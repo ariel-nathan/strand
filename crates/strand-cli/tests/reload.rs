@@ -55,6 +55,8 @@ fn labels(tree: &Node) -> Vec<String> {
         .collect()
 }
 
+/// The demo, with its line endings normalised. The tests below edit this text
+/// by matching on it, and a CRLF checkout matches none of it — see `edit`.
 fn source() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -62,7 +64,21 @@ fn source() -> String {
         .join("examples")
         .join("strand")
         .join("todo_demo.str");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+        .replace("\r\n", "\n")
+}
+
+/// Applies one fixture edit, and insists it landed.
+///
+/// `str::replace` returns the string unchanged when it matches nothing, so a
+/// test built on one keeps running and stops testing what it says. That is not
+/// hypothetical: on a CRLF checkout these edits found nothing, so the
+/// "replacement" module was the running one, its state shape agreed, and a
+/// test about a state that *cannot* be carried watched it be carried.
+fn edit(source: &str, from: &str, to: &str) -> String {
+    assert!(source.contains(from), "no fixture text to replace:\n{from}");
+    source.replace(from, to)
 }
 
 fn compile(source: &str) -> Hir {
@@ -203,7 +219,7 @@ fn newer_code_comes_up_holding_the_running_state() {
     // The claim in one test. A todo typed into the running app is still there
     // after the swap, and the button label proves the code that drew it is the
     // edited one.
-    let edited = source().replace("\"crash stats\"", "\"break stats\"");
+    let edited = edit(&source(), "\"crash stats\"", "\"break stats\"");
     let (trace, frames) = reload_after_typing("survive the swap", &edited);
     let drawn = last(&frames);
 
@@ -228,9 +244,13 @@ fn an_edited_state_record_comes_up_from_init() {
     // record — the field was added at the end — and reading it as the new type
     // would leave `pinned` holding whatever the arena had there. So the actor
     // starts from `init`, and the typed todo is gone: honest, and visibly so.
-    let edited = source()
-        .replace("  burning: bool,\n}", "  burning: bool,\n  pinned: int,\n}")
-        .replace("      burning: false,\n    }", "      burning: false,\n      pinned: 0,\n    }");
+    let source = source();
+    let source = edit(&source, "  burning: bool,\n}", "  burning: bool,\n  pinned: int,\n}");
+    let edited = edit(
+        &source,
+        "      burning: false,\n    }",
+        "      burning: false,\n      pinned: 0,\n    }",
+    );
     let (trace, frames) = reload_after_typing("this one is lost", &edited);
     let drawn = last(&frames);
 

@@ -1,0 +1,12 @@
+# One line ending everywhere, checked out and stored.
+#
+# The tests read example programs and edit them by matching on their text. A
+# checkout that turned those files into CRLF matched nothing, so the fixtures
+# edited nothing and the tests went on to assert something other than what they
+# said — silently, and only on Windows CI. `eol=lf` is what stops that from
+# depending on a git setting.
+* text=auto eol=lf
+
+# Binary, whatever a platform thinks.
+*.png binary
+*.wasm binary

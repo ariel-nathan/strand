@@ -21,6 +21,10 @@ use strandc::hir::{Hir, Ty};
 
 const VIEWPORT: (f32, f32) = (600.0, 480.0);
 
+/// Reads an example, with its line endings normalised.
+///
+/// The fixtures below edit this text by matching on it, and a checkout that
+/// brought the file in with CRLF matches none of it — see `edit`.
 fn example(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -28,7 +32,21 @@ fn example(name: &str) -> String {
         .join("examples")
         .join("strand")
         .join(name);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+        .replace("\r\n", "\n")
+}
+
+/// Applies one fixture edit, and insists it landed.
+///
+/// `str::replace` returns the string unchanged when it matches nothing, so a
+/// test built on one keeps running and stops testing what it says. That is not
+/// hypothetical: on a CRLF checkout these edits found nothing, the two state
+/// shapes agreed, and a test about a snapshot being *refused* was asserting
+/// that one is accepted. It passed.
+fn edit(source: &str, from: &str, to: &str) -> String {
+    assert!(source.contains(from), "no fixture text to replace:\n{from}");
+    source.replace(from, to)
 }
 
 fn compile(source: &str) -> Hir {
@@ -399,7 +417,7 @@ fn newer_code_draws_the_older_state() {
     // Tier 2 in one assertion: the behaviour changed, the record did not, and
     // what the user had typed is still there afterwards.
     let app = demo();
-    let edited = ui(&example("todo_demo.str").replace("\"crash stats\"", "\"break stats\""));
+    let edited = ui(&edit(&example("todo_demo.str"), "\"crash stats\"", "\"break stats\""));
     assert_eq!(app.shape(), edited.shape(), "the state record was not touched");
 
     let mut running = app.started().expect("an instance");
@@ -421,9 +439,13 @@ fn an_edited_state_record_refuses_the_snapshot_and_says_what_changed() {
     // would leave `pinned` holding whatever the arena had there. Refusing is
     // the whole of §9.3's argument.
     let app = demo();
-    let edited = ui(&example("todo_demo.str")
-        .replace("  burning: bool,\n}", "  burning: bool,\n  pinned: int,\n}")
-        .replace("      burning: false,\n    }", "      burning: false,\n      pinned: 0,\n    }"));
+    let source = example("todo_demo.str");
+    let source = edit(&source, "  burning: bool,\n}", "  burning: bool,\n  pinned: int,\n}");
+    let edited = ui(&edit(
+        &source,
+        "      burning: false,\n    }",
+        "      burning: false,\n      pinned: 0,\n    }",
+    ));
 
     let mut running = app.started().expect("an instance");
     app.add(&mut running, "not going anywhere");
@@ -438,11 +460,17 @@ fn an_edited_state_record_refuses_the_snapshot_and_says_what_changed() {
 #[test]
 fn a_state_that_only_changed_inside_a_list_element_is_still_refused() {
     let app = demo();
-    let edited = ui(&example("todo_demo.str")
-        .replace("type Todo = { id: int, title: string, done: bool }", "type Todo = { id: int, title: string, done: bool, at: float }")
-        .replace("done: true }", "done: true, at: 0.0 }")
-        .replace("done: false }", "done: false, at: 0.0 }")
-        .replace("Todo { id: state.nextId, title: clean, done: false }", "Todo { id: state.nextId, title: clean, done: false, at: 0.0 }"));
+    let source = example("todo_demo.str");
+    let source = edit(
+        &source,
+        "type Todo = { id: int, title: string, done: bool }",
+        "type Todo = { id: int, title: string, done: bool, at: float }",
+    );
+    let source = edit(&source, "done: true }", "done: true, at: 0.0 }");
+    // Covers the literal in `commit` as well as the ones in `init`, which is
+    // why there is no fourth edit here. There used to be, and it matched
+    // nothing — the first thing `edit` found when it was added.
+    let edited = ui(&edit(&source, "done: false }", "done: false, at: 0.0 }"));
 
     let mut running = app.started().expect("an instance");
     let snapshot = running.snapshot(&app.codec()).expect("a snapshot");
