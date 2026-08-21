@@ -5,12 +5,27 @@
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
-use crate::lexer::{lex, Span, Tok, Token};
+use crate::lexer::{lex, lex_recovering, Span, Tok, Token};
 use crate::ui::{is_builder, takes_children};
 
 pub fn parse(src: &str) -> Result<Program, Diagnostic> {
     let tokens = lex(src)?;
-    Parser { tokens, pos: 0, no_record_literal: false }.program()
+    Parser { tokens, pos: 0, no_record_literal: false, depth: 0 }.program()
+}
+
+/// Parses as much as it can, reporting every item it could not read instead of
+/// stopping at the first one.
+///
+/// An editor holds a file that is briefly invalid on most keystrokes, and the
+/// item being typed must not take the rest of the file's declarations down with
+/// it. An item that fails to parse is dropped and the parser resynchronises at
+/// the next `fn`/`view`/`type`/`actor`, so its neighbours survive. `parse` keeps
+/// its all-or-nothing contract for batch compilation.
+pub fn parse_recovering(src: &str) -> (Program, Vec<Diagnostic>) {
+    let (tokens, mut errors) = lex_recovering(src);
+    let mut parser = Parser { tokens, pos: 0, no_record_literal: false, depth: 0 };
+    let program = parser.program_recovering(&mut errors);
+    (program, errors)
 }
 
 struct Parser {
@@ -20,7 +35,15 @@ struct Parser {
     /// reads `b { a }` as a record literal with a shorthand field — the same
     /// ambiguity Rust resolves with a no-struct-literal restriction.
     no_record_literal: bool,
+    /// Expression nesting, to keep deeply nested input from overflowing the
+    /// stack. A batch compile only ever sees files someone wrote, but a server
+    /// parses whatever is in the buffer, and `((((…` should be a diagnostic
+    /// rather than a crashed process.
+    depth: u32,
 }
+
+/// Deeper than any real Strand expression, shallow enough to unwind safely.
+const MAX_DEPTH: u32 = 128;
 
 type PResult<T> = Result<T, Diagnostic>;
 
@@ -123,6 +146,41 @@ impl Parser {
         Ok(Program { items })
     }
 
+    /// `program`, but a failed item is reported and skipped rather than ending
+    /// the parse.
+    fn program_recovering(&mut self, errors: &mut Vec<Diagnostic>) -> Program {
+        let mut items = Vec::new();
+        while !self.at(&Tok::Eof) {
+            let before = self.pos;
+            match self.item() {
+                Ok(item) => items.push(item),
+                Err(diagnostic) => {
+                    errors.push(diagnostic);
+                    self.resync(before);
+                }
+            }
+        }
+        Program { items }
+    }
+
+    /// Skips to the next item keyword after a failed item.
+    ///
+    /// Strand has no nested functions, so any `fn`/`view`/`type`/`actor` token
+    /// begins a new declaration and is a safe place to start reading again.
+    /// `failed_at` guarantees forward progress even when `item` consumed
+    /// nothing, which would otherwise loop forever.
+    fn resync(&mut self, failed_at: usize) {
+        if self.pos == failed_at {
+            self.advance();
+        }
+        while !self.at(&Tok::Eof) {
+            if matches!(self.peek(), Tok::Fn | Tok::View | Tok::Type | Tok::Actor) {
+                return;
+            }
+            self.advance();
+        }
+    }
+
     fn item(&mut self) -> PResult<Item> {
         match self.peek() {
             Tok::Fn | Tok::View => Ok(Item::Fn(self.fn_decl()?)),
@@ -156,7 +214,7 @@ impl Parser {
                      called, so the name is free.",
                 ));
         }
-        let (name, _) = self.expect_ident()?;
+        let (name, name_span) = self.expect_ident()?;
 
         self.expect(Tok::LParen)?;
         let mut params = Vec::new();
@@ -179,12 +237,20 @@ impl Parser {
         };
 
         let body = self.block()?;
-        Ok(FnDecl { name, params, ret, is_view, span: Self::join(start, body.span), body })
+        Ok(FnDecl {
+            name,
+            name_span,
+            params,
+            ret,
+            is_view,
+            span: Self::join(start, body.span),
+            body,
+        })
     }
 
     fn actor_decl(&mut self) -> PResult<ActorDecl> {
         let start = self.expect(Tok::Actor)?;
-        let (name, _) = self.expect_ident()?;
+        let (name, name_span) = self.expect_ident()?;
         self.expect(Tok::LBrace)?;
 
         // `state: T` — the record this actor owns.
@@ -250,12 +316,21 @@ impl Parser {
                 .with_help("an actor needs `fn init()` for its starting state and `fn receive(state, msg)` for each message"));
         };
 
-        Ok(ActorDecl { name, state, message, init, receive, view, span: Self::join(start, end) })
+        Ok(ActorDecl {
+            name,
+            name_span,
+            state,
+            message,
+            init,
+            receive,
+            view,
+            span: Self::join(start, end),
+        })
     }
 
     fn type_decl(&mut self) -> PResult<TypeDecl> {
         let start = self.expect(Tok::Type)?;
-        let (name, _) = self.expect_ident()?;
+        let (name, name_span) = self.expect_ident()?;
         self.expect(Tok::Eq)?;
 
         let def = if self.at(&Tok::LBrace) {
@@ -266,7 +341,7 @@ impl Parser {
             TypeDef::Alias(self.type_expr()?)
         };
 
-        Ok(TypeDecl { name, def, span: Self::join(start, self.prev_span()) })
+        Ok(TypeDecl { name, name_span, def, span: Self::join(start, self.prev_span()) })
     }
 
     fn field_defs(&mut self) -> PResult<Vec<FieldDef>> {
@@ -396,12 +471,13 @@ impl Parser {
                 let mutable = matches!(self.peek(), Tok::Var);
                 let start = self.span();
                 self.advance();
-                let (name, _) = self.expect_ident()?;
+                let (name, name_span) = self.expect_ident()?;
                 let ty = if self.eat(&Tok::Colon) { Some(self.type_expr()?) } else { None };
                 self.expect(Tok::Eq)?;
                 let value = self.expr()?;
                 Ok(Stmt::Let {
                     name,
+                    name_span,
                     ty,
                     span: Self::join(start, value.span()),
                     value,
@@ -439,7 +515,18 @@ impl Parser {
     // ---- expressions -----------------------------------------------------
 
     fn expr(&mut self) -> PResult<Expr> {
-        self.binary(0)
+        // Every nested expression funnels through here, so this is the one
+        // place the descent has to be bounded.
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return Err(Diagnostic::new(self.span(), "expression nests too deeply")
+                .with_label("too deep")
+                .with_help("name the inner parts with `let` to flatten this"));
+        }
+        let result = self.binary(0);
+        self.depth -= 1;
+        result
     }
 
     /// Precedence climbing. Lower binding power binds looser.

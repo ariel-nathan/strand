@@ -147,6 +147,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostic> {
     Lexer::new(src).run()
 }
 
+/// Lexes the whole input, stepping over bad bytes instead of stopping at the
+/// first one.
+///
+/// `lex` keeps its stop-at-the-first-error contract, which is what a batch
+/// compile wants. An editor asks on every keystroke, when the buffer is usually
+/// mid-edit and briefly invalid, and one stray character must not blank out the
+/// rest of the file.
+pub fn lex_recovering(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
+    Lexer::new(src).run_recovering()
+}
+
+/// Past this many lexical errors the file is garbage rather than mid-edit —
+/// a binary opened by mistake, say. Lexing continues so the token stream stays
+/// whole; only the reporting stops.
+const MAX_LEX_ERRORS: usize = 100;
+
 struct Lexer<'src> {
     bytes: &'src [u8],
     text: &'src str,
@@ -195,6 +211,42 @@ impl<'src> Lexer<'src> {
     ) -> Result<T, Diagnostic> {
         let span = Span { start, end: start + 1, line, col };
         Err(Diagnostic::new(span, message))
+    }
+
+    /// `run`, but a failed scanner records the problem and the loop carries on
+    /// from the next byte rather than returning.
+    fn run_recovering(mut self) -> (Vec<Token>, Vec<Diagnostic>) {
+        let mut out = Vec::new();
+        let mut errors: Vec<Diagnostic> = Vec::new();
+        loop {
+            self.skip_trivia();
+            let (line, col, start) = (self.line, self.col, self.pos);
+            let Some(b) = self.peek() else {
+                out.push(Token { tok: Tok::Eof, span: Span::new(start, start, line, col) });
+                return (out, errors);
+            };
+
+            let scanned = match b {
+                b'0'..=b'9' => self.number(),
+                b'"' => self.string(),
+                b if b.is_ascii_alphabetic() || b == b'_' => Ok(self.ident_or_keyword()),
+                _ => self.punctuation(),
+            };
+
+            match scanned {
+                Ok(tok) => out.push(Token { tok, span: Span::new(start, self.pos, line, col) }),
+                Err(diagnostic) => {
+                    if errors.len() < MAX_LEX_ERRORS {
+                        errors.push(diagnostic);
+                    }
+                    // Every scanner consumes before it fails, but a future one
+                    // might not, and standing still here would spin forever.
+                    if self.pos == start {
+                        self.bump();
+                    }
+                }
+            }
+        }
     }
 
     fn run(mut self) -> Result<Vec<Token>, Diagnostic> {

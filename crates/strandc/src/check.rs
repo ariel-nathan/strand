@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use crate::analysis::Analysis;
 use crate::ast;
 use crate::diag::Diagnostic;
 use crate::hir::*;
@@ -14,17 +15,39 @@ use crate::lexer::Span;
 use crate::ui::{self, PropTy, Slot};
 
 pub fn check(program: &ast::Program) -> Result<Hir, Vec<Diagnostic>> {
+    let (hir, errors) = check_recovering(program);
+    if errors.is_empty() {
+        Ok(hir)
+    } else {
+        Err(errors)
+    }
+}
+
+/// Checks the whole module and hands back what it built alongside whatever went
+/// wrong, instead of discarding one for the other.
+///
+/// `check` throws the partial module away on any error, which is right for a
+/// batch compile — there is nothing downstream to do with a module that will not
+/// run. An editor is in the opposite position: the file is mid-edit almost all
+/// the time, and the types checked so far are exactly what hover needs. The
+/// checker already never bails partway, so the partial `Hir` is simply the work
+/// it had already done.
+pub fn check_recovering(program: &ast::Program) -> (Hir, Vec<Diagnostic>) {
+    let (hir, _, errors) = analyze(program);
+    (hir, errors)
+}
+
+/// `check_recovering`, plus the position-indexed facts an editor needs.
+///
+/// Hover and go-to-definition are answered from `Analysis` rather than from the
+/// `Hir`, which carries no spans.
+pub fn analyze(program: &ast::Program) -> (Hir, Analysis, Vec<Diagnostic>) {
     let mut cx = Checker::default();
     cx.collect_types(program);
     cx.collect_signatures(program);
     cx.collect_actor(program);
     cx.check_bodies(program);
-
-    if cx.errors.is_empty() {
-        Ok(cx.hir)
-    } else {
-        Err(cx.errors)
-    }
+    (cx.hir, cx.analysis, cx.errors)
 }
 
 /// Every function in the module, whether top-level or inside an actor.
@@ -82,6 +105,8 @@ struct Signature {
     params: Vec<(String, Ty)>,
     ret: Ty,
     is_view: bool,
+    /// Where the function's name was written, for go-to-definition.
+    def_span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +114,8 @@ struct Local {
     slot: u32,
     ty: Ty,
     mutable: bool,
+    /// Where this binding's name was written, for go-to-definition.
+    def_span: Span,
 }
 
 #[derive(Default)]
@@ -110,6 +137,14 @@ struct Checker {
     /// only here, which is what confines a node's lifetime to the expression
     /// that built it.
     in_view: bool,
+    /// Position-indexed facts for editors. Codegen ignores these; they exist so
+    /// hover and go-to-definition do not need a second resolver.
+    analysis: Analysis,
+    /// Declaration site of each named type, keyed the same way `record_ids`,
+    /// `sum_ids` and `aliases` are.
+    type_defs: HashMap<String, Span>,
+    /// Declaration site of each sum-type constructor.
+    ctor_defs: HashMap<String, Span>,
 }
 
 impl Default for Hir {
@@ -153,6 +188,9 @@ impl Checker {
                 self.error(decl.span, format!("type `{}` is declared twice", decl.name));
                 continue;
             }
+            // One place for all three kinds, so a type reference can find its
+            // declaration whether it is a record, a sum or an alias.
+            self.type_defs.insert(decl.name.clone(), decl.name_span);
             match &decl.def {
                 ast::TypeDef::Record(_) => {
                     let id = RecordId(self.hir.records.len() as u32);
@@ -208,6 +246,7 @@ impl Checker {
                             );
                         }
                         self.ctors.insert(variant.name.clone(), (id, index as u32));
+                        self.ctor_defs.insert(variant.name.clone(), variant.span);
                         let fields = variant
                             .fields
                             .iter()
@@ -241,7 +280,7 @@ impl Checker {
             let id = FuncId(self.signatures.len() as u32);
             self.signatures.insert(
                 decl.name.clone(),
-                Signature { id, params, ret, is_view: decl.is_view },
+                Signature { id, params, ret, is_view: decl.is_view, def_span: decl.name_span },
             );
         }
     }
@@ -461,6 +500,11 @@ impl Checker {
                 Ty::Error
             }
             ast::TypeExpr::Named { name, args, span } => {
+                // Covers records, sums and aliases alike, before the branches
+                // below split on which kind this is.
+                if let Some(declared_at) = self.type_defs.get(name).copied() {
+                    self.record_use(*span, declared_at);
+                }
                 let arity = args.len();
                 let mut arg_tys: Vec<Ty> = args.iter().map(|a| self.resolve_ty(a)).collect();
 
@@ -554,8 +598,12 @@ impl Checker {
             self.in_view = signature.is_view;
 
             self.scopes.push(HashMap::new());
-            for (name, ty) in &signature.params {
-                self.declare(name.clone(), ty.clone(), false);
+            // `signature.params` carries no spans; the declaration it was built
+            // from does, in the same order.
+            for (index, (name, ty)) in signature.params.iter().enumerate() {
+                let def_span =
+                    decl.params.get(index).map(|param| param.span).unwrap_or(decl.span);
+                self.declare(name.clone(), ty.clone(), false, def_span);
             }
             self.param_count = self.locals.len();
 
@@ -582,18 +630,24 @@ impl Checker {
         }
     }
 
-    fn declare(&mut self, name: String, ty: Ty, mutable: bool) -> u32 {
+    fn declare(&mut self, name: String, ty: Ty, mutable: bool, def_span: Span) -> u32 {
         let slot = self.locals.len() as u32;
         self.locals.push(ty.clone());
         self.scopes
             .last_mut()
             .expect("a scope is always open")
-            .insert(name, Local { slot, ty, mutable });
+            .insert(name, Local { slot, ty, mutable, def_span });
         slot
     }
 
     fn lookup(&self, name: &str) -> Option<&Local> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    /// Notes that the name written at `use_site` refers to a declaration made at
+    /// `declared_at`.
+    fn record_use(&mut self, use_site: Span, declared_at: Span) {
+        self.analysis.definitions.push((use_site, declared_at));
     }
 
     fn check_block(&mut self, block: &ast::Block, expected: Option<&Ty>) -> Block {
@@ -603,7 +657,7 @@ impl Checker {
         let mut diverges = false;
         for stmt in &block.stmts {
             match stmt {
-                ast::Stmt::Let { name, ty, value, mutable, span } => {
+                ast::Stmt::Let { name, name_span, ty, value, mutable, span } => {
                     let want = ty.as_ref().map(|t| self.resolve_ty(t));
                     let value = self.check_expr(value, want.as_ref());
                     let ty = match want {
@@ -632,7 +686,7 @@ impl Checker {
                             "a node joins the tree where it is written, so binding one                              would separate the two — write the builder call where the                              node belongs, or wrap it in a `view fn` and call that",
                         );
                     }
-                    let slot = self.declare(name.clone(), ty, *mutable);
+                    let slot = self.declare(name.clone(), ty, *mutable, *name_span);
                     stmts.push(Stmt::Let { slot, value });
                 }
                 ast::Stmt::Assign { target, value, span } => {
@@ -707,7 +761,18 @@ impl Checker {
         Block { stmts, tail, ty }
     }
 
+    /// Records every expression's range and type on the way back out.
+    ///
+    /// Inner expressions finish first, so the narrower spans land in the table
+    /// before the wider ones that contain them; `Analysis::type_at` picks the
+    /// narrowest either way.
     fn check_expr(&mut self, expr: &ast::Expr, expected: Option<&Ty>) -> Expr {
+        let checked = self.check_expr_inner(expr, expected);
+        self.analysis.types.push((expr.span(), checked.ty.clone()));
+        checked
+    }
+
+    fn check_expr_inner(&mut self, expr: &ast::Expr, expected: Option<&Ty>) -> Expr {
         match expr {
             ast::Expr::Int { value, .. } => Expr { ty: Ty::Int, kind: ExprKind::Int(*value) },
             ast::Expr::Float { value, .. } => {
@@ -720,7 +785,10 @@ impl Checker {
 
             ast::Expr::Ident { name, span } => {
                 if let Some(local) = self.lookup(name) {
-                    return Expr { ty: local.ty.clone(), kind: ExprKind::Local(local.slot) };
+                    let (ty, slot, def_span) =
+                        (local.ty.clone(), local.slot, local.def_span);
+                    self.record_use(*span, def_span);
+                    return Expr { ty, kind: ExprKind::Local(slot) };
                 }
                 // A niladic constructor used as a value: `None`, `EmptyTitle`.
                 if name == "None" {
@@ -734,6 +802,9 @@ impl Checker {
                     return Expr { ty, kind: ExprKind::MakeNone };
                 }
                 if let Some((sum, index)) = self.ctors.get(name).copied() {
+                    if let Some(declared_at) = self.ctor_defs.get(name).copied() {
+                        self.record_use(*span, declared_at);
+                    }
                     let variant = &self.hir.sums[sum.0 as usize].variants[index as usize];
                     if !variant.fields.is_empty() {
                         let arity = variant.fields.len();
@@ -1173,6 +1244,9 @@ impl Checker {
         }
 
         if let Some((sum, index)) = self.ctors.get(name).copied() {
+            if let Some(declared_at) = self.ctor_defs.get(name).copied() {
+                self.record_use(span, declared_at);
+            }
             return self.check_variant_call(sum, index, name, args, span);
         }
 
@@ -1202,6 +1276,7 @@ impl Checker {
             }
             return Expr { ty: Ty::Error, kind: ExprKind::Unit };
         };
+        self.record_use(span, signature.def_span);
 
         if args.len() != signature.params.len() {
             self.error(
@@ -1482,9 +1557,9 @@ impl Checker {
                 covered.irrefutable = true;
                 Pattern::Wildcard
             }
-            ast::Pattern::Binding { name, .. } => {
+            ast::Pattern::Binding { name, span } => {
                 covered.irrefutable = true;
-                let slot = self.declare(name.clone(), scrutinee.clone(), false);
+                let slot = self.declare(name.clone(), scrutinee.clone(), false, *span);
                 Pattern::Bind { slot }
             }
             ast::Pattern::Int { value, span } => {
@@ -1555,6 +1630,9 @@ impl Checker {
                     self.error(span, format!("unknown constructor `{name}`"));
                     return Pattern::Wildcard;
                 };
+                if let Some(declared_at) = self.ctor_defs.get(name).copied() {
+                    self.record_use(span, declared_at);
+                }
                 if owner != sum {
                     let want = self.hir.sums[sum.0 as usize].name.clone();
                     self.error(span, format!("`{name}` is not a variant of `{want}`"));

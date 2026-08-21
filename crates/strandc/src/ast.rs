@@ -31,6 +31,8 @@ pub enum Item {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActorDecl {
     pub name: String,
+    /// Just the name, where `span` covers the whole declaration.
+    pub name_span: Span,
     pub state: TypeExpr,
     /// `message: T` declares the channel's payload type. Defaults to `string`.
     pub message: Option<TypeExpr>,
@@ -44,6 +46,8 @@ pub struct ActorDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
     pub name: String,
+    /// Just the name, where `span` covers the whole declaration.
+    pub name_span: Span,
     pub params: Vec<Param>,
     /// `None` means the function returns unit.
     pub ret: Option<TypeExpr>,
@@ -65,6 +69,8 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeDecl {
     pub name: String,
+    /// Just the name, where `span` covers the whole declaration.
+    pub name_span: Span,
     pub def: TypeDef,
     pub span: Span,
 }
@@ -126,7 +132,16 @@ pub struct Block {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     /// `let x = e` (immutable) or `var x = e` (mutable), per §4.2.
-    Let { name: String, ty: Option<TypeExpr>, value: Expr, mutable: bool, span: Span },
+    Let {
+        name: String,
+        /// Just the name, where `span` covers the whole statement. Editors jump
+        /// to and rename the name alone.
+        name_span: Span,
+        ty: Option<TypeExpr>,
+        value: Expr,
+        mutable: bool,
+        span: Span,
+    },
     /// `state.todos = next`
     Assign { target: Expr, value: Expr, span: Span },
     Return { value: Option<Expr>, span: Span },
