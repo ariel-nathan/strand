@@ -1,4 +1,4 @@
-// A Strand actor that calls into the host ABI (§6 of docs/abi.md).
+// A Strand actor that calls into the host ABI (§6 of `docs/strand-design.md`).
 //
 // `log` is a builtin, so the emitted module imports `strand.log`. Imports
 // occupy the low function indices, which is why adding them was a change to

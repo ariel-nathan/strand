@@ -65,7 +65,7 @@ fn accept(title: string): Result<string, AddError> {
 // ---- what crosses the two channels ----------------------------------------
 //
 // Flat, because a message is copied into a different arena and a pointer from
-// this one would mean nothing there (docs/abi.md §7). That is why the tally
+// this one would mean nothing there (§6.8). That is why the tally
 // comes back as two numbers and is turned into a string on this side.
 
 type Command =

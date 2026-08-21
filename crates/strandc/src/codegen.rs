@@ -1,4 +1,4 @@
-//! WASM emission (§4.6), implementing the layout rules in `docs/abi.md`.
+//! WASM emission (§4.6), implementing the layout rules in `docs/strand-design.md`.
 //!
 //! Core modules and linear memory — no GC types, no Component Model. The
 //! load-bearing decision is §2 of that document: `Result`/`Option` cross a
@@ -37,7 +37,7 @@ fn stride(elem: &Ty) -> u64 {
 
 type Code = Vec<Instruction<'static>>;
 
-/// The WASM representation of a Strand type (`docs/abi.md`).
+/// The WASM representation of a Strand type (`docs/strand-design.md`).
 fn rep(ty: &Ty) -> Vec<ValType> {
     match ty {
         Ty::Int => vec![ValType::I64],
@@ -45,7 +45,7 @@ fn rep(ty: &Ty) -> Vec<ValType> {
         Ty::Bool => vec![ValType::I32],
         // Pointers into linear memory, and immediate tags for all-niladic sums.
         Ty::Str | Ty::List(_) | Ty::Record(_) | Ty::Sum(_) => vec![ValType::I32],
-        // The multi-value pair. This is the whole point of docs/abi.md §2.
+        // The multi-value pair. This is the whole point of §6.2.
         Ty::Option(_) | Ty::Result(..) => vec![ValType::I32, ValType::I64],
         // A node leaves nothing behind: building it *was* the effect. See
         // `Ty::Node` in the HIR for why that is the point rather than a saving.
@@ -404,7 +404,7 @@ impl<'hir> Emitter<'hir> {
             }
             exports.export(&func.name, ExportKind::Func, offset + index as u32);
         }
-        // The host ABI names from docs/abi.md §6.
+        // The host ABI names from §6.7.
         exports.export("strand_alloc", ExportKind::Func, self.alloc_index);
         if self.builds_nodes {
             // What a host needs to read a frame: where the array starts, how
@@ -421,7 +421,7 @@ impl<'hir> Emitter<'hir> {
             if actor.view.is_some() {
                 // Draws the actor as it currently is. The runtime calls this
                 // after each message; what it produces is read out of
-                // `strand_nodes` (`docs/abi.md` §8).
+                // `strand_nodes` (§6.9).
                 exports.export("strand_view", ExportKind::Func, actor_base + 3);
             }
             // Lets a host read the actor's state without the actor logging it.
@@ -535,7 +535,7 @@ impl<'hir> Emitter<'hir> {
         for ty in &func.locals {
             if ty.has_holes() {
                 return bail(format!(
-                    "in `{}`: could not infer a complete type for a local                      (a `Result`/`Option` whose other half is never determined);                      add a type annotation",
+                    "in `{}`: could not infer a complete type for a local (a                      `Result`/`Option` whose other half is never determined);                      add a type annotation",
                     func.name
                 ));
             }
@@ -635,7 +635,7 @@ impl<'hir> Emitter<'hir> {
             }
 
             // `send(port, value)`: hand the host the bytes that already are
-            // the value (docs/abi.md §7). The port is a constant the checker
+            // the value (§6.8). The port is a constant the checker
             // resolved; nothing here knows or can know who receives it.
             ExprKind::Send { port, value } => {
                 let ty = value.ty.clone();
@@ -705,7 +705,7 @@ impl<'hir> Emitter<'hir> {
             ExprKind::CallBuiltin { builtin, args } => {
                 match builtin {
                     // log(msg) takes a Strand string; the host ABI takes
-                    // (ptr, len), so unpack the header here (docs/abi.md §5).
+                    // (ptr, len), so unpack the header here (§6.5).
                     Builtin::Log => {
                         let text = ctx.scratch(ValType::I32);
                         self.expr(ctx, code, &args[0])?;
@@ -990,7 +990,7 @@ impl<'hir> Emitter<'hir> {
             ExprKind::MakeVariant { sum, variant, fields } => {
                 let def = &self.hir.sums[sum.0 as usize];
                 if def.variants.iter().all(|v| v.fields.is_empty()) {
-                    // All-niladic sums degrade to a bare tag (docs/abi.md §3).
+                    // All-niladic sums degrade to a bare tag (§6.3).
                     code.push(Instruction::I32Const(*variant as i32));
                     return Ok(());
                 }
@@ -1193,7 +1193,7 @@ impl<'hir> Emitter<'hir> {
         code.push(Instruction::LocalSet(tag));
 
         // Non-zero tag is Err/None: re-return the pair and leave. This is the
-        // allocation-free propagation docs/abi.md §2 promises.
+        // allocation-free propagation §6.2 promises.
         code.push(Instruction::LocalGet(tag));
         code.push(Instruction::If(BlockType::Empty));
         code.push(Instruction::I32Const(1));
@@ -1533,7 +1533,7 @@ fn actor_main_body(actor: &ActorInfo, offset: u32) -> Function {
 /// them into this arena with `strand_alloc`, and the checker guaranteed the
 /// type holds no pointers needing relocation, so a boxed variant is used
 /// in place with no decoding at all. Strings are the one relocated case —
-/// codegen knows their layout (`docs/abi.md` §5), so it adds the header.
+/// codegen knows their layout (§6.5), so it adds the header.
 ///
 /// The port decides which handler runs and how the bytes are read, so the two
 /// come from one table and cannot drift apart. A port number the actor does
@@ -1626,7 +1626,7 @@ fn actor_view_body(view: FuncId, frame_reset: u32, offset: u32) -> Function {
 
 // ---- generated string helpers (`stdlib`) ---------------------------------
 //
-// Every one of these works on `docs/abi.md` §5's layout: a pointer to
+// Every one of these works on §6.5's layout: a pointer to
 // `{ i32 len, bytes... }`, UTF-8, immutable. Immutable is what makes them
 // cheap to reason about — a helper never edits its argument, it allocates a
 // new string, and the old one stays valid for anyone still holding it.
@@ -2102,7 +2102,7 @@ fn str_from_char_body(alloc: u32) -> Function {
     f
 }
 
-/// Bump allocator in the guest arena (`docs/abi.md` §6). Never frees: §5.1
+/// Bump allocator in the guest arena (§6.7). Never frees: §5.1
 /// reclaims the whole arena when the actor dies.
 fn alloc_body() -> Function {
     let mut f = Function::new([(2, ValType::I32)]);

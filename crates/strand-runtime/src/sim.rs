@@ -1,6 +1,6 @@
 //! Deterministic simulation of the actor runtime.
 //!
-//! `docs/inspiration-canon.md` takes the TigerBeetle lesson literally: build
+//! §17 takes the TigerBeetle lesson literally: build
 //! the scheduler so a run can be replayed exactly, before the scheduler grows
 //! complicated enough that it cannot be.
 //!

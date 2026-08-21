@@ -15,7 +15,7 @@
 //! ## Why the peer is named by a port rather than by an actor
 //!
 //! Because there is no other name available, and that is the point rather than
-//! a limitation. An actor holds no addresses (`docs/abi.md` §7), so "who died"
+//! a limitation. An actor holds no addresses (§6.8), so "who died"
 //! can only be said in terms the receiver already has: `port` is the index of
 //! *its own* `in` port that the departed peer was wired to. An actor with one
 //! peer can ignore the payload; an actor with several can tell them apart

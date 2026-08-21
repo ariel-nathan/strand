@@ -4,7 +4,7 @@
 //! scheduling unit), and a mailbox (its only channel to the outside world).
 //! Actors share no memory: the only way in is a `Message`.
 //!
-//! Two design commitments from `docs/inspiration-canon.md`:
+//! Two design commitments from §17:
 //!
 //! - **TigerBeetle.** Every scheduling-visible event is recorded on a `Trace`,
 //!   and `sim` runs a scenario on a single thread with virtual time, so a run
@@ -118,7 +118,7 @@ impl Trace {
 /// Where a UI actor's frames go.
 ///
 /// An actor that exports `strand_view` draws itself after every message it
-/// handles (`docs/abi.md` §8). The runtime calls it and hands the bytes
+/// handles (§6.9). The runtime calls it and hands the bytes
 /// straight over: it knows *where* the actor left a frame and nothing about
 /// what a frame means. Layout, widgets and the compositor stay on the other
 /// side of this trait, which is what keeps the actor runtime free of the
@@ -316,7 +316,7 @@ pub struct Wiring {
 ///
 /// The bytes are prepared by whoever set the watch, not here. Encoding a value
 /// means knowing a type's layout, and the runtime knowing that would be a
-/// second implementation of `docs/abi.md` §7 living next to the compiler's —
+/// second implementation of §6.8 living next to the compiler's —
 /// the mistake the host encoder exists to avoid. This carries what to deliver
 /// and where; it does not know what it means.
 #[derive(Debug, Clone, PartialEq, Eq)]

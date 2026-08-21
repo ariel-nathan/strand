@@ -6,7 +6,7 @@
 //! together, before flattening, and is the only view that can answer it.
 //!
 //! **Visual.** `Inspector::overlay` appends outline commands to a finished
-//! frame. That is clay's trick, cited in `docs/inspiration-canon.md`: an
+//! frame. That is clay's trick, cited in §17: an
 //! inspector needs no special rendering path because it is just more render
 //! commands. Outlines go through the same pipeline as everything else — and so
 //! does the actor panel, which is why §8.4's "rendered by the platform" costs

@@ -4,7 +4,7 @@
 //! checker cannot vouch for: an off-by-one in a copy, a local index that names
 //! the wrong slot, a loop that never ends. So each helper is exercised through
 //! real Strand source, compiled, validated and executed, with the result read
-//! back out of the guest's own memory using `docs/abi.md` §5's layout.
+//! back out of the guest's own memory using §6.5's layout.
 //!
 //! The cases that matter most are the boundaries: an empty string, a string of
 //! only whitespace, the most negative `int`, and a character that does not fit
@@ -97,7 +97,7 @@ fn an_empty_side_contributes_nothing() {
 
 #[test]
 fn concatenation_leaves_its_arguments_alone() {
-    // Strings are immutable (§4.2 / docs/abi.md §5), so a helper allocates
+    // Strings are immutable (§4.2 / §6.5), so a helper allocates
     // rather than editing. If `+` wrote into `a`, the second use would differ.
     let src = "\
 fn main(): string {

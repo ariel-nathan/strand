@@ -1,7 +1,7 @@
 //! Executes a compiled Strand program and renders its result.
 //!
 //! Decoding is driven by the typed IR, so this doubles as a readable check on
-//! `docs/abi.md`: if a record's fields print correctly, their offsets are
+//! the design doc: if a record's fields print correctly, their offsets are
 //! right; if `Ok(2.5)` prints as `Ok(2.5)`, the payload slot round-tripped.
 
 use anyhow::{anyhow, Result};
@@ -12,7 +12,7 @@ use strandc::hir::{Hir, Ty};
 use wasmtime::error::Context as _;
 use wasmtime::{Engine, Instance, Store, Val};
 
-/// Every value occupies whole 8-byte slots (`docs/abi.md`).
+/// Every value occupies whole 8-byte slots (`docs/strand-design.md`).
 const WORD: usize = 8;
 
 /// Compiles nothing — takes an already-emitted module — and calls `main`.
@@ -79,7 +79,7 @@ fn render(hir: &Hir, ty: &Ty, values: &[Val], memory: &[u8]) -> String {
     }
 }
 
-/// Widens the single payload slot back into a value of `ty` (`docs/abi.md` §2).
+/// Widens the single payload slot back into a value of `ty` (§6.2).
 fn render_payload(hir: &Hir, ty: &Ty, payload: i64, memory: &[u8]) -> String {
     let value = match ty {
         Ty::Unit => return "()".to_string(),

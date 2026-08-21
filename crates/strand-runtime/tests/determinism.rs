@@ -1,5 +1,5 @@
 //! Proves the actor runtime replays identically — the TigerBeetle property
-//! from `docs/inspiration-canon.md`, asserted rather than assumed.
+//! from §17, asserted rather than assumed.
 
 use std::path::Path;
 use std::time::Duration;

@@ -2,7 +2,7 @@
 //!
 //! The checker resolves names, assigns local slots, and picks the
 //! representation for every value, so codegen never has to ask a question the
-//! type system already answered. Layout rules live in `docs/abi.md`.
+//! type system already answered. Layout rules live in `docs/strand-design.md`.
 
 use std::fmt;
 
@@ -87,7 +87,7 @@ impl Ty {
     }
 
     /// Whether values of this type are a pointer into linear memory
-    /// (`docs/abi.md` §3-§5) rather than an immediate scalar.
+    /// (§6.3–§6.5) rather than an immediate scalar.
     pub fn is_boxed(&self) -> bool {
         matches!(self, Ty::Str | Ty::List(_) | Ty::Record(_) | Ty::Sum(_))
     }
@@ -154,7 +154,7 @@ pub struct ActorInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PortInfo {
     pub name: String,
-    /// The payload type. Flat, per `docs/abi.md` §7.
+    /// The payload type. Flat, per §6.8.
     pub ty: Ty,
 }
 
@@ -375,7 +375,7 @@ impl Helper {
     }
 }
 
-/// Host functions callable from Strand (`docs/abi.md` §6).
+/// Host functions callable from Strand (§6.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Builtin {
     /// `log(msg: string)` — writes through to the runtime's actor log.
@@ -440,7 +440,7 @@ pub enum Tag {
     Err,
     Some,
     None,
-    /// A user sum-type variant: `docs/abi.md` §3 boxes these.
+    /// A user sum-type variant: §6.3 boxes these.
     Variant { sum: SumId, index: u32 },
 }
 

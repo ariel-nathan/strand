@@ -371,7 +371,7 @@ impl ApplicationHandler for App {
                     );
 
                     // Injected render commands, not a second rendering path
-                    // (docs/inspiration-canon.md, on clay).
+                    // (§17, on clay).
                     self.inspector.highlight = self.hovered;
                     if let Some(stats) = &self.stats {
                         stats.read_into(&mut self.stat_rows);

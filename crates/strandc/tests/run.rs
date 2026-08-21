@@ -43,7 +43,7 @@ fn call_int0(src: &str, name: &str) -> i64 {
     func.call(&mut store, ()).expect("trap")
 }
 
-/// Calls a `Result`/`Option`-returning function, which per docs/abi.md §2
+/// Calls a `Result`/`Option`-returning function, which per §6.2
 /// comes back as the pair `(tag, payload)`.
 fn call_result(src: &str, name: &str, arg: i64) -> (i32, i64) {
     let (mut store, instance) = instantiate(src);
@@ -167,7 +167,7 @@ fn a_record_update_keeps_the_fields_it_does_not_name() {
 
 #[test]
 fn result_returns_the_multi_value_pair() {
-    // docs/abi.md §2: tag 0 = Ok, tag 1 = Err, payload in the second slot.
+    // §6.2: tag 0 = Ok, tag 1 = Err, payload in the second slot.
     let src = "type E = | Bad
         fn check(n: int): Result<int, E> {
             if n < 0 { return Err(Bad) }
@@ -239,7 +239,7 @@ fn match_binds_through_nested_patterns() {
 
 #[test]
 fn all_niladic_sums_are_immediate_tags() {
-    // docs/abi.md §3: no allocation for these.
+    // §6.3: no allocation for these.
     let src = "type Colour = | Red | Green | Blue
         fn code(n: int, unused: int): int {
             let c = if n == 0 { Red } else { if n == 1 { Green } else { Blue } }
@@ -279,7 +279,7 @@ fn match_on_string_literals_compares_bytes() {
 
 #[test]
 fn floats_survive_the_payload_slot() {
-    // Reinterpreted through the i64 payload and back (docs/abi.md §2).
+    // Reinterpreted through the i64 payload and back (§6.2).
     let src = "type E = | Bad
         fn half(n: int): Result<float, E> {
             if n < 0 { return Err(Bad) }

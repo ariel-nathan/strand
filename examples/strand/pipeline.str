@@ -24,7 +24,7 @@ type Log = { seen: int }
 fn ADD(): int { 1 }
 fn RESET(): int { 2 }
 
-// What crosses a channel must be flat (docs/abi.md §7): a message is copied
+// What crosses a channel must be flat (§6.8): a message is copied
 // into a different arena, and a pointer from this one would mean nothing
 // there. The checker enforces that at the port declaration, so the mistake is
 // caught where the channel is described rather than where one is used.

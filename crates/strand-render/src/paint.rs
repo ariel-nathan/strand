@@ -3,7 +3,7 @@
 //! One instanced quad per `Command::Rect`: the vertex shader builds the corners
 //! from instance data, so the CPU uploads 8 floats per rectangle and issues a
 //! single draw call for the whole frame. That is the id Tech lesson from
-//! `docs/inspiration-canon.md` in miniature — do the thinking at layout time so
+//! §17 in miniature — do the thinking at layout time so
 //! the hot loop does almost nothing.
 
 use wgpu::util::DeviceExt;

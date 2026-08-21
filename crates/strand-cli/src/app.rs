@@ -307,8 +307,8 @@ mod tests {
     fn the_input_port_is_found_by_type_rather_than_by_name() {
         // Calling it `input` is a convention; carrying `Input` is the fact. A
         // port named anything still receives clicks, because the platform
-        // matches on the type it declared (docs/abi.md §9) — the same reason
-        // the type is declared there rather than matched by spelling.
+        // matches on the type it declared (§6.11) — the same reason the type
+        // is declared there rather than matched by spelling.
         checked(
             "type Count = { total: int }
              actor Counter {

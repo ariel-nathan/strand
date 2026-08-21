@@ -13,7 +13,7 @@ fn addTodo(id: Id, titleLen: int): Result<Todo, AddError> {
   Ok(Todo { id: id, title: "write the compiler", done: false })
 }
 
-// `?` propagates the error without allocating (docs/abi.md §2).
+// `?` propagates the error without allocating (§6.2).
 fn addAndDescribe(id: Id, titleLen: int): Result<Id, AddError> {
   let todo = addTodo(id, titleLen)?
   Ok(todo.id)

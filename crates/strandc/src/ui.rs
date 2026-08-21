@@ -14,7 +14,7 @@
 //! the tree is then a single left-to-right pass with a stack, and no node ever
 //! needs to be moved or patched after it is written.
 //!
-//! That is the Cap'n Proto lesson from `docs/inspiration-canon.md` applied to
+//! That is the Cap'n Proto lesson from §17 applied to
 //! §6.1's tree: the format the guest builds *is* the format the host reads.
 //! There is no encode step, and adding one would be the bug.
 //!
@@ -117,7 +117,7 @@ pub const NODE_SIZE: u32 = 32;
 /// How many nodes one frame may contain.
 ///
 /// A fixed ceiling rather than a growing buffer, following the arena
-/// philosophy `docs/inspiration-canon.md` takes from TigerBeetle: the memory a
+/// philosophy §17 takes from TigerBeetle: the memory a
 /// frame can use is decided once, and a view that exceeds it traps rather than
 /// quietly allocating. A trap is a crash report and a supervisor restart, which
 /// is a great deal easier to notice than a slow leak.

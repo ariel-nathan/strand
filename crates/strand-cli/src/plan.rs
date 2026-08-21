@@ -128,7 +128,7 @@ pub fn plan(hir: &Hir) -> Result<Plan> {
     Ok(Plan { spawns, ui, input_port })
 }
 
-/// Whether a port carries the platform's own event type (`docs/abi.md` §9).
+/// Whether a port carries the platform's own event type (§6.11).
 fn is_input(hir: &Hir, ty: &Ty) -> bool {
     matches!(ty, Ty::Sum(id) if hir.sums[id.0 as usize].name == input::TYPE_NAME)
 }

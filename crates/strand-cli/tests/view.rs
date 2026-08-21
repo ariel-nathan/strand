@@ -237,7 +237,7 @@ fn a_default_applies_where_a_prop_is_left_out() {
 #[test]
 fn a_string_prop_carries_a_computed_value() {
     // The string comes out of an ordinary function, so it is built in the
-    // guest's arena and read back through its own header (docs/abi.md §5).
+    // guest's arena and read back through its own header (§6.5).
     let tree = draw(
         r#"
         fn pick(done: bool): string {

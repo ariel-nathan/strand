@@ -9,7 +9,7 @@
 //! There is no decode step in the sense that word usually means. The bytes the
 //! guest wrote are the bytes read here; the only work is turning a widget tag
 //! and its props into the platform's `Node`, which is where §6.3's theme gets
-//! applied. That is the Cap'n Proto lesson from `docs/inspiration-canon.md`,
+//! applied. That is the Cap'n Proto lesson from §17,
 //! and `strandc::ui` is the single table both ends read it from.
 
 use anyhow::{anyhow, bail, Result};
@@ -40,7 +40,7 @@ fn read_f32(memory: &[u8], at: usize) -> Result<f32> {
     Ok(f32::from_bits(read_u32(memory, at)?))
 }
 
-/// A Strand string: `{ i32 len, bytes }` (`docs/abi.md` §5). A null pointer is
+/// A Strand string: `{ i32 len, bytes }` (§6.5). A null pointer is
 /// "no text", which is how an unwritten string prop arrives.
 fn read_str(memory: &[u8], ptr: u32) -> Result<String> {
     if ptr == 0 {

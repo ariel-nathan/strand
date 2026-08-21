@@ -483,7 +483,7 @@ impl Checker {
 
     /// A message crosses into another arena, where any pointer it carries
     /// would be meaningless. Flat payloads let the wire format *be* the memory
-    /// format — the Cap'n Proto lesson in `docs/inspiration-canon.md` — so the
+    /// format — the Cap'n Proto lesson in §17 — so the
     /// receiver never parses anything. Anything needing relocation is rejected.
     fn check_message_is_flat(&mut self, message: &Ty, span: Span) {
         let offender = match message {

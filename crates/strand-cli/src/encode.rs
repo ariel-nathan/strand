@@ -1,6 +1,6 @@
 //! Encodes a typed message into the bytes an actor's channel carries.
 //!
-//! The layout is `docs/abi.md`'s, and deliberately nothing more: because the
+//! The layout is the design doc's, and deliberately nothing more: because the
 //! checker guarantees message types are flat, the encoded bytes are already a
 //! valid value in the receiving arena. Nothing decodes on arrival.
 //!
@@ -10,7 +10,7 @@
 use anyhow::{anyhow, bail, Result};
 use strandc::hir::{Hir, Ty};
 
-/// Every value occupies whole 8-byte slots (`docs/abi.md`).
+/// Every value occupies whole 8-byte slots (`docs/strand-design.md`).
 const WORD: usize = 8;
 
 /// A message to send, as written on a command line: `Inc`, or `Add 5`.
@@ -56,7 +56,7 @@ fn encode_variant(hir: &Hir, sum: usize, name: &str, args: &[&str]) -> Result<Ve
         );
     }
 
-    // All-niladic sums are the bare tag, not a pointer to one (docs/abi.md §3).
+    // All-niladic sums are the bare tag, not a pointer to one (§6.3).
     if def.variants.iter().all(|v| v.fields.is_empty()) {
         return Ok((index as i32).to_le_bytes().to_vec());
     }

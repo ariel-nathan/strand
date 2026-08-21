@@ -294,7 +294,7 @@ fn the_runtime_delivers_typed_messages() {
     assert_eq!(delivered, 3, "all three typed messages arrive:\n{}", trace.render());
 }
 
-// ---- host builtins (docs/abi.md §6) ---------------------------------------
+// ---- host builtins (§6.7) ---------------------------------------
 
 #[test]
 fn a_strand_actor_can_call_the_host() {

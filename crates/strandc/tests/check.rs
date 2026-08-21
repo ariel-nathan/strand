@@ -169,7 +169,7 @@ fn try_operator_requires_a_result_returning_function() {
 
 #[test]
 fn try_rejects_mismatched_error_types() {
-    // No error conversion in the POC (docs/abi.md §2).
+    // No error conversion in the POC (§6.2).
     let msg = expect_error(
         "type A = | Bad
          type B = | Worse
