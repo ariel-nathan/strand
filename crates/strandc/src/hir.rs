@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use crate::ui::{NodeKind, Slot};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FuncId(pub u32);
 
@@ -28,6 +30,14 @@ pub enum Ty {
     Result(Box<Ty>, Box<Ty>),
     Record(RecordId),
     Sum(SumId),
+    /// A built UI node (§6.2).
+    ///
+    /// Zero-width: a node is *emitted* into the frame's array where it is
+    /// written, so the value left behind carries nothing. That is not a trick
+    /// to save a word — it is why a node cannot be stored, passed around, or
+    /// used twice, and therefore why the array is in tree order by
+    /// construction rather than by discipline.
+    Node,
     /// The type of an expression that never yields — a block ending in
     /// `return`. Unifies with anything.
     Never,
@@ -104,6 +114,7 @@ impl fmt::Display for TyDisplay<'_> {
             }
             Ty::Record(id) => write!(f, "{}", hir.records[id.0 as usize].name),
             Ty::Sum(id) => write!(f, "{}", hir.sums[id.0 as usize].name),
+            Ty::Node => write!(f, "Node"),
         }
     }
 }
@@ -126,6 +137,9 @@ pub struct ActorInfo {
     pub message: Ty,
     pub init: FuncId,
     pub receive: FuncId,
+    /// `view fn view(state) -> Node`, when the actor declares one. Its presence
+    /// is what makes a module a UI actor (§6.5).
+    pub view: Option<FuncId>,
 }
 
 impl Hir {
@@ -155,6 +169,9 @@ pub struct Variant {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Func {
     pub name: String,
+    /// Written `view fn` (§6.2): pure, returns a `Node`, and the only kind of
+    /// function that may build one.
+    pub is_view: bool,
     pub ret: Ty,
     /// Slot types, parameters first. Slot `i` is WASM local `i`.
     pub locals: Vec<Ty>,
@@ -219,6 +236,21 @@ pub enum ExprKind {
 
     /// `expr?` — on the error arm, returns from the enclosing function (§4.3).
     Try { expr: Box<Expr>, kind: TryKind },
+
+    /// §6.2's builder call: append one node to the frame's array, after
+    /// evaluating `children` so that whatever they appended becomes its own.
+    ///
+    /// `props` keeps source order so evaluation does too; every slot the source
+    /// left out takes the builder's default, which the checker has already
+    /// folded into `numbers` (the two float slots) or is simply zero.
+    MakeNode {
+        kind: NodeKind,
+        props: Vec<(Slot, Expr)>,
+        /// Defaults for `Slot::Number` and `Slot::Number2`.
+        numbers: [f32; 2],
+        /// Empty for a leaf.
+        children: Block,
+    },
 }
 
 /// Host functions callable from Strand (`docs/abi.md` §6).

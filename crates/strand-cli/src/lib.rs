@@ -3,6 +3,8 @@
 
 pub mod demo;
 pub mod encode;
+pub mod frame;
 pub mod run;
 pub mod stats;
 pub mod todo;
+pub mod view;

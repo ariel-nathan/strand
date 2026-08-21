@@ -297,3 +297,139 @@ fn checks_the_design_doc_add_todo_shape() {
         "#,
     );
 }
+
+// ---- §6.2's builder DSL ---------------------------------------------------
+
+#[test]
+fn a_view_returns_a_node() {
+    let hir = expect_ok("view fn main(): Node { text(\"hi\") }");
+    assert_eq!(hir.funcs[0].ret, Ty::Node);
+    assert!(hir.funcs[0].is_view);
+}
+
+#[test]
+fn a_view_must_actually_return_one() {
+    let msg = expect_error("view fn main(): int { 1 }");
+    assert!(msg.contains("must return Node"), "message was: {msg}");
+}
+
+#[test]
+fn a_function_returning_a_node_must_say_it_is_a_view() {
+    // The keyword is not decoration: it is what licenses the builder calls, so
+    // a plain `fn` returning Node is a mistake worth naming.
+    let msg = expect_error("fn main(): Node { text(\"hi\") }");
+    assert!(msg.contains("not a view"), "message was: {msg}");
+}
+
+#[test]
+fn builders_are_confined_to_views() {
+    let msg = expect_error("fn helper(): int { text(\"hi\") 1 }");
+    assert!(msg.contains("belongs in a view"), "message was: {msg}");
+}
+
+#[test]
+fn a_node_cannot_be_stored_in_a_local() {
+    // Nodes are emitted where they are written, so a binding would separate the
+    // two — see `Ty::Node`. Better unsayable than subtly wrong.
+    let msg = expect_error("view fn main(): Node { let a = text(\"hi\") a }");
+    assert!(msg.contains("cannot hold a Node"), "message was: {msg}");
+}
+
+#[test]
+fn a_node_cannot_be_a_parameter() {
+    let msg = expect_error("view fn wrap(inner: Node): Node { column() { inner } }");
+    assert!(msg.contains("cannot be a Node"), "message was: {msg}");
+}
+
+#[test]
+fn a_mistyped_prop_is_a_compile_error() {
+    // §6.2's claim that props are type-checked like any other argument. The
+    // HTML equivalent — `witdh: 10px` — fails silently.
+    let msg = expect_error("view fn main(): Node { column(gap: \"8\") { text(\"a\") } }");
+    assert!(msg.contains("`gap` on `column` is int"), "message was: {msg}");
+}
+
+#[test]
+fn an_unknown_prop_lists_the_ones_that_exist() {
+    let msg = expect_error("view fn main(): Node { column(gpa: 8) { text(\"a\") } }");
+    assert!(msg.contains("no prop `gpa`"), "message was: {msg}");
+}
+
+#[test]
+fn a_missing_required_prop_is_reported() {
+    let msg = expect_error("view fn main(): Node { button(id: 1) }");
+    assert!(msg.contains("needs `label`"), "message was: {msg}");
+}
+
+#[test]
+fn a_prop_given_twice_is_reported() {
+    let msg = expect_error("view fn main(): Node { column(gap: 1, gap: 2) { text(\"a\") } }");
+    assert!(msg.contains("given twice"), "message was: {msg}");
+}
+
+#[test]
+fn a_node_that_goes_nowhere_is_reported_where_it_was_written() {
+    // A block after a leaf does not attach to it, so this builds two nodes and
+    // places one. Caught here rather than as "the view left 2 roots" at the
+    // moment the host reads the frame.
+    let msg = expect_error("view fn main(): Node { text(\"a\") { text(\"b\") } }");
+    assert!(msg.contains("never placed"), "message was: {msg}");
+}
+
+#[test]
+fn a_bare_value_cannot_be_a_child() {
+    // JSX renders `0` when you write `count && <Badge/>`. Here a non-node child
+    // is a compile error, so the shape of the mistake does not exist.
+    let msg = expect_error("view fn main(): Node { column() { 42 } }");
+    assert!(msg.contains("must be a Node"), "message was: {msg}");
+}
+
+#[test]
+fn an_if_without_else_is_a_node_inside_a_view() {
+    // Elsewhere this would have to be unit; in a children block "no node" is a
+    // perfectly good result, and §6.2 writes exactly this.
+    expect_ok(
+        "view fn main(): Node { column() { if true { text(\"a\") } } }",
+    );
+}
+
+#[test]
+fn a_view_can_call_an_ordinary_function_for_a_prop() {
+    let hir = expect_ok(
+        "fn title(): string { \"hi\" }\nview fn main(): Node { text(title()) }",
+    );
+    assert_eq!(hir.funcs.len(), 2);
+}
+
+#[test]
+fn an_actor_may_declare_a_view() {
+    let hir = expect_ok(
+        r#"
+        type Count = { total: int }
+        actor Counter {
+          state: Count
+          fn init(): Count { Count { total: 0 } }
+          fn receive(state: Count, msg: string): Count { state }
+          view fn draw(state: Count): Node { text("counter") }
+        }
+        "#,
+    );
+    let actor = hir.actor.expect("an actor was declared");
+    assert!(actor.view.is_some(), "and it draws itself");
+}
+
+#[test]
+fn an_actors_view_takes_only_its_state() {
+    let msg = expect_error(
+        r#"
+        type Count = { total: int }
+        actor Counter {
+          state: Count
+          fn init(): Count { Count { total: 0 } }
+          fn receive(state: Count, msg: string): Count { state }
+          view fn draw(state: Count, extra: int): Node { text("counter") }
+        }
+        "#,
+    );
+    assert!(msg.contains("and nothing else"), "message was: {msg}");
+}

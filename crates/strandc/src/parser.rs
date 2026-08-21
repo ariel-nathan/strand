@@ -6,6 +6,7 @@
 use crate::ast::*;
 use crate::diag::Diagnostic;
 use crate::lexer::{lex, Span, Tok, Token};
+use crate::ui::{is_builder, takes_children};
 
 pub fn parse(src: &str) -> Result<Program, Diagnostic> {
     let tokens = lex(src)?;
@@ -124,7 +125,7 @@ impl Parser {
 
     fn item(&mut self) -> PResult<Item> {
         match self.peek() {
-            Tok::Fn => Ok(Item::Fn(self.fn_decl()?)),
+            Tok::Fn | Tok::View => Ok(Item::Fn(self.fn_decl()?)),
             Tok::Type => Ok(Item::Type(self.type_decl()?)),
             Tok::Actor => Ok(Item::Actor(self.actor_decl()?)),
             other => self.error(format!("expected `fn`, `type` or `actor`, found {other}")),
@@ -132,7 +133,16 @@ impl Parser {
     }
 
     fn fn_decl(&mut self) -> PResult<FnDecl> {
-        let start = self.expect(Tok::Fn)?;
+        // `view fn name(...)` (§6.2). The keyword leads, so the reader knows
+        // what kind of function this is before reading its name.
+        let is_view = self.at(&Tok::View);
+        let start = if is_view {
+            let span = self.expect(Tok::View)?;
+            self.expect(Tok::Fn)?;
+            span
+        } else {
+            self.expect(Tok::Fn)?
+        };
         let (name, _) = self.expect_ident()?;
 
         self.expect(Tok::LParen)?;
@@ -156,7 +166,7 @@ impl Parser {
         };
 
         let body = self.block()?;
-        Ok(FnDecl { name, params, ret, span: Self::join(start, body.span), body })
+        Ok(FnDecl { name, params, ret, is_view, span: Self::join(start, body.span), body })
     }
 
     fn actor_decl(&mut self) -> PResult<ActorDecl> {
@@ -186,15 +196,36 @@ impl Parser {
 
         let mut init = None;
         let mut receive = None;
-        while self.at(&Tok::Fn) {
+        let mut view = None;
+        while self.at(&Tok::Fn) || self.at(&Tok::View) {
             let decl = self.fn_decl()?;
+            // A `view fn` is the actor's view whatever it is called: the
+            // keyword already says what it is, so the name is free to say what
+            // it draws.
+            if decl.is_view {
+                if let Some(first) = &view {
+                    let first: &FnDecl = first;
+                    return Err(Diagnostic::new(
+                        decl.span,
+                        format!("`{}` already draws this actor", first.name),
+                    )
+                    .with_label("a second view")
+                    .with_help(
+                        "an actor has one view; break the rest out as `view fn`                          items outside the actor and call them as children",
+                    ));
+                }
+                view = Some(decl);
+                continue;
+            }
             match decl.name.as_str() {
                 "init" => init = Some(decl),
                 "receive" => receive = Some(decl),
                 other => {
                     return Err(Diagnostic::new(decl.span, format!("unexpected function `{other}`"))
                         .with_label("not part of an actor")
-                        .with_help("an actor declares exactly `init` and `receive`"));
+                        .with_help(
+                            "an actor declares `init` and `receive`, and optionally a                              `view fn` to draw itself",
+                        ));
                 }
             }
         }
@@ -206,7 +237,7 @@ impl Parser {
                 .with_help("an actor needs `fn init()` for its starting state and `fn receive(state, msg)` for each message"));
         };
 
-        Ok(ActorDecl { name, state, message, init, receive, span: Self::join(start, end) })
+        Ok(ActorDecl { name, state, message, init, receive, view, span: Self::join(start, end) })
     }
 
     fn type_decl(&mut self) -> PResult<TypeDecl> {
@@ -447,6 +478,30 @@ impl Parser {
                     self.advance();
                     let args = self.allowing_records(|p| p.call_args())?;
                     let end = self.expect(Tok::RParen)?;
+
+                    // §6.2's trailing block. A block attaches only to a name
+                    // this parser already knows is a builder, which is what
+                    // keeps `foo()` followed by a block unambiguous without a
+                    // no-block-here restriction of the kind `if` needs.
+                    if let Expr::Ident { name, .. } = &expr {
+                        if is_builder(name) {
+                            let name = name.clone();
+                            let children = if takes_children(&name) && self.at(&Tok::LBrace) {
+                                Some(self.block()?)
+                            } else {
+                                None
+                            };
+                            let end = children.as_ref().map_or(end, |b| b.span);
+                            expr = Expr::Build {
+                                span: Self::join(expr.span(), end),
+                                name,
+                                args,
+                                children,
+                            };
+                            continue;
+                        }
+                    }
+
                     expr = Expr::Call {
                         span: Self::join(expr.span(), end),
                         callee: Box::new(expr),

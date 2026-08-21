@@ -7,6 +7,7 @@ pub mod diag;
 pub mod hir;
 pub mod lexer;
 pub mod parser;
+pub mod ui;
 
 /// Front end: source to typed IR, with every diagnostic gathered against the
 /// original source so §8.2 rendering works.

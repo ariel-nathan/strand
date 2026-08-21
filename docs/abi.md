@@ -118,3 +118,60 @@ host imports in emitted modules — the function-index space shifts once imports
 exist, so it is a real change rather than an addition. Today the sending half
 is exercised by a host encoder that reads layout from the same `Hir`, so both
 ends still agree by construction.
+
+## 8. The frame: how a view crosses into the host
+
+A `view fn` (§6.2) does not return a tree. It **appends** to a fixed array in
+its own arena and returns nothing — `Node` has no runtime representation at
+all, and that absence is the design rather than an optimisation.
+
+Layout, one record per node, 32 bytes:
+
+| offset | field | notes |
+|---|---|---|
+| 0 | `i32 kind` | which widget (`strandc::ui::NodeKind`) |
+| 4 | `i32 child_count` | how many of the preceding roots are this node's |
+| 8 | `i32 id` | hit id; 0 means the node takes no input |
+| 12 | `i32 flag` | `checked`, `focused` |
+| 16 | `i32 text` | §5 string pointer, or 0 |
+| 20 | `f32 number` | `gap`, or a scroll's `offset` |
+| 24 | `f32 number2` | `padding` |
+| 28 | `i32 text2` | a second string, for the one widget needing two |
+
+**The array is post-order.** A view emits as it evaluates, so a container's
+children are finished before it is, and it records how many of the unclaimed
+roots belong to it. Rebuilding the tree is one left-to-right pass with a stack.
+Nothing is moved, nothing is back-patched, and — as in §7 — there is no decode
+step: the bytes the guest wrote are the bytes the host reads.
+
+Codegen keeps one counter, `pending`, holding the number of finished roots not
+yet claimed by a parent. A builder saves it before its children run and hands
+the saved value to `node_push`, which computes `child_count = pending - marker`
+and then sets `pending = marker + 1`. That single subtraction replaces the
+child-tracking stack a tree builder would otherwise need, and it is what makes
+conditional children free: an `if` that does not run appends nothing, so its
+parent simply counts one fewer.
+
+**Why `Node` is zero-width.** A node is emitted where it is written, so a value
+that could be stored, passed, or used twice would be a node that appears
+somewhere other than where it was built. Making the type carry nothing means
+the checker rejects `let n = text("hi")` and `fn f(n: Node)` outright, and the
+array is in tree order by construction rather than by discipline. The rule is
+the same shape as §7's flat-message rule: a restriction that buys a property.
+
+Exports:
+
+    strand_nodes           // i32 global: where the array starts
+    strand_node_count      // i32 global: how many records are in it
+    strand_frame_reset()   // empty the array before building the next frame
+
+The arena is fixed at 2048 nodes (`ui::NODE_CAPACITY`) and sits between the
+static data and the bump heap. A view that exceeds it traps rather than
+growing — following the arena discipline `docs/inspiration-canon.md` takes from
+TigerBeetle, and because a trap arrives as a crash report naming the actor
+(§8.4) while a silent truncation arrives as a view that stopped drawing halfway
+down.
+
+`crates/strandc/src/ui.rs` is the single table describing all of this. The
+parser, the checker, codegen and the host's decoder all read it, so the two
+ends of the boundary cannot disagree about a byte.

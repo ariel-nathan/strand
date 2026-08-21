@@ -49,6 +49,9 @@ pub fn run_main(hir: &Hir, wasm: &[u8]) -> Result<String> {
 fn render(hir: &Hir, ty: &Ty, values: &[Val], memory: &[u8]) -> String {
     match ty {
         Ty::Unit => "()".to_string(),
+        // A node was drawn, not returned: the frame's array holds it, and
+        // `strand view` is what reads that.
+        Ty::Node => "<node>".to_string(),
         Ty::Int => values[0].unwrap_i64().to_string(),
         Ty::Float => format_float(values[0].unwrap_f64()),
         Ty::Bool => (values[0].unwrap_i32() != 0).to_string(),
@@ -139,6 +142,9 @@ fn render_pointer(hir: &Hir, ty: &Ty, ptr: usize, memory: &[u8]) -> String {
 
 fn read_field(hir: &Hir, ty: &Ty, at: usize, memory: &[u8]) -> String {
     match ty {
+        // Unrepresentable as a field: the checker rejects a record that holds
+        // one, so this arm exists only to keep the match total.
+        Ty::Node => "<node>".to_string(),
         Ty::Int => read_i64(memory, at).map_or("<oob>".into(), |v| v.to_string()),
         Ty::Float => read_i64(memory, at)
             .map_or("<oob>".into(), |v| format_float(f64::from_bits(v as u64))),

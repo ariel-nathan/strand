@@ -11,6 +11,7 @@ use crate::ast;
 use crate::diag::Diagnostic;
 use crate::hir::*;
 use crate::lexer::Span;
+use crate::ui::{self, PropTy, Slot};
 
 pub fn check(program: &ast::Program) -> Result<Hir, Vec<Diagnostic>> {
     let mut cx = Checker::default();
@@ -35,6 +36,7 @@ fn fn_decls(program: &ast::Program) -> Vec<&ast::FnDecl> {
             ast::Item::Actor(decl) => {
                 out.push(&decl.init);
                 out.push(&decl.receive);
+                out.extend(decl.view.as_ref());
             }
             ast::Item::Type(_) => {}
         }
@@ -42,11 +44,44 @@ fn fn_decls(program: &ast::Program) -> Vec<&ast::FnDecl> {
     out
 }
 
+/// The Strand type a prop argument must have.
+fn prop_ty(ty: PropTy) -> Ty {
+    match ty {
+        PropTy::Int => Ty::Int,
+        PropTy::Float => Ty::Float,
+        PropTy::Bool => Ty::Bool,
+        PropTy::Str => Ty::Str,
+    }
+}
+
+/// A builder's props, for the "you can write these" half of a diagnostic.
+fn prop_list(builder: &ui::Builder) -> String {
+    if builder.props.is_empty() {
+        return "no props".to_string();
+    }
+    builder
+        .props
+        .iter()
+        .map(|prop| format!("`{}`", prop.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn number_default(builder: &ui::Builder, slot: Slot) -> f32 {
+    builder
+        .props
+        .iter()
+        .find(|prop| prop.slot == slot)
+        .and_then(|prop| prop.default)
+        .unwrap_or(0.0)
+}
+
 #[derive(Debug, Clone)]
 struct Signature {
     id: FuncId,
     params: Vec<(String, Ty)>,
     ret: Ty,
+    is_view: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +106,10 @@ struct Checker {
     locals: Vec<Ty>,
     param_count: usize,
     ret_ty: Ty,
+    /// Whether the body being checked was written `view fn`. Builders are legal
+    /// only here, which is what confines a node's lifetime to the expression
+    /// that built it.
+    in_view: bool,
 }
 
 impl Default for Hir {
@@ -192,14 +231,96 @@ impl Checker {
                 self.error(decl.span, format!("function `{}` is declared twice", decl.name));
                 continue;
             }
-            let params = decl
+            let params: Vec<(String, Ty)> = decl
                 .params
                 .iter()
                 .map(|p| (p.name.clone(), self.resolve_ty(&p.ty)))
                 .collect();
             let ret = decl.ret.as_ref().map_or(Ty::Unit, |t| self.resolve_ty(t));
+            self.check_view_signature(decl, &params, &ret);
             let id = FuncId(self.signatures.len() as u32);
-            self.signatures.insert(decl.name.clone(), Signature { id, params, ret });
+            self.signatures.insert(
+                decl.name.clone(),
+                Signature { id, params, ret, is_view: decl.is_view },
+            );
+        }
+    }
+
+    /// `Node` is a value you may build and hand back, and nothing else.
+    ///
+    /// A node is emitted into the frame's array at the point it is written, so
+    /// storing one would mean a node that appears somewhere other than where it
+    /// was built. Rather than let that be a subtle ordering bug, the type
+    /// system makes it unsayable — the same move as §5.3's flat message rule.
+    fn check_view_signature(&mut self, decl: &ast::FnDecl, params: &[(String, Ty)], ret: &Ty) {
+        for (name, ty) in params {
+            if *ty == Ty::Node {
+                self.error_labeled(
+                    decl.span,
+                    format!("parameter `{name}` cannot be a Node"),
+                    "nodes are not values you can pass",
+                    "a node is emitted where it is written, so passing one would \
+                     put it somewhere else in the tree — pass the data and build \
+                     the node in place, or call a `view fn` as a child",
+                );
+            }
+        }
+
+        if decl.is_view && *ret != Ty::Node {
+            let found = self.show(ret);
+            self.error_labeled(
+                decl.span,
+                format!("`view fn {}` must return Node, found {found}", decl.name),
+                "not a view",
+                "a view function is `view fn name(...) -> Node`",
+            );
+        }
+        if !decl.is_view && *ret == Ty::Node {
+            self.error_labeled(
+                decl.span,
+                format!("`{}` returns Node but is not a view", decl.name),
+                "missing `view`",
+                format!("write `view fn {}` — only a view may build nodes (§6.2)", decl.name),
+            );
+        }
+    }
+
+    /// A view returns one node, so a node built as a *statement* is built and
+    /// then dropped on the floor — it never joins the tree.
+    ///
+    /// Left unchecked this is only caught when the host reads a frame with two
+    /// roots in it, which is a long way from the line that wrote them.
+    fn reject_orphan_nodes(&mut self, body: &Block, source: &ast::Block) {
+        let spans: Vec<Span> = source
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                ast::Stmt::Expr(expr) => Some(expr.span()),
+                _ => None,
+            })
+            .collect();
+
+        let mut seen = 0;
+        let mut orphans = Vec::new();
+        for stmt in &body.stmts {
+            if let Stmt::Expr(expr) = stmt {
+                if expr.ty == Ty::Node {
+                    if let Some(span) = spans.get(seen) {
+                        orphans.push(*span);
+                    }
+                }
+                seen += 1;
+            }
+        }
+
+        for span in orphans {
+            self.error_labeled(
+                span,
+                "this node is built but never placed",
+                "nowhere to go",
+                "a view returns one node — put this inside a container's block, \
+                 or make it the value the view returns",
+            );
         }
     }
 
@@ -301,12 +422,33 @@ impl Checker {
                 );
             }
 
+            // A UI actor is one that declares how to draw itself. Everything
+            // else about it — mailbox, state, supervision — is unchanged.
+            let view = decl.view.as_ref().and_then(|view_decl| {
+                let signature = self.signatures.get(&view_decl.name).cloned()?;
+                match signature.params.as_slice() {
+                    [(_, only)] if only.unifies(&state) => {}
+                    _ => {
+                        let want = self.show(&state);
+                        self.error_labeled(
+                            view_decl.span,
+                            format!("`view` takes the actor state {want} and nothing else"),
+                            "wrong parameters",
+                            "a view is a pure function of state (§6.5), so the state \
+                             is all it gets",
+                        );
+                    }
+                }
+                Some(signature.id)
+            });
+
             self.hir.actor = Some(ActorInfo {
                 name: decl.name.clone(),
                 state,
                 message,
                 init: init.id,
                 receive: receive.id,
+                view,
             });
         }
     }
@@ -335,6 +477,12 @@ impl Checker {
                 };
 
                 match name.as_str() {
+                    "Node" => {
+                        if arity != 0 {
+                            self.error(*span, "`Node` takes no type arguments");
+                        }
+                        Ty::Node
+                    }
                     "int" | "float" | "bool" | "string" | "unit" => {
                         if arity != 0 {
                             self.error(*span, format!("`{name}` takes no type arguments"));
@@ -403,6 +551,7 @@ impl Checker {
             self.scopes.clear();
             self.locals.clear();
             self.ret_ty = signature.ret.clone();
+            self.in_view = signature.is_view;
 
             self.scopes.push(HashMap::new());
             for (name, ty) in &signature.params {
@@ -411,6 +560,9 @@ impl Checker {
             self.param_count = self.locals.len();
 
             let body = self.check_block(&decl.body, Some(&signature.ret));
+            if signature.is_view {
+                self.reject_orphan_nodes(&body, &decl.body);
+            }
             if !body.ty.unifies(&signature.ret) {
                 let (found, want) = (self.show(&body.ty), self.show(&signature.ret));
                 self.error(
@@ -421,6 +573,7 @@ impl Checker {
 
             self.hir.funcs.push(Func {
                 name: decl.name.clone(),
+                is_view: signature.is_view,
                 ret: signature.ret,
                 locals: std::mem::take(&mut self.locals),
                 param_count: self.param_count,
@@ -471,6 +624,14 @@ impl Checker {
                             value.ty.clone()
                         }
                     };
+                    if ty == Ty::Node {
+                        self.error_labeled(
+                            *span,
+                            format!("`{name}` cannot hold a Node"),
+                            "nodes are emitted, not stored",
+                            "a node joins the tree where it is written, so binding one                              would separate the two — write the builder call where the                              node belongs, or wrap it in a `view fn` and call that",
+                        );
+                    }
                     let slot = self.declare(name.clone(), ty, *mutable);
                     stmts.push(Stmt::Let { slot, value });
                 }
@@ -646,6 +807,10 @@ impl Checker {
 
             ast::Expr::Call { callee, args, span } => self.check_call(callee, args, *span, expected),
 
+            ast::Expr::Build { name, args, children, span } => {
+                self.check_build(name, args, children.as_ref(), *span)
+            }
+
             ast::Expr::RecordLit { name, fields, span } => {
                 self.check_record_lit(name.as_deref(), fields, *span, expected)
             }
@@ -672,6 +837,12 @@ impl Checker {
                             then_block.ty.join(&else_expr.ty)
                         }
                     }
+                    // A view's `if` needs no `else`: §6.2 writes conditional
+                    // children, and "no node" is a perfectly good result. It
+                    // costs nothing to represent, because the frame's array
+                    // simply has one fewer entry and its parent counts one
+                    // fewer child.
+                    None if then_block.ty == Ty::Node => Ty::Node,
                     None => {
                         // Without `else` the branch cannot produce a value.
                         if !then_block.ty.unifies(&Ty::Unit) {
@@ -778,6 +949,167 @@ impl Checker {
             ty,
             kind: ExprKind::Binary { op: hir_op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
         }
+    }
+
+    /// §6.2's builder call: `column(gap: 4) { ... }`.
+    ///
+    /// Props are ordinary type-checked arguments, which is the whole argument
+    /// for the builder DSL over a JSX-shaped syntax — there is no second mode
+    /// with its own escape hatches, and a mistyped prop is a compile error like
+    /// any other.
+    fn check_build(
+        &mut self,
+        name: &str,
+        args: &[ast::Arg],
+        children: Option<&ast::Block>,
+        span: Span,
+    ) -> Expr {
+        let Some(builder) = ui::lookup(name) else {
+            self.error(span, format!("unknown builder `{name}`"));
+            return Expr { ty: Ty::Error, kind: ExprKind::Unit };
+        };
+
+        if !self.in_view {
+            self.error_labeled(
+                span,
+                format!("`{name}` builds a node, so it belongs in a view"),
+                "not inside a `view fn`",
+                "mark the enclosing function `view fn name(...) -> Node` (§6.2)",
+            );
+        }
+
+        // Props bind by label where one is written and by position otherwise —
+        // the same rule ordinary calls use, so there is nothing new to learn.
+        let mut props: Vec<(Slot, Expr)> = Vec::new();
+        let mut filled: Vec<&'static str> = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            let found = match &arg.name {
+                Some(label) => builder.props.iter().find(|prop| prop.name == *label),
+                None => builder.props.get(index),
+            };
+            let Some(prop) = found else {
+                match &arg.name {
+                    Some(label) => self.error_labeled(
+                        arg.span,
+                        format!("`{name}` has no prop `{label}`"),
+                        "unknown prop",
+                        format!("`{name}` takes {}", prop_list(builder)),
+                    ),
+                    None => self.error(
+                        arg.span,
+                        format!("`{name}` takes {} argument(s), found {}", builder.props.len(), args.len()),
+                    ),
+                }
+                self.check_expr(&arg.value, None);
+                continue;
+            };
+
+            if filled.contains(&prop.name) {
+                self.error(arg.span, format!("`{}` is given twice", prop.name));
+            }
+            filled.push(prop.name);
+
+            let want = prop_ty(prop.ty);
+            let value = self.check_expr(&arg.value, Some(&want));
+            if !value.ty.unifies(&want) {
+                let (found, want) = (self.show(&value.ty), self.show(&want));
+                self.error_labeled(
+                    arg.span,
+                    format!("`{}` on `{name}` is {want}, found {found}", prop.name),
+                    "wrong type",
+                    "props are type-checked like any other argument (§6.2)",
+                );
+            }
+            props.push((prop.slot, value));
+        }
+
+        for prop in builder.props {
+            if prop.default.is_none() && !filled.contains(&prop.name) {
+                self.error_labeled(
+                    span,
+                    format!("`{name}` needs `{}`", prop.name),
+                    "missing prop",
+                    format!("`{name}` takes {}", prop_list(builder)),
+                );
+            }
+        }
+
+        let numbers = [
+            number_default(builder, Slot::Number),
+            number_default(builder, Slot::Number2),
+        ];
+
+        let children = match children {
+            Some(block) => {
+                if !builder.container {
+                    self.error_labeled(
+                        block.span,
+                        format!("`{name}` has no children"),
+                        "unexpected block",
+                        format!("`{name}` is a leaf — it draws itself and nothing under it"),
+                    );
+                }
+                self.check_children(block)
+            }
+            None => Block { stmts: Vec::new(), tail: None, ty: Ty::Unit },
+        };
+
+        Expr { ty: Ty::Node, kind: ExprKind::MakeNode { kind: builder.kind, props, numbers, children } }
+    }
+
+    /// A builder's trailing block. Every statement in it is a child, so unlike
+    /// an ordinary block it has no tail value — the last node is a child like
+    /// the others, not a result.
+    fn check_children(&mut self, block: &ast::Block) -> Block {
+        let mut checked = self.check_block(block, Some(&Ty::Node));
+
+        let spans: Vec<Span> = block
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                ast::Stmt::Expr(expr) => Some(expr.span()),
+                _ => None,
+            })
+            .collect();
+        let mut seen = 0;
+        let mut complaints = Vec::new();
+        for stmt in &checked.stmts {
+            if let Stmt::Expr(expr) = stmt {
+                if let Some(span) = spans.get(seen) {
+                    complaints.push((expr.ty.clone(), *span));
+                }
+                seen += 1;
+            }
+        }
+        for (ty, span) in complaints {
+            self.expect_child_ty(&ty, span);
+        }
+
+        // The last child is a child like the others, not the block's value.
+        if let Some(tail) = checked.tail.take() {
+            if let Some(source) = &block.tail {
+                self.expect_child_ty(&tail.ty, source.span());
+            }
+            checked.stmts.push(Stmt::Expr(*tail));
+        }
+        checked.ty = Ty::Unit;
+        checked
+    }
+
+    /// Anything in a children block must either be a node or do nothing
+    /// visible. A stray value would be silently dropped, which is exactly the
+    /// class of mistake `{count && <Badge/>}` makes in JSX.
+    fn expect_child_ty(&mut self, ty: &Ty, span: Span) {
+        if matches!(ty, Ty::Node | Ty::Unit | Ty::Never | Ty::Error) {
+            return;
+        }
+        let found = self.show(ty);
+        self.error_labeled(
+            span,
+            format!("a child must be a Node, found {found}"),
+            "not a node",
+            "children are nodes — a bare value here would be silently dropped",
+        );
     }
 
     fn check_call(

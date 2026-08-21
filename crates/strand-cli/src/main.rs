@@ -16,6 +16,7 @@ usage:
   strand run <file.str>            compile and run `main`
   strand build <file.str> [-o out] compile to a .wasm module
   strand todo                      the todo UI (§7)
+  strand view <file.str> [w h]     draw a Strand view; with w h, print its tree
   strand inspect [w h]             print the todo UI tree (§8.4)
   strand ui [--burn]               compositor demo (§6.1)
   strand demo [--window|--trace]   run the M0 actor skeleton
@@ -39,6 +40,11 @@ fn main() -> ExitCode {
         ["demo", "--window"] => strand_cli::demo::run(true),
         ["demo", "--trace"] => strand_cli::demo::run_with(false, true),
         ["todo"] => strand_cli::todo::run(),
+        ["view", file] => view(Path::new(file), None),
+        ["view", file, w, h] => match (w.parse::<f32>(), h.parse::<f32>()) {
+            (Ok(w), Ok(h)) => view(Path::new(file), Some((w, h))),
+            _ => Err(anyhow::anyhow!("view takes a width and height in pixels")),
+        },
         ["inspect"] => {
             print!("{}", strand_cli::todo::inspect((800.0, 628.0)));
             return ExitCode::SUCCESS;
@@ -93,6 +99,21 @@ fn run(path: &Path) -> Result<()> {
     let value = strand_cli::run::run_main(&hir, &wasm)?;
     println!("{value}");
     Ok(())
+}
+
+/// Runs a `view fn` written in Strand (§6.2). With a viewport it prints the
+/// laid-out tree instead of opening a window, which is how a view is checked
+/// without a screen.
+fn view(path: &Path, viewport: Option<(f32, f32)>) -> Result<()> {
+    let (hir, _) = front_end(path)?;
+    let wasm = strandc::codegen::emit(&hir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    match viewport {
+        Some(viewport) => {
+            print!("{}", strand_cli::view::inspect(&hir, &wasm, viewport)?);
+            Ok(())
+        }
+        None => strand_cli::view::run(&hir, &wasm),
+    }
 }
 
 fn build(path: &Path, out: Option<&Path>) -> Result<()> {

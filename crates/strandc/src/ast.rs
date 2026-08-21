@@ -36,6 +36,8 @@ pub struct ActorDecl {
     pub message: Option<TypeExpr>,
     pub init: FnDecl,
     pub receive: FnDecl,
+    /// `view fn view(state) -> Node`, when the actor draws itself (§6.2).
+    pub view: Option<FnDecl>,
     pub span: Span,
 }
 
@@ -46,6 +48,10 @@ pub struct FnDecl {
     /// `None` means the function returns unit.
     pub ret: Option<TypeExpr>,
     pub body: Block,
+    /// Written `view fn` (§6.2). A view returns a `Node`, may use the builder
+    /// DSL, and is the only place that may — which is what lets a node be
+    /// emitted exactly where it is written.
+    pub is_view: bool,
     pub span: Span,
 }
 
@@ -190,6 +196,12 @@ pub enum Expr {
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
 
     Call { callee: Box<Expr>, args: Vec<Arg>, span: Span },
+    /// §6.2's builder call: `column(gap: 4) { ... }`.
+    ///
+    /// A separate node rather than a `Call` with a block argument, because the
+    /// children are not an argument: they are a scope whose contents become
+    /// this node's children in the order they are written.
+    Build { name: String, args: Vec<Arg>, children: Option<Block>, span: Span },
     /// `t.title`, and the receiver half of `list.push(x)`.
     Field { base: Box<Expr>, name: String, span: Span },
 
@@ -215,6 +227,7 @@ impl Expr {
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Call { span, .. }
+            | Expr::Build { span, .. }
             | Expr::Field { span, .. }
             | Expr::RecordLit { span, .. }
             | Expr::If { span, .. }

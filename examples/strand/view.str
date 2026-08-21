@@ -1,0 +1,64 @@
+// §6.2's builder DSL, in Strand.
+//
+//   strand view examples/strand/view.str 800 600   print the laid-out tree
+//   strand view examples/strand/view.str           open a window
+//
+// Three things to notice, all of them §6.2's argument for a builder DSL over a
+// JSX-shaped syntax:
+//
+//   - Children are a trailing block, so nesting is just nesting. No `{}` escape
+//     hatch, no second syntax mode to switch into and back out of.
+//   - Props are ordinary arguments: `gap: 8` is type-checked like any other,
+//     and `gap: "8"` is a compile error rather than a silent no-op.
+//   - Conditionals are ordinary `if`. Nothing here needs a ternary, and there
+//     is no `count && <Badge/>` trap to fall into, because a branch that does
+//     not run simply contributes no child.
+
+type Todo = { title: string, done: bool }
+
+fn describe(todo: Todo): string {
+  match todo.done {
+    true  => "done",
+    false => "still to do",
+  }
+}
+
+// A view is a pure function of its arguments. Calling one as a child is how a
+// tree is composed — §6.2's `todoRow(t, onToggle)`, with the callback still to
+// come.
+view fn todoRow(index: int, todo: Todo): Node {
+  row(gap: 8) {
+    checkbox(id: 1000 + index, checked: todo.done, label: todo.title)
+    spacer()
+    muted(describe(todo))
+  }
+}
+
+view fn main(): Node {
+  let first = Todo { title: "write the compiler", done: true }
+  let second = Todo { title: "write the renderer", done: true }
+  let third = Todo { title: "write a view in Strand", done: false }
+
+  screen(gap: 12, padding: 16) {
+    text("todo — built by Strand")
+
+    row(gap: 8) {
+      textInput(id: 1, value: "", prompt: "what needs doing?")
+      button(id: 2, label: "Add")
+    }
+
+    panel(gap: 8) {
+      todoRow(0, first)
+      todoRow(1, second)
+      todoRow(2, third)
+
+      // No `else` needed: a branch that does not run contributes no child.
+      if third.done {
+        muted("all done")
+      }
+    }
+
+    spacer()
+    muted("this whole tree was built by compiled Strand code")
+  }
+}

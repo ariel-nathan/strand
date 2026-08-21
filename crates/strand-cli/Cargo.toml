@@ -23,4 +23,5 @@ tracing.workspace = true
 wasmtime = "48.0.0"
 
 [dev-dependencies]
+miette = { version = "7.6.0", features = ["fancy"] }
 wasmparser = "0.257.1"

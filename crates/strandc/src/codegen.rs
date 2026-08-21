@@ -14,6 +14,7 @@ use wasm_encoder::{
 };
 
 use crate::hir::*;
+use crate::ui::{self, Slot};
 
 /// Every value occupies whole 8-byte slots in memory, so field offsets are
 /// just word counts. Simpler than tight packing and irrelevant at POC scale.
@@ -35,7 +36,9 @@ fn rep(ty: &Ty) -> Vec<ValType> {
         Ty::Str | Ty::List(_) | Ty::Record(_) | Ty::Sum(_) => vec![ValType::I32],
         // The multi-value pair. This is the whole point of docs/abi.md §2.
         Ty::Option(_) | Ty::Result(..) => vec![ValType::I32, ValType::I64],
-        Ty::Unit | Ty::Never | Ty::Error => vec![],
+        // A node leaves nothing behind: building it *was* the effect. See
+        // `Ty::Node` in the HIR for why that is the point rather than a saving.
+        Ty::Unit | Ty::Never | Ty::Error | Ty::Node => vec![],
     }
 }
 
@@ -82,6 +85,17 @@ struct Emitter<'hir> {
     heap_start: u32,
     alloc_index: u32,
     str_eq_index: u32,
+    /// The generated helper that appends one node to the frame's array.
+    node_push_index: u32,
+    /// Globals holding the frame's arena. Their indices depend on whether the
+    /// module has an actor, since the state global keeps index 1 — it is
+    /// exported as `strand_state` and moving it would break the host.
+    node_base_global: u32,
+    node_count_global: u32,
+    pending_global: u32,
+    /// Whether anything in this module builds nodes. A module that draws
+    /// nothing pays for none of this.
+    builds_nodes: bool,
     /// Host functions this module actually calls. Imports take the lowest
     /// function indices, so everything defined here is offset past them.
     imports: Vec<Builtin>,
@@ -90,6 +104,10 @@ struct Emitter<'hir> {
 impl<'hir> Emitter<'hir> {
     fn new(hir: &'hir Hir) -> Self {
         let helpers = hir.funcs.len() as u32;
+        let builds_nodes = hir.funcs.iter().any(|func| func.is_view);
+        // Global 0 is the bump pointer and global 1, when there is an actor, is
+        // the state. The frame's arena takes the next three.
+        let first_free = if hir.actor.is_some() { 2 } else { 1 };
         Self {
             hir,
             types: Vec::new(),
@@ -98,6 +116,11 @@ impl<'hir> Emitter<'hir> {
             heap_start: DATA_START,
             alloc_index: helpers,
             str_eq_index: helpers + 1,
+            node_push_index: helpers + 2,
+            node_base_global: first_free,
+            node_count_global: first_free + 1,
+            pending_global: first_free + 2,
+            builds_nodes,
             imports: Vec::new(),
         }
     }
@@ -130,6 +153,7 @@ impl<'hir> Emitter<'hir> {
         let offset = self.imports.len() as u32;
         self.alloc_index += offset;
         self.str_eq_index += offset;
+        self.node_push_index += offset;
 
         // Function types, in index order: user functions, then the two helpers.
         let mut signatures = Vec::new();
@@ -144,6 +168,21 @@ impl<'hir> Emitter<'hir> {
             self.intern_type(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
         let actor_main_ty = self.intern_type(Vec::new(), Vec::new());
         let actor_recv_ty = self.intern_type(vec![ValType::I32, ValType::I32], Vec::new());
+        // node_push(kind, marker, id, flag, text, text2, number, number2)
+        let node_push_ty = self.intern_type(
+            vec![
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::F32,
+                ValType::F32,
+            ],
+            Vec::new(),
+        );
+        let frame_reset_ty = self.intern_type(Vec::new(), Vec::new());
 
         // Bodies are emitted before the type section is finalised, because a
         // multi-value block inside a body can intern a new type.
@@ -175,6 +214,10 @@ impl<'hir> Emitter<'hir> {
         }
         functions.function(alloc_ty);
         functions.function(str_eq_ty);
+        if self.builds_nodes {
+            functions.function(node_push_ty);
+            functions.function(frame_reset_ty);
+        }
         if self.hir.actor.is_some() {
             functions.function(actor_main_ty);
             functions.function(actor_recv_ty);
@@ -191,10 +234,17 @@ impl<'hir> Emitter<'hir> {
         });
         module.section(&memories);
 
+        // The frame's arena sits between the static data and the bump heap, at
+        // a fixed size decided here rather than grown at runtime (see
+        // `ui::NODE_CAPACITY`).
+        let node_arena = self.heap_start;
+        let bump_start =
+            if self.builds_nodes { node_arena + ui::NODE_ARENA_BYTES } else { node_arena };
+
         let mut globals = GlobalSection::new();
         globals.global(
             GlobalType { val_type: ValType::I32, mutable: true, shared: false },
-            &ConstExpr::i32_const(self.heap_start as i32),
+            &ConstExpr::i32_const(bump_start as i32),
         );
         if let Some(actor) = &self.hir.actor {
             // Global 1 holds the current state. `receive` returns the next one,
@@ -205,6 +255,19 @@ impl<'hir> Emitter<'hir> {
                 &zero_of(val_type),
             );
         }
+        if self.builds_nodes {
+            // base, count, and the roots not yet claimed by a parent.
+            globals.global(
+                GlobalType { val_type: ValType::I32, mutable: false, shared: false },
+                &ConstExpr::i32_const(node_arena as i32),
+            );
+            for _ in 0..2 {
+                globals.global(
+                    GlobalType { val_type: ValType::I32, mutable: true, shared: false },
+                    &ConstExpr::i32_const(0),
+                );
+            }
+        }
         module.section(&globals);
 
         let mut exports = ExportSection::new();
@@ -214,9 +277,18 @@ impl<'hir> Emitter<'hir> {
         }
         // The host ABI names from docs/abi.md §6.
         exports.export("strand_alloc", ExportKind::Func, self.alloc_index);
+        if self.builds_nodes {
+            // What a host needs to read a frame: where the array starts, how
+            // many nodes are in it, and how to empty it before the next one.
+            exports.export("strand_nodes", ExportKind::Global, self.node_base_global);
+            exports.export("strand_node_count", ExportKind::Global, self.node_count_global);
+            exports.export("strand_frame_reset", ExportKind::Func, self.node_push_index + 1);
+        }
         if self.hir.actor.is_some() {
-            exports.export("strand_main", ExportKind::Func, self.str_eq_index + 1);
-            exports.export("strand_on_message", ExportKind::Func, self.str_eq_index + 2);
+            let actor_base =
+                if self.builds_nodes { self.node_push_index + 1 } else { self.str_eq_index };
+            exports.export("strand_main", ExportKind::Func, actor_base + 1);
+            exports.export("strand_on_message", ExportKind::Func, actor_base + 2);
             // Lets a host read the actor's state without the actor logging it.
             exports.export("strand_state", ExportKind::Global, 1);
         }
@@ -228,6 +300,14 @@ impl<'hir> Emitter<'hir> {
         }
         code.function(&alloc_body());
         code.function(&str_eq_body());
+        if self.builds_nodes {
+            code.function(&node_push_body(
+                self.node_base_global,
+                self.node_count_global,
+                self.pending_global,
+            ));
+            code.function(&frame_reset_body(self.node_count_global, self.pending_global));
+        }
         if let Some(actor) = &self.hir.actor {
             code.function(&actor_main_body(actor, offset));
             code.function(&actor_receive_body(actor, self.alloc_index, self.hir, offset));
@@ -409,6 +489,67 @@ impl<'hir> Emitter<'hir> {
                     .position(|b| b == builtin)
                     .expect("import was collected");
                 code.push(Instruction::Call(index as u32));
+            }
+
+            ExprKind::MakeNode { kind, props, numbers, children } => {
+                // Slots first, in the order they were written, so a prop that
+                // calls something observable happens when the source says.
+                let id = ctx.scratch(ValType::I32);
+                let flag = ctx.scratch(ValType::I32);
+                let text = ctx.scratch(ValType::I32);
+                let text2 = ctx.scratch(ValType::I32);
+                let number = ctx.scratch(ValType::F32);
+                let number2 = ctx.scratch(ValType::F32);
+                let marker = ctx.scratch(ValType::I32);
+
+                for local in [id, flag, text, text2] {
+                    code.push(Instruction::I32Const(0));
+                    code.push(Instruction::LocalSet(local));
+                }
+                code.push(Instruction::F32Const(numbers[0].into()));
+                code.push(Instruction::LocalSet(number));
+                code.push(Instruction::F32Const(numbers[1].into()));
+                code.push(Instruction::LocalSet(number2));
+
+                for (slot, value) in props {
+                    self.expr(ctx, code, value)?;
+                    // Slots are 32-bit; Strand ints are i64 and floats f64. A
+                    // spacing prop is written as an int (§6.3's unit is the
+                    // logical pixel) but stored as a float, because layout
+                    // works in fractions of one.
+                    match (slot.is_float(), &value.ty) {
+                        (true, Ty::Int) => code.push(Instruction::F32ConvertI64S),
+                        (true, Ty::Float) => code.push(Instruction::F32DemoteF64),
+                        (false, Ty::Int) => code.push(Instruction::I32WrapI64),
+                        // bool and string are already i32.
+                        _ => {}
+                    }
+                    let local = match slot {
+                        Slot::Id => id,
+                        Slot::Flag => flag,
+                        Slot::Text => text,
+                        Slot::Text2 => text2,
+                        Slot::Number => number,
+                        Slot::Number2 => number2,
+                    };
+                    code.push(Instruction::LocalSet(local));
+                }
+
+                // Everything appended from here until the push belongs to this
+                // node. `node_push` turns the difference into a child count.
+                code.push(Instruction::GlobalGet(self.pending_global));
+                code.push(Instruction::LocalSet(marker));
+                self.block(ctx, code, children)?;
+
+                code.push(Instruction::I32Const(kind.tag()));
+                code.push(Instruction::LocalGet(marker));
+                code.push(Instruction::LocalGet(id));
+                code.push(Instruction::LocalGet(flag));
+                code.push(Instruction::LocalGet(text));
+                code.push(Instruction::LocalGet(text2));
+                code.push(Instruction::LocalGet(number));
+                code.push(Instruction::LocalGet(number2));
+                code.push(Instruction::Call(self.node_push_index));
             }
 
             ExprKind::MakeRecord { record, fields } => {
@@ -1068,6 +1209,89 @@ fn alloc_body() -> Function {
     f
 }
 
+/// Appends one node to the frame's array (`ui`'s layout).
+///
+/// `marker` is the pending count from before this node's children ran, so
+/// `pending - marker` is exactly how many of the finished roots are its own.
+/// One subtraction replaces the child-tracking stack a tree builder would
+/// otherwise need, and it is what makes the array post-order by construction.
+///
+/// A frame that exceeds `NODE_CAPACITY` traps. That is deliberate: the arena is
+/// fixed, so the alternative is a silent truncation, and a trap arrives as a
+/// crash report naming the actor (§8.4) instead of as a view that quietly
+/// stopped drawing halfway down.
+fn node_push_body(base_global: u32, count_global: u32, pending_global: u32) -> Function {
+    let mut f = Function::new([(1, ValType::I32)]);
+    let (kind, marker, id, flag, text, text2, number, number2) = (0, 1, 2, 3, 4, 5, 6, 7);
+    let addr = 8;
+
+    // if node_count >= NODE_CAPACITY { unreachable }
+    f.instruction(&Instruction::GlobalGet(count_global));
+    f.instruction(&Instruction::I32Const(ui::NODE_CAPACITY as i32));
+    f.instruction(&Instruction::I32GeU);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+
+    // addr = node_base + node_count * NODE_SIZE
+    f.instruction(&Instruction::GlobalGet(base_global));
+    f.instruction(&Instruction::GlobalGet(count_global));
+    f.instruction(&Instruction::I32Const(ui::NODE_SIZE as i32));
+    f.instruction(&Instruction::I32Mul);
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(addr));
+
+    let store_i32 = |f: &mut Function, offset: u32, local: u32| {
+        f.instruction(&Instruction::LocalGet(addr));
+        f.instruction(&Instruction::LocalGet(local));
+        f.instruction(&Instruction::I32Store(mem_arg(offset as u64, 2)));
+    };
+    store_i32(&mut f, ui::KIND_OFFSET, kind);
+    store_i32(&mut f, Slot::Id.offset(), id);
+    store_i32(&mut f, Slot::Flag.offset(), flag);
+    store_i32(&mut f, Slot::Text.offset(), text);
+    store_i32(&mut f, Slot::Text2.offset(), text2);
+
+    for (offset, local) in [(Slot::Number.offset(), number), (Slot::Number2.offset(), number2)] {
+        f.instruction(&Instruction::LocalGet(addr));
+        f.instruction(&Instruction::LocalGet(local));
+        f.instruction(&Instruction::F32Store(mem_arg(offset as u64, 2)));
+    }
+
+    // child_count = pending - marker
+    f.instruction(&Instruction::LocalGet(addr));
+    f.instruction(&Instruction::GlobalGet(pending_global));
+    f.instruction(&Instruction::LocalGet(marker));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::I32Store(mem_arg(ui::CHILD_COUNT_OFFSET as u64, 2)));
+
+    f.instruction(&Instruction::GlobalGet(count_global));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::GlobalSet(count_global));
+
+    // This node has claimed its children and is now one pending root itself.
+    f.instruction(&Instruction::LocalGet(marker));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::GlobalSet(pending_global));
+
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// Empties the frame's array. §6.1's per-frame arena reset, which at this
+/// layout is two stores.
+fn frame_reset_body(count_global: u32, pending_global: u32) -> Function {
+    let mut f = Function::new([]);
+    for global in [count_global, pending_global] {
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::GlobalSet(global));
+    }
+    f.instruction(&Instruction::End);
+    f
+}
+
 /// Byte-wise string equality, needed by string patterns (§5 layout).
 fn str_eq_body() -> Function {
     let mut f = Function::new([(2, ValType::I32)]);
@@ -1259,6 +1483,12 @@ fn collect_expr_strings(expr: &Expr, out: &mut Vec<String>) {
             }
         }
         ExprKind::Block(block) => collect_block_strings(block, out),
+        ExprKind::MakeNode { props, children, .. } => {
+            for (_, value) in props {
+                collect_expr_strings(value, out);
+            }
+            collect_block_strings(children, out);
+        }
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Bool(_)
