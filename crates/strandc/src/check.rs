@@ -13,6 +13,7 @@ use crate::diag::Diagnostic;
 use crate::hir::*;
 use crate::lexer::Span;
 use crate::input;
+use crate::lifecycle;
 use crate::stdlib;
 use crate::ui::{self, PropTy, Slot};
 
@@ -218,7 +219,7 @@ impl Checker {
     // ---- declarations ----------------------------------------------------
 
     fn collect_types(&mut self, program: &ast::Program) {
-        self.collect_platform_input(program);
+        self.collect_platform_types(program);
 
         // Pass 1: reserve ids so types may refer to each other in any order.
         for item in &program.items {
@@ -306,34 +307,48 @@ impl Checker {
         }
     }
 
-    /// Declares the platform's `Input` type, if this module asked for it.
+    /// Declares the platform's own types, for the modules that asked for them.
     ///
-    /// Asking means naming `Input` as the type of a port. That is the whole
-    /// opt-in, and it matters because registering the type also registers
-    /// `Click`, `Enter` and the rest as constructors — ordinary names a UI
-    /// program might want for itself. A file that never mentions `Input`
-    /// reserves nothing; a file that declares its own `type Input` keeps it,
-    /// and is left alone here rather than being told it clashes with something
-    /// it never asked for.
-    fn collect_platform_input(&mut self, program: &ast::Program) {
+    /// Asking means naming one as the type of a port. That is the whole opt-in,
+    /// and it matters because registering `Input` also registers `Click`,
+    /// `Enter` and the rest as constructors — ordinary names a UI program might
+    /// want for itself. A file that never mentions a platform type reserves
+    /// nothing from it; a file that declares its own type of that name keeps
+    /// its own, and is left alone here rather than told it clashes with
+    /// something it never asked for.
+    fn collect_platform_types(&mut self, program: &ast::Program) {
+        for (name, variants) in
+            [(input::TYPE_NAME, input::VARIANTS), (lifecycle::TYPE_NAME, lifecycle::VARIANTS)]
+        {
+            self.collect_platform_type(program, name, variants);
+        }
+    }
+
+    fn collect_platform_type(
+        &mut self,
+        program: &ast::Program,
+        type_name: &str,
+        variants: &[input::Variant],
+    ) {
         let asked = program.items.iter().any(|item| match item {
             ast::Item::Actor(decl) => decl.inbox.iter().chain(&decl.outbox).any(|port| {
                 matches!(&port.ty, ast::TypeExpr::Named { name, args, .. }
-                    if name == input::TYPE_NAME && args.is_empty())
+                    if name == type_name && args.is_empty())
             }),
             _ => false,
         });
-        let declared_here = program.items.iter().any(|item| {
-            matches!(item, ast::Item::Type(decl) if decl.name == input::TYPE_NAME)
-        });
+        let declared_here = program
+            .items
+            .iter()
+            .any(|item| matches!(item, ast::Item::Type(decl) if decl.name == type_name));
         if !asked || declared_here {
             return;
         }
 
         let id = SumId(self.hir.sums.len() as u32);
         self.hir.sums.push(SumDef {
-            name: input::TYPE_NAME.to_string(),
-            variants: input::VARIANTS
+            name: type_name.to_string(),
+            variants: variants
                 .iter()
                 .map(|variant| Variant {
                     name: variant.name.to_string(),
@@ -351,8 +366,8 @@ impl Checker {
                 })
                 .collect(),
         });
-        self.sum_ids.insert(input::TYPE_NAME.to_string(), id);
-        for (index, variant) in input::VARIANTS.iter().enumerate() {
+        self.sum_ids.insert(type_name.to_string(), id);
+        for (index, variant) in variants.iter().enumerate() {
             self.ctors.insert(variant.name.to_string(), (id, index as u32));
         }
         // No `type_defs` or `ctor_defs` entry: there is no declaration in this
@@ -1968,6 +1983,33 @@ impl Checker {
         // Host builtins are not user functions and cannot be shadowed.
         if name == "send" {
             return self.check_send(args, span);
+        }
+
+        // §4.3's second tier: a bug ends the actor. There is no catch, so the
+        // type is `Never` — it unifies with whatever the surrounding
+        // expression owes, which is what lets `panic` stand as a match arm or
+        // as a function's tail without a value to return.
+        if name == "panic" {
+            if args.len() != 1 {
+                self.error_labeled(
+                    span,
+                    "`panic` takes one message",
+                    "wrong arguments",
+                    "write `panic(\"what went wrong\")` — the message becomes the                      crash report's reason (§8.4)",
+                );
+            }
+            let arg = args
+                .first()
+                .map(|a| self.check_expr(&a.value, Some(&Ty::Str)))
+                .unwrap_or(Expr { ty: Ty::Error, kind: ExprKind::Unit });
+            if !arg.ty.unifies(&Ty::Str) {
+                let found = self.show(&arg.ty);
+                self.error(span, format!("`panic` takes a string, found {found}"));
+            }
+            return Expr {
+                ty: Ty::Never,
+                kind: ExprKind::CallBuiltin { builtin: Builtin::Panic, args: vec![arg] },
+            };
         }
 
         if name == "log" {

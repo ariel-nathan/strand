@@ -383,6 +383,9 @@ pub enum Builtin {
     /// `send(port, ptr, len)` — hands bytes to whatever the `app` block wired
     /// this port to. The guest names a port; the host knows the destination.
     Send,
+    /// `panic(msg: string)` — §4.3's second tier. Ends this actor and nothing
+    /// else, with the message as the crash report's reason.
+    Panic,
 }
 
 impl Builtin {
@@ -390,6 +393,7 @@ impl Builtin {
         match self {
             Builtin::Log => "log",
             Builtin::Send => "send",
+            Builtin::Panic => "panic",
         }
     }
 
@@ -398,6 +402,7 @@ impl Builtin {
         match self {
             Builtin::Log => ("strand", "log"),
             Builtin::Send => ("strand", "send"),
+            Builtin::Panic => ("strand", "panic"),
         }
     }
 }

@@ -8,6 +8,7 @@ pub mod diag;
 pub mod hir;
 pub mod input;
 pub mod lexer;
+pub mod lifecycle;
 pub mod line_index;
 pub mod parser;
 pub mod stdlib;

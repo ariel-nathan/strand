@@ -720,6 +720,17 @@ impl<'hir> Emitter<'hir> {
                     Builtin::Send => {
                         return bail("`send` is emitted from its own node, not as a call")
                     }
+                    // Same string unpacking as `log`: the host takes a pair.
+                    Builtin::Panic => {
+                        let text = ctx.scratch(ValType::I32);
+                        self.expr(ctx, code, &args[0])?;
+                        code.push(Instruction::LocalSet(text));
+                        code.push(Instruction::LocalGet(text));
+                        code.push(Instruction::I32Const(4));
+                        code.push(Instruction::I32Add);
+                        code.push(Instruction::LocalGet(text));
+                        code.push(Instruction::I32Load(mem_arg(0, 2)));
+                    }
                 }
                 let index = self
                     .imports
@@ -727,6 +738,14 @@ impl<'hir> Emitter<'hir> {
                     .position(|b| b == builtin)
                     .expect("import was collected");
                 code.push(Instruction::Call(index as u32));
+                // The host call raises rather than returns, but WASM has no way
+                // to say so about an import. Without this, everything after a
+                // `panic` is still reachable as far as validation is concerned,
+                // and a `panic` in tail position would fall off a function that
+                // owes its caller a value.
+                if *builtin == Builtin::Panic {
+                    code.push(Instruction::Unreachable);
+                }
             }
 
             ExprKind::CallHelper { helper, args } => {
@@ -1464,6 +1483,10 @@ fn builtin_signature(builtin: Builtin) -> (Vec<ValType>, Vec<ValType>) {
         Builtin::Log => (vec![ValType::I32, ValType::I32], Vec::new()),
         // send(port, ptr, len)
         Builtin::Send => (vec![ValType::I32, ValType::I32, ValType::I32], Vec::new()),
+        // panic(ptr, len). Declared as returning nothing even though it never
+        // returns: WASM has no bottom type for an import, so the emitter puts
+        // an `unreachable` after the call instead.
+        Builtin::Panic => (vec![ValType::I32, ValType::I32], Vec::new()),
     }
 }
 

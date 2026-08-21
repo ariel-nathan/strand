@@ -138,8 +138,8 @@
           "name": "keyword.declaration.strand"
         },
         {
-          "comment": "check.rs -- `send` names one of the actor's own out ports. A host call rather than a function, and not shadowable.",
-          "match": "\\b(send)\\b(?=\\s*\\()",
+          "comment": "check.rs -- `send` names one of the actor's own out ports, `panic` ends the actor (4.3). Host calls rather than functions, and not shadowable.",
+          "match": "\\b(send|panic)\\b(?=\\s*\\()",
           "name": "support.function.builtin.strand"
         },
         {

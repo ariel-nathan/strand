@@ -1,0 +1,389 @@
+// §7's demo script, in Strand: a supervision tree you can crash on purpose.
+//
+//   strand view examples/strand/todo_demo.str
+//   strand view examples/strand/todo_demo.str 640 480     the tree, no window
+//
+// `todo_app.str` is the same app in one actor. This is the version §7 actually
+// asks for, and the two extra beats are the whole argument for the
+// architecture:
+//
+//   "crash stats"  panics the Stats actor. Its panel shows a failure boundary
+//                  for a beat, the supervisor puts a fresh one in its place,
+//                  the counts come back — and not one todo is disturbed,
+//                  because they were never in that arena.
+//
+//   "burn CPU"     pegs the Stats actor. Typing stays at frame rate, because
+//                  the compositor is a different thread and the UI actor is a
+//                  different arena. Stats burns by handing itself work through
+//                  a port wired back to itself, so the load is sustained
+//                  rather than one long call.
+//
+// Press F12 for the overlay (§8.4). Two rows, two arenas, and Stats' generation
+// number ticking up each time you crash it.
+
+type Todo = { id: int, title: string, done: bool }
+
+type Model = {
+  todos: List<Todo>,
+  draft: string,
+  focus: int,
+  scroll: float,
+  nextId: int,
+  notice: string,
+  // What Stats last said. `statsUp` is false between a `Down` and the `Up`
+  // that follows it, which is the failure boundary §7 asks for.
+  tally: string,
+  statsUp: bool,
+  burning: bool,
+}
+
+type Counts = { done: int, total: int, spins: int, burning: bool }
+
+fn FIELD(): int { 1 }
+fn ADD(): int { 2 }
+fn CLEAR(): int { 3 }
+fn LIST(): int { 4 }
+fn CRASH(): int { 5 }
+fn BURN(): int { 6 }
+
+fn TOGGLE_BASE(): int { 1000 }
+fn DELETE_BASE(): int { 2000 }
+
+fn MAX(): int { 40 }
+
+type AddError =
+  | EmptyTitle
+  | TooLong(max: int)
+
+fn accept(title: string): Result<string, AddError> {
+  let clean = trim(title)
+  if isEmpty(clean) { return Err(EmptyTitle) }
+  if len(clean) > MAX() { return Err(TooLong(max: MAX())) }
+  Ok(clean)
+}
+
+// ---- what crosses the two channels ----------------------------------------
+//
+// Flat, because a message is copied into a different arena and a pointer from
+// this one would mean nothing there (docs/abi.md §7). That is why the tally
+// comes back as two numbers and is turned into a string on this side.
+
+type Command =
+  // The todos changed; here is what they now are.
+  | Recount(done: int, total: int)
+  // Fall over. §4.3's second tier: a panic ends the actor and nothing else.
+  | Crash
+  // Start or stop burning CPU.
+  | Burn(on: bool)
+
+type Tally = | Counted(done: int, total: int, spins: int, burning: bool)
+
+// The self-wire. Stats hands itself one unit of work at a time, so a burn is
+// many short handler calls rather than one long one — the mailbox stays at one
+// message deep and the actor stays interruptible.
+type Spin = | Again
+
+// ---- state transitions ----------------------------------------------------
+
+fn withDraft(state: Model, draft: string): Model {
+  Model { ...state, draft: draft, notice: "" }
+}
+
+fn withTodos(state: Model, todos: List<Todo>): Model {
+  Model { ...state, todos: todos, notice: "" }
+}
+
+fn noticed(state: Model, notice: string): Model {
+  Model { ...state, notice: notice }
+}
+
+fn commit(state: Model): Model {
+  match accept(state.draft) {
+    Ok(clean) => Model {
+      ...state,
+      todos: push(state.todos, Todo { id: state.nextId, title: clean, done: false }),
+      draft: "",
+      nextId: state.nextId + 1,
+      notice: "",
+    },
+    Err(EmptyTitle) => noticed(state, "a todo needs a title"),
+    Err(TooLong(max)) => noticed(state, "keep it under " + str(max) + " characters"),
+  }
+}
+
+fn toggle(state: Model, id: int): Model {
+  var out: List<Todo> = []
+  for todo in state.todos {
+    if todo.id == id {
+      out = push(out, Todo { ...todo, done: !todo.done })
+    } else {
+      out = push(out, todo)
+    }
+  }
+  withTodos(state, out)
+}
+
+fn remove(state: Model, id: int): Model {
+  var out: List<Todo> = []
+  for todo in state.todos {
+    if todo.id != id { out = push(out, todo) }
+  }
+  withTodos(state, out)
+}
+
+fn clearDone(state: Model): Model {
+  var out: List<Todo> = []
+  for todo in state.todos {
+    if !todo.done { out = push(out, todo) }
+  }
+  if len(out) == len(state.todos) {
+    return noticed(state, "nothing completed to clear")
+  }
+  withTodos(state, out)
+}
+
+fn doneCount(todos: List<Todo>): int {
+  var total = 0
+  for todo in todos {
+    if todo.done { total = total + 1 }
+  }
+  total
+}
+
+fn clicked(state: Model, id: int): Model {
+  if id == ADD() { return commit(state) }
+  if id == CLEAR() { return clearDone(state) }
+  if id >= DELETE_BASE() { return remove(state, id - DELETE_BASE()) }
+  if id >= TOGGLE_BASE() { return toggle(state, id - TOGGLE_BASE()) }
+  state
+}
+
+// ---- the view -------------------------------------------------------------
+
+view fn todoRow(todo: Todo): Node {
+  row(gap: 8) {
+    checkbox(id: TOGGLE_BASE() + todo.id, checked: todo.done, label: todo.title)
+    spacer()
+    button(id: DELETE_BASE() + todo.id, label: "x")
+  }
+}
+
+// The failure boundary. It is drawn from `statsUp`, which is set by a message
+// the platform sent — so what is on screen is the supervision tree's actual
+// state rather than a guess made by a timer.
+view fn statsPanel(state: Model): Node {
+  row(gap: 8) {
+    if state.statsUp {
+      text(state.tally)
+    }
+    if !state.statsUp {
+      muted("stats unavailable — the actor died, the supervisor is restarting it")
+    }
+    spacer()
+    button(id: CRASH(), label: "crash stats")
+    button(id: BURN(), label: burnLabel(state))
+  }
+}
+
+fn burnLabel(state: Model): string {
+  if state.burning { return "stop burning" }
+  "burn CPU"
+}
+
+actor TodoUi {
+  state: Model
+  in  input: Input
+  in  tally: Tally
+  // Opting in to §5.4's news. Without this port the actor still runs; it just
+  // never learns that a peer went away.
+  in  life:  Lifecycle
+  out stats: Command
+
+  fn init(): Model {
+    Model {
+      todos: [
+        Todo { id: 1, title: "write the compiler", done: true },
+        Todo { id: 2, title: "write the runtime", done: true },
+        Todo { id: 3, title: "write the renderer", done: true },
+        Todo { id: 4, title: "crash an actor without losing a todo", done: false },
+      ],
+      draft: "",
+      focus: 0,
+      scroll: 0.0,
+      nextId: 5,
+      notice: "",
+      tally: "counting...",
+      statsUp: true,
+      burning: false,
+    }
+  }
+
+  on input(state: Model, msg: Input): Model {
+    match msg {
+      Typed(ch) => withDraft(state, state.draft + char(ch)),
+      Backspace => withDraft(state, dropLast(state.draft)),
+      Escape => withDraft(state, ""),
+      Enter => {
+        let next = commit(state)
+        send(stats, Recount(done: doneCount(next.todos), total: len(next.todos)))
+        next
+      },
+      Click(id) => {
+        // The two demo buttons are commands to the other actor rather than
+        // edits to this one's state.
+        if id == CRASH() {
+          send(stats, Crash)
+          return state
+        }
+        if id == BURN() {
+          send(stats, Burn(on: !state.burning))
+          return Model { ...state, burning: !state.burning }
+        }
+        let next = clicked(state, id)
+        send(stats, Recount(done: doneCount(next.todos), total: len(next.todos)))
+        next
+      },
+      Focus(id) => Model { ...state, focus: id },
+      Scrolled(id, offset) => Model { ...state, scroll: offset },
+    }
+  }
+
+  on tally(state: Model, msg: Tally): Model {
+    match msg {
+      Counted(done, total, spins, burning) => Model {
+        ...state,
+        tally: str(done) + "/" + str(total) + " done · " + str(spins) + " spins",
+        burning: burning,
+        statsUp: true,
+      },
+    }
+  }
+
+  on life(state: Model, msg: Lifecycle): Model {
+    match msg {
+      // The peer's arena went with it, so what it knew is gone.
+      Down(port) => Model { ...state, statsUp: false, burning: false },
+      // A fresh one, starting from `init`. It has to be told again — which is
+      // exactly why `Up` carries no state of its own to restore. This arrives
+      // at startup too: the first `Up` is what asks for the first count.
+      Up(port) => {
+        send(stats, Recount(done: doneCount(state.todos), total: len(state.todos)))
+        Model { ...state, statsUp: true, tally: "counting..." }
+      },
+    }
+  }
+
+  view fn draw(state: Model): Node {
+    screen(gap: 12, padding: 16) {
+      text("todo — " + str(doneCount(state.todos)) + "/" + str(len(state.todos)) + " done")
+
+      statsPanel(state)
+
+      row(gap: 8) {
+        textInput(id: FIELD(), value: state.draft, prompt: "what needs doing?", focused: state.focus == FIELD())
+        button(id: ADD(), label: "Add")
+      }
+
+      if !isEmpty(state.notice) {
+        muted(state.notice)
+      }
+
+      scroll(id: LIST(), offset: state.scroll) {
+        for todo in state.todos {
+          todoRow(todo)
+        }
+        if isEmpty(state.todos) {
+          muted("nothing yet — type something above")
+        }
+      }
+
+      row(gap: 8) {
+        button(id: CLEAR(), label: "Clear done")
+      }
+    }
+  }
+}
+
+actor Stats {
+  state: Counts
+  in  commands: Command
+  in  spins:    Spin
+  out tally:    Tally
+  out again:    Spin
+
+  fn init(): Counts {
+    Counts { done: 0, total: 0, spins: 0, burning: false }
+  }
+
+  on commands(state: Counts, msg: Command): Counts {
+    match msg {
+      Recount(done, total) => {
+        let next = Counts { ...state, done: done, total: total }
+        send(tally, Counted(done: next.done, total: next.total, spins: next.spins, burning: next.burning))
+        next
+      },
+      // Not a divide-by-zero dressed up as a demo: §4.3's panic, with the
+      // reason the supervisor reports (§8.4).
+      Crash => panic("the stats actor was asked to fall over"),
+      Burn(on) => {
+        let next = Counts { ...state, burning: on }
+        if on {
+          send(again, Again)
+        }
+        send(tally, Counted(done: next.done, total: next.total, spins: next.spins, burning: next.burning))
+        next
+      },
+    }
+  }
+
+  // One unit of work, then hand itself the next one. The actor is between
+  // messages at every turn, so the runtime can put it aside — which is what
+  // makes a busy actor sit next to a smooth one rather than in front of it.
+  on spins(state: Counts, msg: Spin): Counts {
+    if !state.burning {
+      return state
+    }
+    let next = Counts { ...state, spins: state.spins + burn() }
+    send(again, Again)
+    if next.spins % 32 == 0 {
+      send(tally, Counted(done: next.done, total: next.total, spins: next.spins, burning: next.burning))
+    }
+    next
+  }
+}
+
+// Real work, in Strand, with no host call doing the burning for it. Three
+// nested loops over a sixteen-element list is 4096 multiply-adds per unit —
+// enough to show up in the overlay, short enough that the actor returns to its
+// mailbox promptly, and all of it guest code, which is the part that matters:
+// what keeps the window smooth is the architecture, not a cooperative actor.
+//
+// The result is returned so that nothing here can be folded away as dead.
+fn burn(): int {
+  let steps = sixteen()
+  var total = 0
+  for a in steps {
+    for b in steps {
+      for c in steps {
+        total = total + a * b * c
+      }
+    }
+  }
+  if total < 0 { return 0 }
+  1
+}
+
+fn sixteen(): List<int> {
+  [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+}
+
+app TodoDemo {
+  ui    = TodoUi
+  stats = Stats
+
+  ui.stats     -> stats.commands
+  stats.tally  -> ui.tally
+  // A port wired back to its own actor. Nothing about a wire says the two ends
+  // must be different actors, and this is what a self-scheduled loop is.
+  stats.again  -> stats.spins
+}

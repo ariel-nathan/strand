@@ -312,6 +312,25 @@ pub struct Wiring {
     pub port: u32,
 }
 
+/// Someone to tell when an actor dies or is replaced (§5.4).
+///
+/// The bytes are prepared by whoever set the watch, not here. Encoding a value
+/// means knowing a type's layout, and the runtime knowing that would be a
+/// second implementation of `docs/abi.md` §7 living next to the compiler's —
+/// the mistake the host encoder exists to avoid. This carries what to deliver
+/// and where; it does not know what it means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Watch {
+    /// Who to tell.
+    pub watcher: ActorId,
+    /// Which of the watcher's in ports carries lifecycle news.
+    pub port: u32,
+    /// The `Down(...)` message, already encoded.
+    pub down: Vec<u8>,
+    /// The `Up(...)` message, already encoded.
+    pub up: Vec<u8>,
+}
+
 /// Shared address book. Actors hold senders, never each other's memory.
 #[derive(Clone)]
 pub struct Registry {
@@ -329,6 +348,16 @@ pub struct Registry {
     /// `frames` and so the same answer: an actor names a port, and the address
     /// book is what turns a name into a destination.
     outbound: Arc<Mutex<HashMap<ActorId, Vec<Option<Wiring>>>>>,
+    /// Who to tell when a given actor dies or is replaced. Keyed by the actor
+    /// being watched, because that is what the supervisor has in hand.
+    watchers: Arc<Mutex<HashMap<ActorId, Vec<Watch>>>>,
+    /// Mailboxes created before their actor runs, waiting to be picked up.
+    ///
+    /// Without these, "can I send to you yet" depends on which task the
+    /// scheduler happened to start first — and an actor that sends from `init`
+    /// would work or not according to that. Reserving every mailbox before any
+    /// actor runs turns a race into an ordering.
+    pending: Arc<Mutex<HashMap<ActorId, mpsc::UnboundedReceiver<Message>>>>,
     config: Arc<SimConfig>,
 }
 
@@ -345,6 +374,8 @@ impl Registry {
             stats: Arc::new(Mutex::new(BTreeMap::new())),
             frames: Arc::new(Mutex::new(HashMap::new())),
             outbound: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
             config,
         }
     }
@@ -387,6 +418,28 @@ impl Registry {
         self.outbound.lock().unwrap().get(&id)?.get(port as usize).copied().flatten()
     }
 
+    /// Says who to tell when actor `id` dies or is replaced (§5.4).
+    pub fn route_watchers(&self, id: ActorId, watchers: Vec<Watch>) {
+        self.watchers.lock().unwrap().insert(id, watchers);
+    }
+
+    /// Tells everyone watching `id` that it just went down, or came back.
+    ///
+    /// A watcher that has itself died is simply not there to be told, which is
+    /// why this ignores send failures: an undeliverable notification is not a
+    /// failure of the actor it is about.
+    fn announce(&self, id: ActorId, alive: bool) {
+        let watchers = self.watchers.lock().unwrap().get(&id).cloned().unwrap_or_default();
+        for watch in watchers {
+            let bytes = if alive { watch.up.clone() } else { watch.down.clone() };
+            let _ = self.send_from(
+                id,
+                watch.watcher,
+                Message::Blob { from: id, port: watch.port, bytes },
+            );
+        }
+    }
+
     /// A snapshot of every actor this registry has ever spawned, live or dead
     /// (§8.4's debug overlay). Ordered by id.
     pub fn stats(&self) -> Vec<ActorStats> {
@@ -394,9 +447,34 @@ impl Registry {
         cells.iter().map(|(id, cell)| cell.snapshot(*id)).collect()
     }
 
-    fn register(&self, id: ActorId, name: &str) -> mpsc::UnboundedReceiver<Message> {
+    /// Creates an actor's mailbox before the actor exists to read it.
+    ///
+    /// Everything addressed to it queues until it starts, so a peer sending
+    /// during its own startup does not have to know whether the far end is up
+    /// yet — and a restarted actor's replacement can be written to during the
+    /// gap between the old one dying and the new one instantiating.
+    pub fn reserve(&self, id: ActorId) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.inner.lock().unwrap().insert(id, tx);
+        self.pending.lock().unwrap().insert(id, rx);
+    }
+
+    /// Reserves only if nobody has: a caller that laid out the whole tree in
+    /// advance has already done this, and redoing it would throw away whatever
+    /// had been queued since.
+    fn reserve_once(&self, id: ActorId) {
+        if !self.pending.lock().unwrap().contains_key(&id) {
+            self.reserve(id);
+        }
+    }
+
+    fn register(&self, id: ActorId, name: &str) -> mpsc::UnboundedReceiver<Message> {
+        let reserved = self.pending.lock().unwrap().remove(&id);
+        let rx = reserved.unwrap_or_else(|| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.inner.lock().unwrap().insert(id, tx);
+            rx
+        });
         self.trace.record(Event::Spawned { id, name: name.to_string() });
         rx
     }
@@ -517,6 +595,20 @@ fn link_host_abi(linker: &mut Linker<ActorCtx>) -> Result<()> {
             ctx.registry
                 .send_on_port(ctx.id, port as u32, bytes)
                 .map_err(wasmtime::Error::from_anyhow)
+        },
+    )?;
+
+    // §4.3's second tier. A panic is not an error value and there is nothing
+    // to catch it: raising here unwinds out of the guest, the Store is dropped,
+    // and the arena goes with it (§5.1). The supervisor gets a crash report
+    // whose reason is what the guest wrote, which is the whole point of it
+    // being a host call rather than a bare `unreachable`.
+    linker.func_wrap(
+        "strand",
+        "panic",
+        |mut caller: Caller<'_, ActorCtx>, ptr: i32, len: i32| -> wasmtime::Result<()> {
+            let bytes = read_guest_bytes(&mut caller, ptr, len)?;
+            wasmtime::bail!("{}", String::from_utf8_lossy(&bytes))
         },
     )?;
 
@@ -731,6 +823,12 @@ async fn run_life(
     store.epoch_deadline_async_yield_and_update(1);
 
     let mut mailbox = registry.register(id, name);
+    // Announced here rather than by the supervisor, because here is where it
+    // becomes true: this life has a mailbox, so a peer answering `Up` has
+    // somewhere to put the answer. It fires for the first life as well as for
+    // a replacement — an actor coming up for the first time is the same news,
+    // and it saves every peer from having to send a speculative hello.
+    registry.announce(id, true);
     let instance = linker.instantiate_async(&mut store, &module).await.map_err(|e| {
         died(format!("failed to instantiate: {}", reason(&e)), None)
     })?;
@@ -859,6 +957,7 @@ pub fn spawn_supervised(
 
     tokio::spawn(async move {
         let mut generation = 0;
+        registry.reserve_once(id);
         loop {
             match run_actor_once(&engine, &registry, id, &name, &bytes, generation).await {
                 Ok(()) => return Ok(()),
@@ -874,12 +973,23 @@ pub fn spawn_supervised(
                             Message::ChildDown { child: id, report: report.clone() },
                         );
                     }
+                    // §5.4, from the guest's side: anyone this actor was wired
+                    // to hears that it is gone. Announced before the decision
+                    // to restart, because "down" is true either way and a
+                    // watcher should not have to wait on the policy to learn
+                    // it.
+                    registry.announce(id, false);
 
                     if policy == Policy::Stop {
                         return Err(report);
                     }
                     generation += 1;
                     registry.trace.record(Event::Restarted { id, generation });
+                    // A fresh mailbox for the replacement, so that anything
+                    // sent during the gap is waiting rather than refused. The
+                    // `Up` that goes with it is announced by the new life
+                    // itself, once it has picked this up.
+                    registry.reserve(id);
                 }
             }
         }

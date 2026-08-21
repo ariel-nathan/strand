@@ -116,7 +116,16 @@ Imports:
 
     strand.log(ptr: i32, len: i32)
     strand.send(port: i32, ptr: i32, len: i32)
+    strand.panic(ptr: i32, len: i32)    // never returns
     strand.sleep_ms(ms: i64)            // async host call: suspends the fiber
+
+`panic` is §4.3's second tier: it raises out of the guest, the Store is dropped
+and the arena goes with it, and the supervisor gets a crash report whose reason
+is the message. That is the whole reason it is a host call rather than a bare
+`unreachable` — the reason is the useful part. WASM has no way to declare an
+import as never returning, so the emitter puts an `unreachable` after the call;
+without it, a `panic` in tail position would fall off a function that owes its
+caller a value.
 
 Exports:
 
@@ -371,3 +380,43 @@ than in isolation.
 
 A file with one actor and no `app` block is an app of one actor with no wires,
 so there is one path rather than a general one and a special case.
+
+## 11. Lifecycle: what a guest hears about its peers
+
+§5.4 delivers a typed `ChildDown` to the supervisor. In the POC the supervisor
+is the host, and that was where it stopped — a guest could not learn that a peer
+had died. §7's demo needs it to, so the platform declares a second type, opted
+into exactly like `Input` by naming it as a port's type:
+
+    Down(port: int)     the peer feeding this port of mine has died
+    Up(port: int)       a fresh one has taken its place
+
+The peer is named by a port because no other name exists. An actor holds no
+addresses (§7), so "who died" can only be said in terms the receiver already
+has: `port` is the index of the receiver's own `in` port that the departed peer
+was wired to.
+
+`Up` fires for an actor's **first** life as well as for a replacement. Coming up
+for the first time is the same news, and treating it as such saves every peer
+from sending a speculative hello — in `todo_demo.str` the first `Up` is what
+asks for the first count.
+
+Two orderings make this work rather than race:
+
+- **Mailboxes are reserved before any actor runs.** `Registry::reserve` creates
+  the channel up front, so an actor that sends from `init` does not depend on
+  which task the scheduler started first. Without it, "can I send to you yet"
+  is a coin flip.
+- **`Up` is announced by the new life, after it takes its mailbox.** A peer
+  answers `Up` immediately — that is what `Up` is for — so the answer must have
+  somewhere to go. On a restart the supervisor reserves a fresh mailbox first,
+  and anything sent during the gap waits there instead of being refused.
+
+The bytes are encoded by whoever set the watch, not by the runtime. Encoding a
+value means knowing a type's layout, and a second implementation of §7 living
+in the runtime is exactly what the host encoder exists to avoid.
+
+**Honest gap.** Comparing against the port index means writing the number:
+there is no way yet to spell "the index of my `tally` port". With one peer it
+does not come up, and inventing the syntax before something needs it would be
+guessing at the shape.

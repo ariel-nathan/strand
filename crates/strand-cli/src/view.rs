@@ -95,6 +95,11 @@ fn no_view(hir: &Hir) -> String {
 fn stub_host(linker: &mut Linker<()>) -> Result<()> {
     linker.func_wrap("strand", "log", |_: i32, _: i32| {})?;
     linker.func_wrap("strand", "send", |_: i32, _: i32, _: i32| {})?;
+    // `panic` is the exception: doing nothing would let a view be drawn from a
+    // state whose `init` said it could not be built.
+    linker.func_wrap("strand", "panic", |_: i32, _: i32| -> wasmtime::Result<()> {
+        wasmtime::bail!("the actor panicked while building its initial state")
+    })?;
     Ok(())
 }
 

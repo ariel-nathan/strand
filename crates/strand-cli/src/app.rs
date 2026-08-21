@@ -147,6 +147,10 @@ pub fn run(hir: &Hir) -> Result<()> {
     registry.route_frames(ui_id, Arc::new(ToCompositor { theme: Theme::default(), scenes }));
     for spawn in &plan.spawns {
         registry.route_out(spawn.id, spawn.out.clone());
+        registry.route_watchers(spawn.id, spawn.watchers.clone());
+        // Every mailbox exists before any actor does, so an actor that sends
+        // during its own startup does not depend on which task started first.
+        registry.reserve(spawn.id);
     }
 
     let published = stats.clone();

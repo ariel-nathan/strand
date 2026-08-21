@@ -11,9 +11,9 @@
 //! go down one path.
 
 use anyhow::{anyhow, bail, Result};
-use strand_runtime::{ActorId, Wiring};
+use strand_runtime::{ActorId, Watch, Wiring};
 use strandc::hir::{Hir, Ty};
-use strandc::input;
+use strandc::{input, lifecycle};
 
 /// One actor about to run.
 pub struct Spawn {
@@ -26,6 +26,8 @@ pub struct Spawn {
     pub wasm: Vec<u8>,
     /// Indexed by the actor's out-port number.
     pub out: Vec<Option<Wiring>>,
+    /// Who to tell when *this* actor dies or is replaced (§5.4).
+    pub watchers: Vec<Watch>,
 }
 
 pub struct Plan {
@@ -63,7 +65,40 @@ pub fn plan(hir: &Hir) -> Result<Plan> {
                     Some(Wiring { to: wire.to as ActorId, port: wire.to_port as u32 });
             }
         }
-        spawns.push(Spawn { id: index as ActorId, name: name.clone(), actor: *actor, wasm, out });
+        spawns.push(Spawn {
+            id: index as ActorId,
+            name: name.clone(),
+            actor: *actor,
+            wasm,
+            out,
+            // Filled once every instance is known: a watcher is on the far end
+            // of a wire, so it cannot be resolved while the near end is still
+            // being built.
+            watchers: Vec::new(),
+        });
+    }
+
+    if let Some(app) = &hir.app {
+        for wire in &app.wires {
+            let watcher = &hir.actors[instances[wire.to].1];
+            // Only an actor that asked to hear about its peers gets told.
+            let Some(port) = watcher.inbox.iter().position(|p| is_lifecycle(hir, &p.ty)) else {
+                continue;
+            };
+            // The peer is named by the port it feeds, because that is the only
+            // name the watcher has for it (`lifecycle.rs`).
+            let ty = watcher.inbox[port].ty.clone();
+            let encode = |variant: &str| {
+                crate::encode::encode(hir, &ty, &format!("{variant} {}", wire.to_port))
+            };
+            let watch = Watch {
+                watcher: spawns[wire.to].id,
+                port: port as u32,
+                down: encode("Down")?,
+                up: encode("Up")?,
+            };
+            spawns[wire.from].watchers.push(watch);
+        }
     }
 
     // Exactly one actor may draw: the compositor paints one tree, so a second
@@ -96,6 +131,11 @@ pub fn plan(hir: &Hir) -> Result<Plan> {
 /// Whether a port carries the platform's own event type (`docs/abi.md` §9).
 fn is_input(hir: &Hir, ty: &Ty) -> bool {
     matches!(ty, Ty::Sum(id) if hir.sums[id.0 as usize].name == input::TYPE_NAME)
+}
+
+/// Whether a port carries the platform's supervision news (§5.4).
+fn is_lifecycle(hir: &Hir, ty: &Ty) -> bool {
+    matches!(ty, Ty::Sum(id) if hir.sums[id.0 as usize].name == lifecycle::TYPE_NAME)
 }
 
 #[cfg(test)]
