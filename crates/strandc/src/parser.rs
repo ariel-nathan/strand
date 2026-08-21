@@ -9,12 +9,16 @@ use crate::lexer::{lex, Span, Tok, Token};
 
 pub fn parse(src: &str) -> Result<Program, Diagnostic> {
     let tokens = lex(src)?;
-    Parser { tokens, pos: 0 }.program()
+    Parser { tokens, pos: 0, no_record_literal: false }.program()
 }
 
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Set while parsing an `if`/`match` head. Without it, `if a > b { a }`
+    /// reads `b { a }` as a record literal with a shorthand field — the same
+    /// ambiguity Rust resolves with a no-struct-literal restriction.
+    no_record_literal: bool,
 }
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -56,6 +60,23 @@ impl Parser {
         } else {
             false
         }
+    }
+
+    /// Parses `inner` with record literals allowed again — inside parentheses
+    /// or braces the ambiguity cannot arise.
+    fn allowing_records<T>(&mut self, inner: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        let saved = std::mem::replace(&mut self.no_record_literal, false);
+        let result = inner(self);
+        self.no_record_literal = saved;
+        result
+    }
+
+    /// Parses the head of an `if`/`match`, where a `{` always opens a block.
+    fn head_expr(&mut self) -> PResult<Expr> {
+        let saved = std::mem::replace(&mut self.no_record_literal, true);
+        let result = self.expr();
+        self.no_record_literal = saved;
+        result
     }
 
     fn error<T>(&self, message: impl Into<String>) -> PResult<T> {
@@ -242,6 +263,13 @@ impl Parser {
     // ---- statements ------------------------------------------------------
 
     fn block(&mut self) -> PResult<Block> {
+        let saved = std::mem::replace(&mut self.no_record_literal, false);
+        let block = self.block_inner();
+        self.no_record_literal = saved;
+        block
+    }
+
+    fn block_inner(&mut self) -> PResult<Block> {
         let start = self.expect(Tok::LBrace)?;
         let mut stmts = Vec::new();
         let mut tail = None;
@@ -366,7 +394,7 @@ impl Parser {
             match self.peek() {
                 Tok::LParen => {
                     self.advance();
-                    let args = self.call_args()?;
+                    let args = self.allowing_records(|p| p.call_args())?;
                     let end = self.expect(Tok::RParen)?;
                     expr = Expr::Call {
                         span: Self::join(expr.span(), end),
@@ -444,7 +472,7 @@ impl Parser {
             }
             Tok::LParen => {
                 self.advance();
-                let inner = self.expr()?;
+                let inner = self.allowing_records(|p| p.expr())?;
                 self.expect(Tok::RParen)?;
                 Ok(inner)
             }
@@ -455,7 +483,7 @@ impl Parser {
                 self.advance();
                 // `Todo { ... }` is a record literal; a bare `{` after an
                 // identifier is never a block in expression position.
-                if self.at(&Tok::LBrace) && starts_record_literal(self) {
+                if !self.no_record_literal && self.at(&Tok::LBrace) && starts_record_literal(self) {
                     let fields = self.field_inits()?;
                     return Ok(Expr::RecordLit {
                         name: Some(name),
@@ -488,7 +516,7 @@ impl Parser {
 
     fn if_expr(&mut self) -> PResult<Expr> {
         let start = self.expect(Tok::If)?;
-        let cond = self.expr()?;
+        let cond = self.head_expr()?;
         let then_block = self.block()?;
         let else_block = if self.eat(&Tok::Else) {
             if self.at(&Tok::If) {
@@ -510,7 +538,7 @@ impl Parser {
 
     fn match_expr(&mut self) -> PResult<Expr> {
         let start = self.expect(Tok::Match)?;
-        let scrutinee = self.expr()?;
+        let scrutinee = self.head_expr()?;
         self.expect(Tok::LBrace)?;
 
         let mut arms = Vec::new();

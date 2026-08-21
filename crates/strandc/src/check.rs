@@ -527,7 +527,7 @@ impl Checker {
                 }
             }
 
-            ast::Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
+            ast::Expr::Call { callee, args, span } => self.check_call(callee, args, *span, expected),
 
             ast::Expr::RecordLit { name, fields, span } => {
                 self.check_record_lit(name.as_deref(), fields, *span, expected)
@@ -551,10 +551,8 @@ impl Checker {
                                 format!("`if` branches disagree: {t} and {e}"),
                             );
                             Ty::Error
-                        } else if matches!(then_block.ty, Ty::Never) {
-                            else_expr.ty.clone()
                         } else {
-                            then_block.ty.clone()
+                            then_block.ty.join(&else_expr.ty)
                         }
                     }
                     None => {
@@ -665,7 +663,13 @@ impl Checker {
         }
     }
 
-    fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Arg], span: Span) -> Expr {
+    fn check_call(
+        &mut self,
+        callee: &ast::Expr,
+        args: &[ast::Arg],
+        span: Span,
+        expected: Option<&Ty>,
+    ) -> Expr {
         let ast::Expr::Ident { name, .. } = callee else {
             // Method calls need a stdlib; §4.6 defers that past M1.
             self.error(span, "method calls are not supported yet");
@@ -681,20 +685,32 @@ impl Checker {
                 if args.len() != 1 {
                     self.error(span, format!("`{name}` takes exactly one argument"));
                 }
+                // Context supplies the half the constructor cannot know: the
+                // error type of `Ok(..)`, the ok type of `Err(..)`.
+                let (want_ok, want_err) = match expected {
+                    Some(Ty::Result(ok, err)) => (Some((**ok).clone()), Some((**err).clone())),
+                    Some(Ty::Option(some)) => (Some((**some).clone()), None),
+                    _ => (None, None),
+                };
+                let hint = if name == "Err" { want_err.clone() } else { want_ok.clone() };
                 let inner = args
                     .first()
-                    .map(|a| self.check_expr(&a.value, None))
+                    .map(|a| self.check_expr(&a.value, hint.as_ref()))
                     .unwrap_or(Expr { ty: Ty::Error, kind: ExprKind::Unit });
 
-                // The other half of the type comes from context: the function's
-                // declared return type, checked by the caller of this function.
                 let (ty, kind) = match name.as_str() {
                     "Ok" => (
-                        Ty::Result(Box::new(inner.ty.clone()), Box::new(Ty::Error)),
+                        Ty::Result(
+                            Box::new(inner.ty.clone()),
+                            Box::new(want_err.unwrap_or(Ty::Error)),
+                        ),
                         ExprKind::MakeOk(Box::new(inner)),
                     ),
                     "Err" => (
-                        Ty::Result(Box::new(Ty::Error), Box::new(inner.ty.clone())),
+                        Ty::Result(
+                            Box::new(want_ok.unwrap_or(Ty::Error)),
+                            Box::new(inner.ty.clone()),
+                        ),
                         ExprKind::MakeErr(Box::new(inner)),
                     ),
                     _ => (
@@ -960,8 +976,8 @@ impl Checker {
                             arm.span,
                             format!("match arms disagree: {want_s} and {found}"),
                         );
-                    } else if matches!(want, Ty::Never) {
-                        result_ty = Some(body.ty.clone());
+                    } else {
+                        result_ty = Some(want.join(&body.ty));
                     }
                 }
             }

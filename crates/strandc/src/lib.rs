@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod check;
+pub mod codegen;
 pub mod diag;
 pub mod hir;
 pub mod lexer;

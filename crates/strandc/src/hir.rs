@@ -48,6 +48,34 @@ impl Ty {
         }
     }
 
+    /// Combines two compatible types into the most-defined one, filling
+    /// `Error` holes from the other side. `Ok(1)` types as
+    /// `Result<int, Error>` and `Err(Bad)` as `Result<Error, E>`; joining the
+    /// branches of an `if` recovers the full `Result<int, E>` that codegen
+    /// needs in order to know the payload's representation.
+    pub fn join(&self, other: &Ty) -> Ty {
+        match (self, other) {
+            (Ty::Error | Ty::Never, filled) | (filled, Ty::Error | Ty::Never) => filled.clone(),
+            (Ty::List(a), Ty::List(b)) => Ty::List(Box::new(a.join(b))),
+            (Ty::Option(a), Ty::Option(b)) => Ty::Option(Box::new(a.join(b))),
+            (Ty::Result(a1, e1), Ty::Result(a2, e2)) => {
+                Ty::Result(Box::new(a1.join(a2)), Box::new(e1.join(e2)))
+            }
+            _ => self.clone(),
+        }
+    }
+
+    /// Whether any part of this type is still unknown. Such a type cannot be
+    /// given a representation, so codegen rejects it rather than guessing.
+    pub fn has_holes(&self) -> bool {
+        match self {
+            Ty::Error => true,
+            Ty::List(t) | Ty::Option(t) => t.has_holes(),
+            Ty::Result(t, e) => t.has_holes() || e.has_holes(),
+            _ => false,
+        }
+    }
+
     /// Whether values of this type are a pointer into linear memory
     /// (`docs/abi.md` §3-§5) rather than an immediate scalar.
     pub fn is_boxed(&self) -> bool {
