@@ -175,9 +175,18 @@ struct Lexer<'src> {
     col: u32,
 }
 
+/// The bytes Windows editors put in front of a UTF-8 file. Not content: it is
+/// an encoding mark, and a language that refuses it refuses whatever Notepad,
+/// Visual Studio or `Set-Content -Encoding utf8` last saved.
+const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
 impl<'src> Lexer<'src> {
     fn new(text: &'src str) -> Self {
-        Self { bytes: text.as_bytes(), text, pos: 0, line: 1, col: 1 }
+        let bytes = text.as_bytes();
+        // Skipped rather than trimmed from the string, so every span still
+        // counts from the start of the file the user has open.
+        let pos = if bytes.starts_with(BOM) { BOM.len() } else { 0 };
+        Self { bytes, text, pos, line: 1, col: 1 }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -470,6 +479,10 @@ impl<'src> Lexer<'src> {
 
 #[cfg(test)]
 mod tests {
+    /// A UTF-8 byte-order mark, then `fn main`. Spelled as an escape because
+    /// the mark is invisible in a source file, which is the whole trouble
+    /// with it.
+    const BOM_THEN_FN: &str = "\u{feff}fn main";
     use super::*;
 
     fn toks(src: &str) -> Vec<Tok> {
@@ -574,6 +587,24 @@ mod tests {
     #[test]
     fn rejects_unterminated_string() {
         assert!(lex("\"abc").unwrap_err().message.contains("unterminated"));
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_not_a_syntax_error() {
+        // What Notepad, Visual Studio and `Set-Content -Encoding utf8` write.
+        // Refusing it means a file that looks perfectly ordinary in an editor
+        // cannot be compiled at all, and the error points at a character
+        // nobody can see.
+        let tokens = lex(BOM_THEN_FN).unwrap();
+        assert_eq!(tokens[0].tok, Tok::Fn);
+    }
+
+    #[test]
+    fn a_span_after_a_byte_order_mark_still_counts_from_the_file_start() {
+        // Skipped, not trimmed: an offset into the token stream stays an
+        // offset into the file the editor has open.
+        let tokens = lex(BOM_THEN_FN).unwrap();
+        assert_eq!((tokens[0].span.start, tokens[0].span.end), (3, 5));
     }
 
     #[test]
