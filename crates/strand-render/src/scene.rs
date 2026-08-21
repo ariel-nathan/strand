@@ -218,19 +218,24 @@ impl HitRegion {
 
 /// A rectangle, where geometry is geometry and nothing more. Named `Bounds`
 /// because taffy's prelude already owns `Rect` in this module.
+///
+/// Visible to the crate because the inspector has to answer the same question
+/// layout does — what of this is inside the clip — and two implementations of
+/// that would drift.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Bounds {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+pub(crate) struct Bounds {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
+    pub(crate) height: f32,
 }
 
 impl Bounds {
     /// The overlap of two rectangles, or `None` where they do not meet. This is
-    /// what makes nested clips intersect, and what stops a hit region scrolled
-    /// out of sight from still being clickable.
-    fn intersect(self, other: Bounds) -> Option<Bounds> {
+    /// what makes nested clips intersect, what stops a hit region scrolled out
+    /// of sight from still being clickable, and what keeps the inspector's
+    /// outlines inside the region they belong to.
+    pub(crate) fn intersect(self, other: Bounds) -> Option<Bounds> {
         let left = self.x.max(other.x);
         let top = self.y.max(other.y);
         let right = (self.x + self.width).min(other.x + other.width);

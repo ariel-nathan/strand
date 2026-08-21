@@ -15,7 +15,7 @@
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
-use crate::scene::{Color, Command, Frame, HitId, Node};
+use crate::scene::{Bounds, Color, Command, Frame, HitId, Node};
 
 /// Outline colour for ordinary boxes.
 const OUTLINE: Color = Color::rgba(0.20, 0.85, 0.80, 0.55);
@@ -96,19 +96,45 @@ impl Inspector {
         }
 
         // Snapshot first: the outlines being appended must not be outlined.
-        let boxes: Vec<(f32, f32, f32, f32)> = frame
-            .commands
-            .iter()
-            .filter_map(|command| match command {
-                Command::Rect { x, y, width, height, .. } => Some((*x, *y, *width, *height)),
-                // Text has no box of its own, and a clip is not a thing on
-                // screen — outlining either would be inventing geometry.
-                Command::Text { .. } | Command::ClipStart { .. } | Command::ClipEnd => None,
-            })
-            .collect();
+        //
+        // Each box is kept with the clip it was drawn under. The outlines go on
+        // the end of the array, past every `ClipEnd`, so nothing would trim
+        // them — and a row scrolled out of a list would be outlined across
+        // whatever happens to sit above and below it.
+        let mut clips: Vec<Bounds> = Vec::new();
+        let mut boxes: Vec<(Bounds, Option<Bounds>)> = Vec::new();
+        for command in &frame.commands {
+            match command {
+                Command::Rect { x, y, width, height, .. } => boxes.push((
+                    Bounds { x: *x, y: *y, width: *width, height: *height },
+                    clips.last().copied(),
+                )),
+                Command::ClipStart { x, y, width, height } => {
+                    let region = Bounds { x: *x, y: *y, width: *width, height: *height };
+                    let nested = match clips.last() {
+                        // Nothing survives an empty intersection, and a
+                        // zero-area region is what says so.
+                        Some(outer) => outer.intersect(region).unwrap_or(Bounds {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 0.0,
+                            height: 0.0,
+                        }),
+                        None => region,
+                    };
+                    clips.push(nested);
+                }
+                Command::ClipEnd => {
+                    clips.pop();
+                }
+                // Text has no box of its own; outlining one would be inventing
+                // geometry.
+                Command::Text { .. } => {}
+            }
+        }
 
-        for (x, y, width, height) in boxes {
-            outline(frame, x, y, width, height, 1.0, OUTLINE);
+        for (rect, clip) in boxes {
+            outline_within(frame, rect, clip, 1.0, OUTLINE);
         }
 
         if let Some(id) = self.highlight {
@@ -220,9 +246,35 @@ fn bytes(count: u64) -> String {
 /// Four thin rects. A stroked rectangle primitive would be fewer commands, but
 /// would also be a second thing the renderer has to understand.
 fn outline(frame: &mut Frame, x: f32, y: f32, width: f32, height: f32, weight: f32, color: Color) {
+    outline_within(frame, Bounds { x, y, width, height }, None, weight, color);
+}
+
+/// As `outline`, trimmed to the region the outlined box was drawn under.
+///
+/// Each edge is clipped on its own, so an outline that is half inside a scroll
+/// is drawn half — which is what the content under it looks like, and the whole
+/// point of an inspector is that it shows you what is there.
+fn outline_within(
+    frame: &mut Frame,
+    rect: Bounds,
+    clip: Option<Bounds>,
+    weight: f32,
+    color: Color,
+) {
     let mut edge = |x: f32, y: f32, width: f32, height: f32| {
-        frame.commands.push(Command::Rect { x, y, width, height, color });
+        let edge = Bounds { x, y, width, height };
+        let Some(visible) = clip.map_or(Some(edge), |clip| clip.intersect(edge)) else {
+            return;
+        };
+        frame.commands.push(Command::Rect {
+            x: visible.x,
+            y: visible.y,
+            width: visible.width,
+            height: visible.height,
+            color,
+        });
     };
+    let Bounds { x, y, width, height } = rect;
     edge(x, y, width, weight);
     edge(x, y + height - weight, width, weight);
     edge(x, y, weight, height);
@@ -401,6 +453,96 @@ mod tests {
         };
         Inspector { enabled: true, highlight: Some(HitId(42)) }.overlay(&mut frame, VIEWPORT, &[]);
         assert_eq!(frame.commands.len(), plain + 4, "the highlight is four more edges");
+    }
+
+    #[test]
+    fn outlines_stay_inside_the_scroll_they_belong_to() {
+        // Reported from the running app: with F12 on, rows scrolled out of the
+        // todo list were outlined across the field above and the buttons
+        // below. The outlines go on the end of the array, past every `ClipEnd`,
+        // so nothing was trimming them.
+        //
+        // Five 30px rows in a 60px window, scrolled 30: one row is entirely
+        // above the top and two are entirely below the bottom.
+        let tree = Node::Scroll {
+            style: Style {
+                id: Some(HitId(9)),
+                width: Sizing::Fixed(100.0),
+                height: Sizing::Fixed(60.0),
+                ..Default::default()
+            },
+            offset: 30.0,
+            bar: None,
+            children: (0..5)
+                .map(|index| Node::Box {
+                    style: Style {
+                        id: Some(HitId(100 + index)),
+                        width: Sizing::Fixed(100.0),
+                        height: Sizing::Fixed(30.0),
+                        background: Some(Color::rgb(1.0, 0.0, 0.0)),
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+        };
+
+        let mut layouter = Layouter::new();
+        let viewport = (200.0, 200.0);
+        let mut frame = layouter.layout(&tree, viewport).clone();
+        let before = frame.commands.len();
+        Inspector { enabled: true, highlight: None }.overlay(&mut frame, viewport, &[]);
+
+        let outlines = &frame.commands[before..];
+        assert!(!outlines.is_empty(), "the visible rows are still outlined");
+        for command in outlines {
+            let Command::Rect { y, height, .. } = command else { continue };
+            assert!(
+                *y >= 0.0 && *y + *height <= 60.0,
+                "an outline at y={y} height={height} escaped the 0..60 scroll"
+            );
+        }
+    }
+
+    #[test]
+    fn an_outline_half_inside_a_scroll_is_drawn_half() {
+        // Trimmed rather than dropped: the inspector's job is to show what is
+        // actually there, and half a row is what is there.
+        let tree = Node::Scroll {
+            style: Style {
+                id: Some(HitId(9)),
+                width: Sizing::Fixed(100.0),
+                height: Sizing::Fixed(50.0),
+                ..Default::default()
+            },
+            offset: 0.0,
+            bar: None,
+            children: vec![Node::Box {
+                style: Style {
+                    width: Sizing::Fixed(100.0),
+                    height: Sizing::Fixed(80.0),
+                    background: Some(Color::rgb(1.0, 0.0, 0.0)),
+                    ..Default::default()
+                },
+            }],
+        };
+
+        let mut layouter = Layouter::new();
+        let viewport = (200.0, 200.0);
+        let mut frame = layouter.layout(&tree, viewport).clone();
+        let before = frame.commands.len();
+        Inspector { enabled: true, highlight: None }.overlay(&mut frame, viewport, &[]);
+
+        let outlines = &frame.commands[before..];
+        assert!(!outlines.is_empty(), "the visible part is still outlined");
+        for command in outlines {
+            let Command::Rect { y, height, .. } = command else { continue };
+            assert!(*y + *height <= 50.0, "an edge at y={y} height={height} ran past the clip");
+        }
+        // The 80px box's top edge survives; its bottom edge, at y = 78, does not.
+        assert!(
+            outlines.iter().any(|c| matches!(c, Command::Rect { y, .. } if *y == 0.0)),
+            "the top edge should still be drawn"
+        );
     }
 
     #[test]
