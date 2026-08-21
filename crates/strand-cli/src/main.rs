@@ -15,6 +15,7 @@ strand — the Strand toolchain
 usage:
   strand run <file.str>            compile and run `main`
   strand build <file.str> [-o out] compile to a .wasm module
+  strand todo                      the todo UI (§7)
   strand ui [--burn]               compositor demo (§6.1)
   strand demo [--window|--trace]   run the M0 actor skeleton
   strand crash [--trace]           supervised crash and restart (§5.4)
@@ -36,6 +37,7 @@ fn main() -> ExitCode {
         ["demo"] => strand_cli::demo::run(false),
         ["demo", "--window"] => strand_cli::demo::run(true),
         ["demo", "--trace"] => strand_cli::demo::run_with(false, true),
+        ["todo"] => strand_cli::todo::run(),
         ["ui"] => strand_cli::demo::ui(false),
         ["ui", "--burn"] => strand_cli::demo::ui(true),
         ["crash"] => strand_cli::demo::crash(false),
