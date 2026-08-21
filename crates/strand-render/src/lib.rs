@@ -8,6 +8,8 @@
 
 use std::sync::Arc;
 
+pub mod scene;
+
 use anyhow::{anyhow, Result};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
