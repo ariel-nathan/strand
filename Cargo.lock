@@ -2407,10 +2407,14 @@ name = "strand-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "miette",
  "strand-render",
  "strand-runtime",
+ "strandc",
  "tokio",
  "tracing",
+ "wasmparser 0.257.1",
+ "wasmtime",
 ]
 
 [[package]]

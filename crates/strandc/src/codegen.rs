@@ -39,6 +39,12 @@ fn rep(ty: &Ty) -> Vec<ValType> {
     }
 }
 
+/// How many WASM values a type occupies when returned. The runner needs this
+/// to size a dynamic call, and it must agree with `rep`.
+pub fn wasm_arity(ty: &Ty) -> usize {
+    rep(ty).len()
+}
+
 fn words(ty: &Ty) -> u64 {
     rep(ty).len() as u64
 }

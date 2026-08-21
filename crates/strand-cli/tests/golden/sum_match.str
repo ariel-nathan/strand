@@ -1,0 +1,11 @@
+type Shape = | Dot | Line(len: int) | Rect(w: int, h: int)
+
+fn area(s: Shape): int {
+  match s {
+    Dot => 0,
+    Line(len) => len,
+    Rect(w, h) => w * h,
+  }
+}
+
+fn main(): int { area(Rect(w: 6, h: 7)) }

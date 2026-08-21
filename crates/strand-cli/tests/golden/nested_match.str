@@ -1,0 +1,15 @@
+type AddError = | EmptyTitle | TooLong(max: int)
+
+fn classify(n: int): Result<int, AddError> {
+  if n == 0 { return Err(EmptyTitle) }
+  if n > 200 { return Err(TooLong(max: 200)) }
+  Ok(n)
+}
+
+fn main(): int {
+  match classify(999) {
+    Ok(v) => v,
+    Err(EmptyTitle) => -1,
+    Err(TooLong(max)) => max,
+  }
+}

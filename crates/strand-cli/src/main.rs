@@ -1,67 +1,88 @@
-//! M0 walking skeleton.
+//! The `strand` binary (§8.1): one tool, no config files.
 //!
-//!   strand            headless: 3 actors on ONE worker thread
-//!   strand --window   the same actors, with the compositor owning main()
+//!     strand run <file.str>      compile and run `main`
+//!     strand build <file.str>    write a .wasm module
+//!     strand demo [--window]     the M0 actor skeleton
 
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use strand_runtime::{engine, spawn_actor, Message, Registry};
 
-const ACTORS: [(u32, &str, &str); 3] = [
-    (0, "ping", "examples/wasm/ping.wat"),
-    (1, "pong", "examples/wasm/pong.wat"),
-    (2, "ticker", "examples/wasm/ticker.wat"),
-];
+const USAGE: &str = "\
+strand — the Strand toolchain
 
-fn main() -> Result<()> {
-    let windowed = std::env::args().any(|a| a == "--window");
+usage:
+  strand run <file.str>            compile and run `main`
+  strand build <file.str> [-o out] compile to a .wasm module
+  strand demo [--window]           run the M0 actor skeleton
+  strand help                      show this message
+";
 
-    // ONE worker thread on purpose. If a sleeping actor held its OS thread,
-    // the ticker could not tick during ping's 300ms sleep.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()?;
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    if !windowed {
-        return rt.block_on(run_actors());
-    }
-
-    // Windowed: the actor runtime becomes a guest of the compositor. winit
-    // requires the main thread, so the runtime gets a background thread and
-    // main() belongs to the renderer for the rest of the process lifetime.
-    println!("--- strand M0: actors + compositor ---");
-    let _guard = rt.enter();
-    rt.spawn(async {
-        if let Err(e) = run_actors().await {
-            eprintln!("actor runtime failed: {e:#}");
+    let result = match refs.as_slice() {
+        [] | ["help"] | ["--help"] | ["-h"] => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
         }
-    });
-    strand_render::run()
+        ["run", file] => run(Path::new(file)),
+        ["build", file] => build(Path::new(file), None),
+        ["build", file, "-o", out] => build(Path::new(file), Some(Path::new(out))),
+        ["demo"] => strand_cli::demo::run(false),
+        ["demo", "--window"] => strand_cli::demo::run(true),
+        _ => {
+            eprint!("{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
-async fn run_actors() -> Result<()> {
-    let engine = engine()?;
-    let registry = Registry::new();
+/// Compiles to the typed IR, rendering diagnostics (§8.2) if it fails.
+fn front_end(path: &Path) -> Result<(strandc::hir::Hir, String)> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let name = path.display().to_string();
 
-    println!("--- strand M0: 3 actors, 1 worker thread ---");
-    let mut handles = Vec::new();
-    for (id, name, path) in ACTORS {
-        let wat =
-            std::fs::read_to_string(Path::new(path)).with_context(|| format!("reading {path}"))?;
-        handles.push(spawn_actor(&engine, &registry, id, name, &wat).await?);
+    match strandc::compile(&name, &source) {
+        Ok(hir) => Ok((hir, source)),
+        Err(report) => {
+            // Printed rather than returned: miette renders the full report,
+            // and anyhow would flatten it to one line.
+            eprintln!("{:?}", miette::Report::new(report));
+            Err(anyhow::anyhow!("could not compile {}", path.display()))
+        }
     }
+}
 
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    for (id, _, _) in ACTORS {
-        let _ = registry.send(id, Message::Stop);
-    }
-    for handle in handles {
-        handle.await??;
-    }
+fn run(path: &Path) -> Result<()> {
+    let (hir, _) = front_end(path)?;
+    let wasm = strandc::codegen::emit(&hir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let value = strand_cli::run::run_main(&hir, &wasm)?;
+    println!("{value}");
+    Ok(())
+}
 
-    println!("--- actors done ---");
+fn build(path: &Path, out: Option<&Path>) -> Result<()> {
+    let (hir, _) = front_end(path)?;
+    let wasm = strandc::codegen::emit(&hir).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let destination: PathBuf = match out {
+        Some(out) => out.to_path_buf(),
+        None => path.with_extension("wasm"),
+    };
+    std::fs::write(&destination, &wasm)
+        .with_context(|| format!("writing {}", destination.display()))?;
+    println!("wrote {} ({} bytes)", destination.display(), wasm.len());
     Ok(())
 }

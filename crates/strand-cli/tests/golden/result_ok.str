@@ -1,0 +1,8 @@
+type E = | Bad
+
+fn halve(n: int): Result<int, E> {
+  if n % 2 != 0 { return Err(Bad) }
+  Ok(n / 2)
+}
+
+fn main(): Result<int, E> { halve(84) }

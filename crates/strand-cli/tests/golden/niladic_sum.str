@@ -1,0 +1,9 @@
+type Colour = | Red | Green | Blue
+
+fn main(): Colour {
+  match 2 {
+    0 => Red,
+    1 => Green,
+    _ => Blue,
+  }
+}

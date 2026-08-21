@@ -4,9 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "strand_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "strand"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
+miette = { version = "7.6.0", features = ["fancy"] }
 strand-render = { version = "0.1.0", path = "../strand-render" }
 strand-runtime = { version = "0.1.0", path = "../strand-runtime" }
+strandc = { version = "0.1.0", path = "../strandc" }
 tokio = { version = "1.53.1", features = ["full"] }
 tracing.workspace = true
+wasmtime = "48.0.0"
+
+[dev-dependencies]
+wasmparser = "0.257.1"

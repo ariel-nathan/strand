@@ -1,0 +1,5 @@
+type Point = { x: int, y: int, label: string }
+
+fn main(): Point {
+  Point { x: 3, y: -7, label: "origin-ish" }
+}

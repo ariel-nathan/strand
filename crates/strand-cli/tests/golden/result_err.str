@@ -1,0 +1,8 @@
+type E = | Bad | Worse(code: int)
+
+fn check(n: int): Result<int, E> {
+  if n < 0 { return Err(Worse(code: n)) }
+  Ok(n)
+}
+
+fn main(): Result<int, E> { check(-5) }

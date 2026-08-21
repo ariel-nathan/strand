@@ -1,0 +1,6 @@
+fn lookup(n: int): Option<int> {
+  if n < 0 { return None }
+  Some(n * 10)
+}
+
+fn main(): Option<int> { lookup(-1) }

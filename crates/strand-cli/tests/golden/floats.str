@@ -1,0 +1,8 @@
+type E = | Bad
+
+fn scale(n: float): Result<float, E> {
+  if n < 0.0 { return Err(Bad) }
+  Ok(n * 1.5)
+}
+
+fn main(): Result<float, E> { scale(3.0) }

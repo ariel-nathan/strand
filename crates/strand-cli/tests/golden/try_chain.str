@@ -1,0 +1,13 @@
+type E = | Bad
+
+fn inner(n: int): Result<int, E> {
+  if n < 0 { return Err(Bad) }
+  Ok(n + 1)
+}
+
+fn outer(n: int): Result<int, E> {
+  let doubled = inner(n)? * 2
+  Ok(doubled)
+}
+
+fn main(): Result<int, E> { outer(20) }

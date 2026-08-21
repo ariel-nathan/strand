@@ -1,0 +1,9 @@
+fn pick(n: int): string {
+  match n {
+    0 => "zero",
+    1 => "one",
+    _ => "many",
+  }
+}
+
+fn main(): string { pick(1) }

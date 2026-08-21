@@ -1,0 +1,6 @@
+fn main(): int {
+  let a = 10
+  var b = 4
+  b = b * 2 - 1
+  a + b
+}

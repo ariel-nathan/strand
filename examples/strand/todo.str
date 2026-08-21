@@ -1,0 +1,28 @@
+// The §4.5 shapes, in the M1 subset. No List/string methods yet — those need
+// the stdlib, which §4.6 defers past M1.
+
+type Id = int
+
+type Todo = { id: Id, title: string, done: bool }
+
+type AddError = | EmptyTitle | TooLong(max: int)
+
+fn addTodo(id: Id, titleLen: int): Result<Todo, AddError> {
+  if titleLen == 0  { return Err(EmptyTitle) }
+  if titleLen > 200 { return Err(TooLong(max: 200)) }
+  Ok(Todo { id: id, title: "write the compiler", done: false })
+}
+
+// `?` propagates the error without allocating (docs/abi.md §2).
+fn addAndDescribe(id: Id, titleLen: int): Result<Id, AddError> {
+  let todo = addTodo(id, titleLen)?
+  Ok(todo.id)
+}
+
+fn main(): Result<Todo, AddError> {
+  match addAndDescribe(7, 18) {
+    Ok(id)            => addTodo(id, 18),
+    Err(EmptyTitle)   => Err(EmptyTitle),
+    Err(TooLong(max)) => Err(TooLong(max: max)),
+  }
+}

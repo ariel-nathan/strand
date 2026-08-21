@@ -67,14 +67,8 @@ impl Checker {
         self.errors.push(Diagnostic::new(span, message));
     }
 
-    /// Reports with a suggested fix. Used only where the fix is unambiguous —
-    /// §8.2 wants suggestions, not guesses.
-    fn error_help(&mut self, span: Span, message: impl Into<String>, help: impl Into<String>) {
-        self.errors.push(Diagnostic::new(span, message).with_help(help));
-    }
-
-    /// Reports with the underline labelled. Preferred wherever the label can
-    /// say something more useful than "here" (§8.2).
+    /// Reports with a labelled underline and a suggested fix. Used only where
+    /// the fix is unambiguous — §8.2 wants suggestions, not guesses.
     fn error_labeled(
         &mut self,
         span: Span,
