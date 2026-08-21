@@ -101,7 +101,9 @@ impl Inspector {
             .iter()
             .filter_map(|command| match command {
                 Command::Rect { x, y, width, height, .. } => Some((*x, *y, *width, *height)),
-                Command::Text { .. } => None,
+                // Text has no box of its own, and a clip is not a thing on
+                // screen — outlining either would be inventing geometry.
+                Command::Text { .. } | Command::ClipStart { .. } | Command::ClipEnd => None,
             })
             .collect();
 
@@ -275,6 +277,7 @@ fn kind(node: &Node) -> &'static str {
         Node::Column { .. } => "column",
         Node::Box { .. } => "box",
         Node::Text { .. } => "text",
+        Node::Scroll { .. } => "scroll",
     }
 }
 

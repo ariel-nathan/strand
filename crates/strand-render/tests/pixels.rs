@@ -14,7 +14,7 @@
 
 use strand_render::inspect::{ActorStat, Inspector};
 use strand_render::paint::Painter;
-use strand_render::scene::{Color, Frame, Layouter, Node, Sizing, Style};
+use strand_render::scene::{Color, Frame, HitId, Layouter, Node, Sizing, Style};
 
 const SIZE: u32 = 256;
 
@@ -311,4 +311,70 @@ fn the_debug_overlay_dims_the_app_without_hiding_it() {
     let below_panel = pixel(&data, 128, 200);
     assert!(under_panel.1 < below_panel.1, "the panel should darken what is behind it");
     assert!(under_panel.1 > 0, "but not black it out — this is an overlay, not a curtain");
+}
+
+/// A `height`-tall scroll holding one very tall child, so anything painted
+/// below `height` got there by escaping the clip.
+fn overflowing_scroll(height: f32, child: Color) -> Node {
+    Node::Scroll {
+        style: Style {
+            id: Some(HitId(1)),
+            width: Sizing::Fixed(SIZE as f32),
+            height: Sizing::Fixed(height),
+            ..Default::default()
+        },
+        offset: 0.0,
+        bar: None,
+        children: vec![Node::Box {
+            style: Style {
+                width: Sizing::Fixed(SIZE as f32),
+                height: Sizing::Fixed(300.0),
+                background: Some(child),
+                ..Default::default()
+            },
+        }],
+    }
+}
+
+#[test]
+fn a_scroll_clips_its_content_on_the_gpu() {
+    // Clip commands are a claim until the scissor honours them. Without
+    // set_scissor_rect the 300px child paints straight over everything below,
+    // and every command-array test still passes.
+    let mut headless = gpu_or_skip!();
+
+    let mut layouter = Layouter::new();
+    let tree = overflowing_scroll(100.0, Color::rgb(1.0, 0.0, 0.0));
+    let data = headless.render(layouter.layout(&tree, (SIZE as f32, SIZE as f32)));
+
+    assert!(close(pixel(&data, 128, 50), (255, 0, 0)), "inside the scroll it paints");
+    assert_eq!(pixel(&data, 128, 150), (0, 0, 0), "and past the clip it stops");
+}
+
+#[test]
+fn drawing_resumes_once_the_clip_closes() {
+    // A scissor left set would trim everything drawn afterwards — the sibling
+    // below, and the debug overlay with it.
+    let mut headless = gpu_or_skip!();
+
+    let tree = Node::column(
+        Style::default(),
+        vec![
+            overflowing_scroll(60.0, Color::rgb(1.0, 0.0, 0.0)),
+            Node::Box {
+                style: Style {
+                    width: Sizing::Fixed(SIZE as f32),
+                    height: Sizing::Fixed(60.0),
+                    background: Some(Color::rgb(0.0, 1.0, 0.0)),
+                    ..Default::default()
+                },
+            },
+        ],
+    );
+    let mut layouter = Layouter::new();
+    let data = headless.render(layouter.layout(&tree, (SIZE as f32, SIZE as f32)));
+
+    assert!(close(pixel(&data, 128, 30), (255, 0, 0)), "the scroll shows its content");
+    assert!(close(pixel(&data, 128, 90), (0, 255, 0)), "and the sibling below is not trimmed");
+    assert_eq!(pixel(&data, 128, 150), (0, 0, 0), "while the overflow stays clipped");
 }

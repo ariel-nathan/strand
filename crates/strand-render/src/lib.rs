@@ -15,7 +15,7 @@ pub mod scene;
 pub mod text;
 pub mod widgets;
 
-use compositor::{InputEvent, InputSender, SceneReceiver};
+use compositor::{InputEvent, InputSender, Key, SceneReceiver};
 use inspect::{ActorStat, Inspector, StatsHandle};
 use paint::Painter;
 use text::{FontMeasure, TextPainter};
@@ -165,6 +165,10 @@ struct App {
     input: Option<InputSender>,
     cursor: (f32, f32),
     hovered: Option<HitId>,
+    /// Where keystrokes go. A keyboard has no position, so the platform has to
+    /// remember what the pointer last chose — this is the compositor's whole
+    /// contribution to text input, and the app owns everything else.
+    focused: Option<HitId>,
     /// §8.4's debug overlay, toggled with F12 like the tool it imitates.
     inspector: Inspector,
     /// Where the actor runtime publishes what it is doing (§8.4).
@@ -192,6 +196,7 @@ impl Default for App {
             input: None,
             cursor: (0.0, 0.0),
             hovered: None,
+            focused: None,
             inspector: Inspector::default(),
             stats: None,
             stat_rows: Vec::new(),
@@ -233,13 +238,59 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
 
             WindowEvent::KeyboardInput { event, .. } => {
-                use winit::keyboard::{Key, NamedKey};
-                if event.state.is_pressed() && event.logical_key == Key::Named(NamedKey::F12) {
+                use winit::keyboard::{Key as WinitKey, NamedKey};
+                if !event.state.is_pressed() {
+                    return;
+                }
+                if event.logical_key == WinitKey::Named(NamedKey::F12) {
                     self.inspector.toggle();
                     eprintln!(
                         "inspector {}",
                         if self.inspector.enabled { "on" } else { "off" }
                     );
+                    return;
+                }
+
+                // Everything else belongs to whoever has focus, and to nobody
+                // at all when nothing does.
+                let (Some(input), Some(id)) = (&self.input, self.focused) else { return };
+                let key = match event.logical_key {
+                    WinitKey::Named(NamedKey::Backspace) => Some(Key::Backspace),
+                    WinitKey::Named(NamedKey::Enter) => Some(Key::Enter),
+                    WinitKey::Named(NamedKey::Escape) => Some(Key::Escape),
+                    // winit has already applied the layout and the modifiers,
+                    // so `text` is the character the user meant rather than the
+                    // key they pressed.
+                    _ => None,
+                };
+                if let Some(key) = key {
+                    input.send(InputEvent::Key { id, key });
+                    return;
+                }
+                if let Some(text) = &event.text {
+                    for character in text.chars().filter(|c| !c.is_control()) {
+                        input.send(InputEvent::Key { id, key: Key::Char(character) });
+                    }
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                use winit::event::MouseScrollDelta;
+                let Some(input) = &self.input else { return };
+                // A "line" is a guess at what a notch should move. Pixel deltas
+                // (trackpads) say exactly, and are taken at their word.
+                const LINE: f32 = 40.0;
+                let step = match delta {
+                    MouseScrollDelta::LineDelta(_, lines) => lines * LINE,
+                    MouseScrollDelta::PixelDelta(position) => position.y as f32,
+                };
+
+                let (x, y) = self.cursor;
+                let Some(extent) = self.layouter.frame().scroll_at(x, y) else { return };
+                // Clamped here because here is where the content was measured.
+                let offset = (extent.offset - step).clamp(0.0, extent.max_offset);
+                if offset != extent.offset {
+                    input.send(InputEvent::Scroll { id: extent.id, offset });
                 }
             }
 
@@ -261,8 +312,21 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state, .. } => {
-                let (Some(input), Some(id)) = (&self.input, self.hovered) else { return };
+                let Some(input) = &self.input else { return };
                 let (x, y) = self.cursor;
+
+                // Focus moves on press, and a press on something that does not
+                // take focus takes it away. One rule, no focus traps.
+                if state.is_pressed() {
+                    let region = self.layouter.frame().hit_region(x, y);
+                    let next = region.filter(|region| region.focusable).map(|region| region.id);
+                    if next != self.focused {
+                        self.focused = next;
+                        input.send(InputEvent::FocusChanged { id: next });
+                    }
+                }
+
+                let Some(id) = self.hovered else { return };
                 input.send(match state {
                     winit::event::ElementState::Pressed => InputEvent::PointerDown { id, x, y },
                     winit::event::ElementState::Released => InputEvent::PointerUp { id, x, y },

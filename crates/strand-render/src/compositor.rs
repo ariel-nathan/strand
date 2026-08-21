@@ -72,6 +72,21 @@ impl SceneReceiver {
     }
 }
 
+/// A keystroke, reduced to what a text field needs.
+///
+/// §2 lists text input beyond the todo app's minimum as a non-goal, and this is
+/// that minimum: characters, the two edits that make a field usable, and a way
+/// out. No selection, no composition, no clipboard — each of those is a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    /// Already resolved through the keyboard layout and modifiers, so this is
+    /// the character the user meant rather than the key they pressed.
+    Char(char),
+    Backspace,
+    Enter,
+    Escape,
+}
+
 /// What the compositor sends back when input lands on a node (§6.1).
 ///
 /// Typed, and carrying the id of the node that was hit — routing is the
@@ -83,6 +98,18 @@ pub enum InputEvent {
     /// The pointer entered a different node than it was over last frame.
     PointerEnter { id: HitId },
     PointerLeave { id: HitId },
+    /// A keystroke, delivered to whichever node holds focus. A keyboard has no
+    /// position, so focus is what routing has instead of hit-testing.
+    Key { id: HitId, key: Key },
+    /// Focus moved. `None` means a click landed somewhere that does not take it.
+    FocusChanged { id: Option<HitId> },
+    /// The wheel turned over a scrollable region.
+    ///
+    /// Carries where the offset now *is*, not how far it moved. The platform
+    /// measured the content this frame, so it is the only party that can clamp
+    /// the value — and sending the clamped result means an app can never hold a
+    /// scroll position that shows nothing.
+    Scroll { id: HitId, offset: f32 },
 }
 
 /// The compositor end: sends events towards the app.

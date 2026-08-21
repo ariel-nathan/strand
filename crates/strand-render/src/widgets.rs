@@ -100,6 +100,84 @@ pub fn panel(theme: &Theme, children: Vec<Node>) -> Node {
     )
 }
 
+/// A single-line text field (§6.4).
+///
+/// The caret is a sibling box, not a measured position. Layout places it
+/// immediately after the glyphs because that is where the next sibling goes —
+/// so it lands exactly right, measured by the same font that drew the text,
+/// with no measuring code in the widget at all.
+///
+/// `focused` comes from the app's state. The platform decides *where* focus is
+/// and says so in an event; what a focused field looks like is the view's
+/// business (§6.5).
+pub fn text_input(
+    theme: &Theme,
+    id: HitId,
+    value: &str,
+    placeholder: &str,
+    focused: bool,
+) -> Node {
+    let caret = Node::Box {
+        style: Style {
+            width: Sizing::Fixed(2.0),
+            height: Sizing::Fixed(18.0),
+            background: Some(theme.accent),
+            ..Default::default()
+        },
+    };
+
+    let empty = value.is_empty();
+    let text = Node::text(
+        if empty { placeholder } else { value },
+        TextStyle { size: 16.0, color: if empty { theme.muted } else { theme.text } },
+    );
+
+    // With nothing typed, the caret belongs before the prompt rather than
+    // trailing it — the prompt is not text the caret is sitting after.
+    let children = match (empty, focused) {
+        (true, true) => vec![caret, text],
+        (false, true) => vec![text, caret],
+        (_, false) => vec![text],
+    };
+
+    Node::row(
+        Style {
+            id: Some(id),
+            focusable: true,
+            width: Sizing::Grow,
+            padding: theme.padding,
+            gap: 2.0,
+            background: Some(theme.raised),
+            cross_axis: Align::Center,
+            ..Default::default()
+        },
+        children,
+    )
+}
+
+/// A panel you can scroll: raised surface, clipped content, and an indicator
+/// when there is more than fits (§6.4).
+///
+/// `offset` is the app's, not the platform's (§6.5). The platform clamps it
+/// against the content it just measured and reports the clamped value back as
+/// an event, so the app can hold a scroll position but never an impossible one.
+pub fn scroll(theme: &Theme, id: HitId, offset: f32, height: Sizing, children: Vec<Node>) -> Node {
+    Node::Scroll {
+        style: Style {
+            id: Some(id),
+            width: Sizing::Grow,
+            height,
+            padding: theme.padding,
+            gap: theme.gap,
+            background: Some(theme.raised),
+            ..Default::default()
+        },
+        offset,
+        bar: Some(theme.muted),
+        children,
+    }
+}
+
 /// The window-filling background every screen starts from.
 pub fn screen(theme: &Theme, children: Vec<Node>) -> Node {
     Node::column(
@@ -193,6 +271,108 @@ mod tests {
         let frame = layouter.layout(&tree, (500.0, 300.0));
         let ids: Vec<u32> = frame.hits.iter().map(|region| region.id.0).collect();
         assert_eq!(ids, vec![10, 11, 20, 21], "hit regions follow paint order");
+    }
+
+    #[test]
+    fn a_focused_field_shows_a_caret_after_what_was_typed() {
+        let mut layouter = Layouter::new();
+        let tree = text_input(&theme(), HitId(1), "milk", "what needs doing?", true);
+        let frame = layouter.layout(&tree, (400.0, 60.0)).clone();
+
+        // Text, then the caret: the caret's left edge is past the text's.
+        let text_x = frame
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                Command::Text { x, .. } => Some(*x),
+                _ => None,
+            })
+            .expect("the value should be drawn");
+        let caret = frame
+            .commands
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                Command::Rect { x, width, color, .. } if *width == 2.0 => Some((*x, *color)),
+                _ => None,
+            })
+            .expect("a focused field should show a caret");
+        assert!(caret.0 > text_x, "the caret sits after the text, at {}", caret.0);
+        assert_eq!(caret.1, theme().accent);
+    }
+
+    #[test]
+    fn an_unfocused_field_shows_no_caret() {
+        let mut layouter = Layouter::new();
+        let tree = text_input(&theme(), HitId(1), "milk", "what needs doing?", false);
+        let frame = layouter.layout(&tree, (400.0, 60.0));
+        assert!(
+            !frame.commands.iter().any(|c| matches!(c, Command::Rect { width: 2.0, .. })),
+            "the caret is what focus looks like, so it must not appear without it"
+        );
+    }
+
+    #[test]
+    fn an_empty_field_prompts_in_muted_text_with_the_caret_ahead_of_it() {
+        let mut layouter = Layouter::new();
+        let tree = text_input(&theme(), HitId(1), "", "what needs doing?", true);
+        let frame = layouter.layout(&tree, (400.0, 60.0)).clone();
+
+        let (text_x, color) = frame
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                Command::Text { x, color, .. } => Some((*x, *color)),
+                _ => None,
+            })
+            .expect("the placeholder should be drawn");
+        assert_eq!(color, theme().muted, "a prompt is not the value");
+
+        let caret_x = frame
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                Command::Rect { x, width: 2.0, .. } => Some(*x),
+                _ => None,
+            })
+            .expect("a focused field should show a caret");
+        assert!(caret_x < text_x, "with nothing typed the caret leads the prompt");
+    }
+
+    #[test]
+    fn a_text_field_takes_focus_and_a_button_does_not() {
+        // The rule the platform routes keys by: clicking a field starts typing,
+        // clicking anything else stops it.
+        let mut layouter = Layouter::new();
+        let tree = screen(
+            &theme(),
+            vec![
+                text_input(&theme(), HitId(1), "", "type here", false),
+                button(&theme(), HitId(2), "Add"),
+            ],
+        );
+        let frame = layouter.layout(&tree, (400.0, 200.0));
+        let focusable: Vec<(u32, bool)> =
+            frame.hits.iter().map(|r| (r.id.0, r.focusable)).collect();
+        assert_eq!(focusable, vec![(1, true), (2, false)]);
+    }
+
+    #[test]
+    fn a_scroll_reports_how_far_it_could_go() {
+        let mut layouter = Layouter::new();
+        let rows: Vec<Node> = (0..20)
+            .map(|i| checkbox(&theme(), HitId(100 + i), false, format!("row {i}")))
+            .collect();
+        let tree = screen(
+            &theme(),
+            vec![scroll(&theme(), HitId(9), 0.0, Sizing::Fixed(100.0), rows)],
+        );
+        let frame = layouter.layout(&tree, (400.0, 300.0));
+
+        let extent = frame.scrolls.first().expect("the scroll should report itself");
+        assert_eq!(extent.id, HitId(9));
+        assert!(extent.max_offset > 0.0, "twenty rows do not fit in 100px");
+        assert_eq!(extent.offset, 0.0);
     }
 
     #[test]

@@ -81,6 +81,16 @@ fn fs(in: VertexOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// One draw call: the instances it covers, and the scissor they are confined
+/// to. A frame with no clips is one batch, so the common case costs exactly
+/// what it did before clipping existed.
+#[derive(Debug, Clone)]
+struct Batch {
+    /// `None` means the whole viewport.
+    scissor: Option<[f32; 4]>,
+    range: std::ops::Range<u32>,
+}
+
 pub struct Painter {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
@@ -89,6 +99,40 @@ pub struct Painter {
     /// How many instances the current buffer can hold before it must grow.
     capacity: usize,
     instances: Vec<Instance>,
+    batches: Vec<Batch>,
+    /// Kept from `prepare`, because a scissor is in whole pixels and has to be
+    /// clamped to something.
+    viewport: (f32, f32),
+}
+
+/// The overlap of two `[x, y, w, h]` rectangles; empty where they do not meet.
+fn intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let left = a[0].max(b[0]);
+    let top = a[1].max(b[1]);
+    let right = (a[0] + a[2]).min(b[0] + b[2]);
+    let bottom = (a[1] + a[3]).min(b[1] + b[3]);
+    [left, top, (right - left).max(0.0), (bottom - top).max(0.0)]
+}
+
+/// A scissor rectangle in whole pixels, clamped to the attachment. `None` means
+/// nothing would be drawn — wgpu rejects a scissor that leaves the target, so
+/// the batch is skipped rather than clamped into a lie.
+fn scissor(rect: [f32; 4], viewport: (f32, f32)) -> Option<(u32, u32, u32, u32)> {
+    let (width, height) = (viewport.0.max(1.0) as u32, viewport.1.max(1.0) as u32);
+    let x = (rect[0].floor().max(0.0) as u32).min(width);
+    let y = (rect[1].floor().max(0.0) as u32).min(height);
+    let right = ((rect[0] + rect[2]).ceil().max(0.0) as u32).min(width);
+    let bottom = ((rect[1] + rect[3]).ceil().max(0.0) as u32).min(height);
+    (right > x && bottom > y).then_some((x, y, right - x, bottom - y))
+}
+
+/// Ends the batch that was accumulating and starts the next. A batch with no
+/// instances is not worth a draw call, so it is dropped rather than emitted.
+fn close_batch(batches: &mut Vec<Batch>, start: &mut u32, end: u32, scissor: Option<[f32; 4]>) {
+    if end > *start {
+        batches.push(Batch { scissor, range: *start..end });
+    }
+    *start = end;
 }
 
 /// Rectangles a fresh painter can hold before its buffer is reallocated.
@@ -193,6 +237,8 @@ impl Painter {
             instance_buffer,
             capacity: INITIAL_CAPACITY,
             instances: Vec::with_capacity(INITIAL_CAPACITY),
+            batches: Vec::new(),
+            viewport: (1.0, 1.0),
         }
     }
 
@@ -213,7 +259,16 @@ impl Painter {
             }),
         );
 
+        self.viewport = viewport;
         self.instances.clear();
+        self.batches.clear();
+
+        // Clips nest, so the active region is a stack and each entry is already
+        // intersected with the one below it. A clip boundary is exactly where
+        // one draw call has to end and the next begin.
+        let mut clips: Vec<[f32; 4]> = Vec::new();
+        let mut start: u32 = 0;
+
         for command in &frame.commands {
             match command {
                 Command::Rect { x, y, width, height, color } => {
@@ -228,11 +283,28 @@ impl Painter {
                         ],
                     });
                 }
-                // Text needs glyph rasterisation; §12 keeps that scoped out for
-                // now, and drawing a placeholder box would misrepresent it.
+                // Text goes through glyphon, which clips itself from the same
+                // command stream.
                 Command::Text { .. } => {}
+                Command::ClipStart { x, y, width, height } => {
+                    let region = [*x, *y, *width, *height];
+                    let nested = match clips.last() {
+                        Some(outer) => intersect(*outer, region),
+                        None => region,
+                    };
+                    let len = self.instances.len() as u32;
+                    close_batch(&mut self.batches, &mut start, len, clips.last().copied());
+                    clips.push(nested);
+                }
+                Command::ClipEnd => {
+                    let len = self.instances.len() as u32;
+                    close_batch(&mut self.batches, &mut start, len, clips.last().copied());
+                    clips.pop();
+                }
             }
         }
+        let len = self.instances.len() as u32;
+        close_batch(&mut self.batches, &mut start, len, clips.last().copied());
 
         if self.instances.len() > self.capacity {
             self.capacity = self.instances.len().next_power_of_two();
@@ -251,6 +323,9 @@ impl Painter {
     }
 
     /// Draws the frame prepared by the last `prepare` call.
+    ///
+    /// One draw call per clip region. An unclipped frame is a single batch, so
+    /// this is the same single call it always was.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
         if count == 0 {
             return;
@@ -258,7 +333,19 @@ impl Painter {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        // Six vertices make the quad; the instance count makes the frame.
-        pass.draw(0..6, 0..count);
+
+        let (width, height) = (self.viewport.0.max(1.0) as u32, self.viewport.1.max(1.0) as u32);
+        for batch in &self.batches {
+            match batch.scissor {
+                Some(rect) => match scissor(rect, self.viewport) {
+                    Some((x, y, w, h)) => pass.set_scissor_rect(x, y, w, h),
+                    // Clipped away entirely: nothing to draw here.
+                    None => continue,
+                },
+                None => pass.set_scissor_rect(0, 0, width, height),
+            }
+            // Six vertices make the quad; the instance range makes the batch.
+            pass.draw(0..6, batch.range.clone());
+        }
     }
 }

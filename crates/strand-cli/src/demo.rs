@@ -219,7 +219,12 @@ pub fn ui(burn: bool) -> Result<()> {
                     }
                     InputEvent::PointerEnter { id } => println!("app: enter {}", id.0),
                     InputEvent::PointerLeave { id } => println!("app: leave {}", id.0),
-                    InputEvent::PointerUp { .. } => {}
+                    // This demo has no field to type into and nothing to
+                    // scroll; the todo app is where those are exercised.
+                    InputEvent::PointerUp { .. }
+                    | InputEvent::Key { .. }
+                    | InputEvent::FocusChanged { .. }
+                    | InputEvent::Scroll { .. } => {}
                 }
             }
 

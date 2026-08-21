@@ -70,6 +70,10 @@ struct Placement {
     left: f32,
     top: f32,
     color: glyphon::Color,
+    /// The clip region this run fell inside (§6.1). glyphon takes bounds per
+    /// text area, so scrolled text is trimmed by the same command stream that
+    /// trims the rectangles — no second clipping mechanism.
+    bounds: TextBounds,
 }
 
 /// sRGB bytes, which is what glyphon expects.
@@ -115,8 +119,43 @@ impl TextPainter {
 
         placements.clear();
         let mut index = 0;
+        let whole = TextBounds {
+            left: 0,
+            top: 0,
+            right: viewport.0 as i32,
+            bottom: viewport.1 as i32,
+        };
+        // Clips nest, and each entry is already intersected with the one below.
+        let mut clips: Vec<TextBounds> = Vec::new();
+
         for command in &frame.commands {
-            let Command::Text { x, y, size, color, text } = command else { continue };
+            let Command::Text { x, y, size, color, text } = command else {
+                match command {
+                    Command::ClipStart { x, y, width, height } => {
+                        let region = TextBounds {
+                            left: *x as i32,
+                            top: *y as i32,
+                            right: (x + width).ceil() as i32,
+                            bottom: (y + height).ceil() as i32,
+                        };
+                        let nested = match clips.last() {
+                            Some(outer) => TextBounds {
+                                left: region.left.max(outer.left),
+                                top: region.top.max(outer.top),
+                                right: region.right.min(outer.right),
+                                bottom: region.bottom.min(outer.bottom),
+                            },
+                            None => region,
+                        };
+                        clips.push(nested);
+                    }
+                    Command::ClipEnd => {
+                        clips.pop();
+                    }
+                    _ => {}
+                }
+                continue;
+            };
 
             if index == buffers.len() {
                 buffers.push(Buffer::new(font_system, Metrics::new(*size, size * 1.25)));
@@ -143,6 +182,7 @@ impl TextPainter {
                     to_srgb8(color.b),
                     to_srgb8(color.a),
                 ),
+                bounds: clips.last().copied().unwrap_or(whole),
             });
             index += 1;
         }
@@ -156,12 +196,7 @@ impl TextPainter {
             left: placement.left,
             top: placement.top,
             scale: 1.0,
-            bounds: TextBounds {
-                left: 0,
-                top: 0,
-                right: viewport.0 as i32,
-                bottom: viewport.1 as i32,
-            },
+            bounds: placement.bounds,
             default_color: placement.color,
             custom_glyphs: &[],
         });
