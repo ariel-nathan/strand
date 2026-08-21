@@ -8,7 +8,11 @@
 
 use std::sync::Arc;
 
+pub mod paint;
 pub mod scene;
+
+use paint::Painter;
+use scene::{Color, Frame, Layouter, Node, Sizing, Style, TextStyle};
 
 use anyhow::{anyhow, Result};
 use winit::application::ApplicationHandler;
@@ -22,6 +26,7 @@ struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    painter: Painter,
 }
 
 impl Gpu {
@@ -59,7 +64,8 @@ impl Gpu {
 
         surface.configure(&device, &config);
 
-        Ok(Self { surface, device, queue, config })
+        let painter = Painter::new(&device, config.format);
+        Ok(Self { surface, device, queue, config, painter })
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -70,8 +76,11 @@ impl Gpu {
         }
     }
 
-    /// M0 paints a flat colour. M3 replaces this with scene-graph traversal.
-    fn render(&mut self) -> Result<()> {
+    /// Paints one frame's command array (§6.1).
+    fn render(&mut self, frame: &Frame) -> Result<()> {
+        let viewport = (self.config.width as f32, self.config.height as f32);
+        let count = self.painter.prepare(&self.device, &self.queue, frame, viewport);
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -93,7 +102,7 @@ impl Gpu {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
         {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -114,6 +123,7 @@ impl Gpu {
                 occlusion_query_set: None,
                 ..Default::default()
             });
+            self.painter.draw(&mut pass, count);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -126,6 +136,9 @@ impl Gpu {
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
+    layouter: Layouter,
+    /// The tree to paint. Replaced wholesale each time the app submits one.
+    scene: Option<Node>,
 }
 
 impl ApplicationHandler for App {
@@ -165,7 +178,10 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(gpu) = &mut self.gpu {
-                    if let Err(e) = gpu.render() {
+                    let viewport = (gpu.config.width as f32, gpu.config.height as f32);
+                    let tree = self.scene.get_or_insert_with(demo_scene);
+                    let frame = self.layouter.layout(tree, viewport);
+                    if let Err(e) = gpu.render(frame) {
                         eprintln!("frame dropped: {e}");
                     }
                 }
@@ -176,6 +192,65 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+}
+
+/// A stand-in UI until an app actor submits one: a header, a sidebar and a
+/// few rows, enough to show layout and painting working together.
+fn demo_scene() -> Node {
+    let panel = Color::rgb(0.13, 0.14, 0.18);
+    let accent = Color::rgb(0.35, 0.55, 0.95);
+    let muted = Color::rgb(0.22, 0.23, 0.28);
+
+    let row = |shade: Color| Node::Box {
+        style: Style {
+            width: Sizing::Grow,
+            height: Sizing::Fixed(28.0),
+            background: Some(shade),
+            ..Default::default()
+        },
+    };
+
+    Node::column(
+        Style { width: Sizing::Grow, height: Sizing::Grow, padding: 16.0, gap: 12.0, ..Default::default() },
+        vec![
+            // header
+            Node::Box {
+                style: Style {
+                    width: Sizing::Grow,
+                    height: Sizing::Fixed(48.0),
+                    background: Some(accent),
+                    ..Default::default()
+                },
+            },
+            Node::row(
+                Style { width: Sizing::Grow, height: Sizing::Grow, gap: 12.0, ..Default::default() },
+                vec![
+                    // sidebar
+                    Node::Box {
+                        style: Style {
+                            width: Sizing::Percent(0.28),
+                            height: Sizing::Grow,
+                            background: Some(panel),
+                            ..Default::default()
+                        },
+                    },
+                    // list
+                    Node::column(
+                        Style {
+                            width: Sizing::Grow,
+                            height: Sizing::Grow,
+                            padding: 12.0,
+                            gap: 8.0,
+                            background: Some(panel),
+                            ..Default::default()
+                        },
+                        vec![row(muted), row(muted), row(accent), row(muted)],
+                    ),
+                ],
+            ),
+            Node::text("strand", TextStyle::default()),
+        ],
+    )
 }
 
 /// Takes over the calling thread (which must be the main thread) with the

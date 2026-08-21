@@ -1,0 +1,16 @@
+--- strand M0: actors + compositor ---
+--- strand M0: 3 actors, 1 worker thread ---
+[   14ms] ticker tick
+[   19ms] ping   ping: starting
+[   23ms] pong   pong: ready
+[   75ms] ticker tick
+[  136ms] ticker tick
+[  199ms] ticker tick
+[  260ms] ticker tick
+[  323ms] ping   ping: woke, sending PING to pong
+[  324ms] pong   PING
+[  325ms] ping   PONG
+[  325ms] ticker tick
+[  385ms] ticker tick
+[  446ms] ticker tick
+--- actors done ---

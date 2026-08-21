@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytemuck = { version = "1.25.2", features = ["derive"] }
 pollster = "1.0.1"
 taffy = "0.13.0"
 tracing.workspace = true
