@@ -13,6 +13,7 @@ use crate::diag::Diagnostic;
 use crate::hir::*;
 use crate::lexer::Span;
 use crate::input;
+use crate::stdlib;
 use crate::ui::{self, PropTy, Slot};
 
 pub fn check(program: &ast::Program) -> Result<Hir, Vec<Diagnostic>> {
@@ -1023,6 +1024,18 @@ impl Checker {
         let operand = if matches!(lhs.ty, Ty::Error | Ty::Never) { rhs.ty.clone() } else { lhs.ty.clone() };
 
         let (ty, hir_op) = match (op, &operand) {
+            // §4.2's complaint about JS is `"1" + 1`, not `"a" + "b"`. Mixed
+            // operands are still rejected above, so this cannot coerce.
+            (B::Add, Ty::Str) => {
+                return Expr {
+                    ty: Ty::Str,
+                    kind: ExprKind::CallHelper {
+                        helper: Helper::StrConcat,
+                        args: vec![lhs, rhs],
+                    },
+                }
+            }
+
             (B::Add, Ty::Int) => (Ty::Int, BinOp::AddInt),
             (B::Sub, Ty::Int) => (Ty::Int, BinOp::SubInt),
             (B::Mul, Ty::Int) => (Ty::Int, BinOp::MulInt),
@@ -1064,6 +1077,78 @@ impl Checker {
             ty,
             kind: ExprKind::Binary { op: hir_op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
         }
+    }
+
+    /// A call to one of `stdlib`'s functions.
+    ///
+    /// Checked exactly like a user function — the argument count and every type
+    /// — because from the caller's side that is what it is. The only difference
+    /// is where the body comes from.
+    fn check_stdlib_call(&mut self, fun: &stdlib::Fun, args: &[ast::Arg], span: Span) -> Expr {
+        let kind_ty = |kind: stdlib::Kind| match kind {
+            stdlib::Kind::Int => Ty::Int,
+            stdlib::Kind::Str => Ty::Str,
+            stdlib::Kind::Bool => Ty::Bool,
+        };
+        let ret = kind_ty(fun.ret);
+
+        if args.len() != fun.params.len() {
+            self.error_labeled(
+                span,
+                format!(
+                    "`{}` takes {} argument(s), found {}",
+                    fun.name,
+                    fun.params.len(),
+                    args.len()
+                ),
+                "wrong number of arguments",
+                fun.signature(),
+            );
+        }
+
+        let mut checked = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            let want = fun.params.get(index).copied().map(kind_ty);
+            let value = self.check_expr(&arg.value, want.as_ref());
+            if let Some(want) = want {
+                if !value.ty.unifies(&want) {
+                    let (found, want) = (self.show(&value.ty), self.show(&want));
+                    self.error_labeled(
+                        arg.span,
+                        format!("argument {} of `{}` is {want}, found {found}", index + 1, fun.name),
+                        "wrong type",
+                        fun.signature(),
+                    );
+                }
+            }
+            checked.push(value);
+        }
+        if checked.len() != fun.params.len() {
+            return Expr { ty: ret, kind: ExprKind::Unit };
+        }
+
+        // These have no declaration to go to either, so the signature is what
+        // hover has to say.
+        self.analysis
+            .descriptions
+            .push((span, format!("{}\n{}", fun.signature(), fun.doc)));
+
+        let kind = match fun.body {
+            stdlib::Body::Helper(helper) => ExprKind::CallHelper { helper, args: checked },
+            // `len(s) == 0`, out of pieces that already exist.
+            stdlib::Body::LengthIsZero => ExprKind::Binary {
+                op: BinOp::EqInt,
+                lhs: Box::new(Expr {
+                    ty: Ty::Int,
+                    kind: ExprKind::CallHelper {
+                        helper: Helper::StrCharCount,
+                        args: checked,
+                    },
+                }),
+                rhs: Box::new(Expr { ty: Ty::Int, kind: ExprKind::Int(0) }),
+            },
+        };
+        Expr { ty: ret, kind }
     }
 
     /// §6.2's builder call: `column(gap: 4) { ... }`.
@@ -1297,6 +1382,14 @@ impl Checker {
                 self.record_use(span, declared_at);
             }
             return self.check_variant_call(sum, index, name, args, span);
+        }
+
+        if let Some(fun) = stdlib::lookup(name) {
+            // A user function of the same name wins, so nothing here takes a
+            // name out of circulation.
+            if !self.signatures.contains_key(name) {
+                return self.check_stdlib_call(fun, args, span);
+            }
         }
 
         // Host builtins are not user functions and cannot be shadowed.

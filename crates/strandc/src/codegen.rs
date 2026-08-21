@@ -96,6 +96,10 @@ struct Emitter<'hir> {
     /// Whether anything in this module builds nodes. A module that draws
     /// nothing pays for none of this.
     builds_nodes: bool,
+    /// Generated string helpers this module actually calls, in a fixed order.
+    /// Emitted last, so adding one shifts no index anything else depends on.
+    helpers: Vec<Helper>,
+    helpers_base: u32,
     /// Host functions this module actually calls. Imports take the lowest
     /// function indices, so everything defined here is offset past them.
     imports: Vec<Builtin>,
@@ -121,8 +125,22 @@ impl<'hir> Emitter<'hir> {
             node_count_global: first_free + 1,
             pending_global: first_free + 2,
             builds_nodes,
+            helpers: Vec::new(),
+            // Filled in once the conditional helpers before it are counted.
+            helpers_base: 0,
             imports: Vec::new(),
         }
+    }
+
+    /// Where `helper` ended up. Only helpers the module calls are emitted, so
+    /// this is a position in that list rather than a fixed slot.
+    fn helper_index(&self, helper: Helper) -> u32 {
+        let position = self
+            .helpers
+            .iter()
+            .position(|candidate| *candidate == helper)
+            .expect("helper was collected");
+        self.helpers_base + position as u32
     }
 
     fn intern_type(&mut self, params: Vec<ValType>, results: Vec<ValType>) -> u32 {
@@ -147,6 +165,7 @@ impl<'hir> Emitter<'hir> {
     fn run(mut self) -> EResult<Vec<u8>> {
         self.collect_strings();
         self.collect_imports();
+        self.collect_helpers();
 
         // Imports shift every defined function, so fix the helper indices here
         // rather than sprinkling the offset through emission.
@@ -154,6 +173,20 @@ impl<'hir> Emitter<'hir> {
         self.alloc_index += offset;
         self.str_eq_index += offset;
         self.node_push_index += offset;
+
+        // The generated string helpers sit after everything else, so their
+        // presence cannot move an index another part of the emitter computed.
+        let mut after = self.str_eq_index + 1;
+        if self.builds_nodes {
+            after += 2;
+        }
+        if let Some(actor) = &self.hir.actor {
+            after += 2;
+            if actor.view.is_some() {
+                after += 1;
+            }
+        }
+        self.helpers_base = after;
 
         // Function types, in index order: user functions, then the two helpers.
         let mut signatures = Vec::new();
@@ -184,6 +217,15 @@ impl<'hir> Emitter<'hir> {
         );
         let frame_reset_ty = self.intern_type(Vec::new(), Vec::new());
         let actor_view_ty = self.intern_type(Vec::new(), Vec::new());
+        let helper_types: Vec<u32> = self
+            .helpers
+            .clone()
+            .into_iter()
+            .map(|helper| {
+                let (params, results) = helper_signature(helper);
+                self.intern_type(params, results)
+            })
+            .collect();
 
         // Bodies are emitted before the type section is finalised, because a
         // multi-value block inside a body can intern a new type.
@@ -225,6 +267,9 @@ impl<'hir> Emitter<'hir> {
             if actor.view.is_some() {
                 functions.function(actor_view_ty);
             }
+        }
+        for helper_ty in &helper_types {
+            functions.function(*helper_ty);
         }
         module.section(&functions);
 
@@ -325,6 +370,9 @@ impl<'hir> Emitter<'hir> {
                 code.function(&actor_view_body(view, self.node_push_index + 1, offset));
             }
         }
+        for helper in &self.helpers {
+            code.function(&helper_body(*helper, self.alloc_index));
+        }
         module.section(&code);
 
         if !self.data.is_empty() {
@@ -337,6 +385,24 @@ impl<'hir> Emitter<'hir> {
     }
 
     /// Finds which host functions the program calls, so only those are imported.
+    /// Finds the string helpers this module calls.
+    ///
+    /// A program that never touches a string emits none of them, which is the
+    /// same rule imports follow: you pay for what you call.
+    fn collect_helpers(&mut self) {
+        let mut used = Vec::new();
+        for func in &self.hir.funcs {
+            walk_block(&func.body, &mut |expr| {
+                if let ExprKind::CallHelper { helper, .. } = &expr.kind {
+                    used.push(*helper);
+                }
+            });
+        }
+        used.sort();
+        used.dedup();
+        self.helpers = used;
+    }
+
     fn collect_imports(&mut self) {
         let mut used = Vec::new();
         for func in &self.hir.funcs {
@@ -502,6 +568,13 @@ impl<'hir> Emitter<'hir> {
                     .position(|b| b == builtin)
                     .expect("import was collected");
                 code.push(Instruction::Call(index as u32));
+            }
+
+            ExprKind::CallHelper { helper, args } => {
+                for arg in args {
+                    self.expr(ctx, code, arg)?;
+                }
+                code.push(Instruction::Call(self.helper_index(*helper)));
             }
 
             ExprKind::MakeNode { kind, props, numbers, children } => {
@@ -1198,6 +1271,484 @@ fn actor_view_body(view: FuncId, frame_reset: u32, offset: u32) -> Function {
     f
 }
 
+// ---- generated string helpers (`stdlib`) ---------------------------------
+//
+// Every one of these works on `docs/abi.md` §5's layout: a pointer to
+// `{ i32 len, bytes... }`, UTF-8, immutable. Immutable is what makes them
+// cheap to reason about — a helper never edits its argument, it allocates a
+// new string, and the old one stays valid for anyone still holding it.
+//
+// Characters, not bytes, wherever a count is user-visible. A UTF-8 continuation
+// byte is `0b10xxxxxx`, so `b & 0xC0 != 0x80` marks the start of a character,
+// and counting or stepping back over those is all any of this needs.
+
+/// The WASM signature of a helper. Needed before any body is emitted, because
+/// the type section is written first.
+fn helper_signature(helper: Helper) -> (Vec<ValType>, Vec<ValType>) {
+    match helper {
+        Helper::StrConcat => (vec![ValType::I32, ValType::I32], vec![ValType::I32]),
+        Helper::StrFromInt => (vec![ValType::I64], vec![ValType::I32]),
+        Helper::StrFromChar => (vec![ValType::I64], vec![ValType::I32]),
+        Helper::StrCharCount => (vec![ValType::I32], vec![ValType::I64]),
+        Helper::StrDropLast | Helper::StrTrim => (vec![ValType::I32], vec![ValType::I32]),
+    }
+}
+
+fn helper_body(helper: Helper, alloc: u32) -> Function {
+    match helper {
+        Helper::StrConcat => str_concat_body(alloc),
+        Helper::StrFromInt => str_from_int_body(alloc),
+        Helper::StrFromChar => str_from_char_body(alloc),
+        Helper::StrCharCount => str_char_count_body(),
+        Helper::StrDropLast => str_drop_last_body(alloc),
+        Helper::StrTrim => str_trim_body(alloc),
+    }
+}
+
+/// Pushes `bytes = header + len`, allocates, and writes the length header.
+/// Leaves the new string's pointer in `out`.
+fn begin_string(f: &mut Function, alloc: u32, len: u32, out: u32) {
+    f.instruction(&Instruction::LocalGet(len));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::Call(alloc));
+    f.instruction(&Instruction::LocalTee(out));
+    f.instruction(&Instruction::LocalGet(len));
+    f.instruction(&Instruction::I32Store(mem_arg(0, 2)));
+}
+
+/// `a + b`. One allocation, two copies, and neither argument is touched.
+fn str_concat_body(alloc: u32) -> Function {
+    let mut f = Function::new([(3, ValType::I32)]);
+    let (a, b, la, lb, out) = (0, 1, 2, 3, 4);
+
+    for (src, len) in [(a, la), (b, lb)] {
+        f.instruction(&Instruction::LocalGet(src));
+        f.instruction(&Instruction::I32Load(mem_arg(0, 2)));
+        f.instruction(&Instruction::LocalSet(len));
+    }
+
+    // total = la + lb, reusing `la`'s neighbour slot for the sum.
+    f.instruction(&Instruction::LocalGet(la));
+    f.instruction(&Instruction::LocalGet(lb));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::Call(alloc));
+    f.instruction(&Instruction::LocalTee(out));
+    f.instruction(&Instruction::LocalGet(la));
+    f.instruction(&Instruction::LocalGet(lb));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Store(mem_arg(0, 2)));
+
+    // out[4..] = a[4..], then out[4 + la..] = b[4..].
+    f.instruction(&Instruction::LocalGet(out));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalGet(a));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalGet(la));
+    f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+
+    f.instruction(&Instruction::LocalGet(out));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalGet(la));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalGet(b));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalGet(lb));
+    f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+
+    f.instruction(&Instruction::LocalGet(out));
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// Characters, not bytes: everything whose top bits are not `10` starts one.
+fn str_char_count_body() -> Function {
+    let mut f = Function::new([(3, ValType::I32)]);
+    let (s, n, i, count) = (0, 1, 2, 3);
+
+    f.instruction(&Instruction::LocalGet(s));
+    f.instruction(&Instruction::I32Load(mem_arg(0, 2)));
+    f.instruction(&Instruction::LocalSet(n));
+
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(i));
+    f.instruction(&Instruction::LocalGet(n));
+    f.instruction(&Instruction::I32GeU);
+    f.instruction(&Instruction::BrIf(1));
+
+    f.instruction(&Instruction::LocalGet(s));
+    f.instruction(&Instruction::LocalGet(i));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Load8U(mem_arg(4, 0)));
+    f.instruction(&Instruction::I32Const(0xC0));
+    f.instruction(&Instruction::I32And);
+    f.instruction(&Instruction::I32Const(0x80));
+    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(count));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(count));
+    f.instruction(&Instruction::End);
+
+    f.instruction(&Instruction::LocalGet(i));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(i));
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+
+    f.instruction(&Instruction::LocalGet(count));
+    f.instruction(&Instruction::I64ExtendI32U);
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// What Backspace does: step back over any continuation bytes so a multi-byte
+/// character goes as one thing rather than leaving a broken tail.
+fn str_drop_last_body(alloc: u32) -> Function {
+    let mut f = Function::new([(3, ValType::I32)]);
+    let (s, n, cut, out) = (0, 1, 2, 3);
+
+    f.instruction(&Instruction::LocalGet(s));
+    f.instruction(&Instruction::I32Load(mem_arg(0, 2)));
+    f.instruction(&Instruction::LocalTee(n));
+
+    // Nothing to drop: hand back the same string. Immutability makes that safe.
+    f.instruction(&Instruction::I32Eqz);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(s));
+    f.instruction(&Instruction::Return);
+    f.instruction(&Instruction::End);
+
+    f.instruction(&Instruction::LocalGet(n));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::LocalSet(cut));
+
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(cut));
+    f.instruction(&Instruction::I32Eqz);
+    f.instruction(&Instruction::BrIf(1));
+
+    f.instruction(&Instruction::LocalGet(s));
+    f.instruction(&Instruction::LocalGet(cut));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Load8U(mem_arg(4, 0)));
+    f.instruction(&Instruction::I32Const(0xC0));
+    f.instruction(&Instruction::I32And);
+    f.instruction(&Instruction::I32Const(0x80));
+    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::BrIf(1));
+
+    f.instruction(&Instruction::LocalGet(cut));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::LocalSet(cut));
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+
+    begin_string(&mut f, alloc, cut, out);
+    f.instruction(&Instruction::LocalGet(out));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalGet(s));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalGet(cut));
+    f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+
+    f.instruction(&Instruction::LocalGet(out));
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// ASCII whitespace off both ends. §12's scope discipline: Unicode whitespace
+/// is a table, and nothing in the POC needs one.
+fn str_trim_body(alloc: u32) -> Function {
+    // Six locals, not five: `is_ascii_space` borrows the last one.
+    let mut f = Function::new([(6, ValType::I32)]);
+    let (s, n, start, end, len, out) = (0, 1, 2, 3, 4, 5);
+
+    f.instruction(&Instruction::LocalGet(s));
+    f.instruction(&Instruction::I32Load(mem_arg(0, 2)));
+    f.instruction(&Instruction::LocalTee(n));
+    f.instruction(&Instruction::LocalSet(end));
+
+    // Forwards past leading whitespace.
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(start));
+    f.instruction(&Instruction::LocalGet(end));
+    f.instruction(&Instruction::I32GeU);
+    f.instruction(&Instruction::BrIf(1));
+    f.instruction(&Instruction::LocalGet(s));
+    f.instruction(&Instruction::LocalGet(start));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Load8U(mem_arg(4, 0)));
+    is_ascii_space(&mut f);
+    f.instruction(&Instruction::I32Eqz);
+    f.instruction(&Instruction::BrIf(1));
+    f.instruction(&Instruction::LocalGet(start));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(start));
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+
+    // Backwards past trailing whitespace.
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(end));
+    f.instruction(&Instruction::LocalGet(start));
+    f.instruction(&Instruction::I32LeU);
+    f.instruction(&Instruction::BrIf(1));
+    f.instruction(&Instruction::LocalGet(s));
+    f.instruction(&Instruction::LocalGet(end));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Load8U(mem_arg(3, 0)));
+    is_ascii_space(&mut f);
+    f.instruction(&Instruction::I32Eqz);
+    f.instruction(&Instruction::BrIf(1));
+    f.instruction(&Instruction::LocalGet(end));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::LocalSet(end));
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+
+    f.instruction(&Instruction::LocalGet(end));
+    f.instruction(&Instruction::LocalGet(start));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::LocalSet(len));
+
+    begin_string(&mut f, alloc, len, out);
+    f.instruction(&Instruction::LocalGet(out));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalGet(s));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalGet(start));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalGet(len));
+    f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+
+    f.instruction(&Instruction::LocalGet(out));
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// Replaces the byte on the stack with whether it is space, tab, CR or LF.
+fn is_ascii_space(f: &mut Function) {
+    // b == 32 || b == 9 || b == 10 || b == 13, without a local to hold `b`:
+    // `(b == 32) | (b == 9) | (b == 10) | (b == 13)` needs `b` four times, so
+    // subtract-and-compare against the small set instead.
+    f.instruction(&Instruction::LocalSet(SPACE_SCRATCH));
+    let mut first = true;
+    for byte in [32, 9, 10, 13] {
+        f.instruction(&Instruction::LocalGet(SPACE_SCRATCH));
+        f.instruction(&Instruction::I32Const(byte));
+        f.instruction(&Instruction::I32Eq);
+        if !first {
+            f.instruction(&Instruction::I32Or);
+        }
+        first = false;
+    }
+}
+
+/// The local `is_ascii_space` borrows. Both callers declare it as their last
+/// i32, so the index is the same in each.
+const SPACE_SCRATCH: u32 = 6;
+
+/// Decimal. Two passes: count the digits, then fill backwards from the end.
+///
+/// The magnitude is taken as *unsigned*, which is what makes `int`'s most
+/// negative value work: negating it wraps to itself, and read without a sign
+/// that bit pattern is exactly the magnitude wanted.
+fn str_from_int_body(alloc: u32) -> Function {
+    let mut f = Function::new([(2, ValType::I64), (4, ValType::I32)]);
+    let (value, mag, scratch) = (0, 1, 2);
+    let (digits, total, out, at) = (3, 4, 5, 6);
+
+    f.instruction(&Instruction::LocalGet(value));
+    f.instruction(&Instruction::I64Const(0));
+    f.instruction(&Instruction::I64LtS);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::I64Const(0));
+    f.instruction(&Instruction::LocalGet(value));
+    f.instruction(&Instruction::I64Sub);
+    f.instruction(&Instruction::LocalSet(mag));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::LocalSet(total));
+    f.instruction(&Instruction::Else);
+    f.instruction(&Instruction::LocalGet(value));
+    f.instruction(&Instruction::LocalSet(mag));
+    f.instruction(&Instruction::End);
+
+    // At least one digit, so zero prints as "0" rather than as nothing.
+    f.instruction(&Instruction::LocalGet(mag));
+    f.instruction(&Instruction::LocalSet(scratch));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(digits));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(digits));
+    f.instruction(&Instruction::LocalGet(scratch));
+    f.instruction(&Instruction::I64Const(10));
+    f.instruction(&Instruction::I64DivU);
+    f.instruction(&Instruction::LocalTee(scratch));
+    f.instruction(&Instruction::I64Const(0));
+    f.instruction(&Instruction::I64Ne);
+    f.instruction(&Instruction::BrIf(0));
+    f.instruction(&Instruction::End);
+
+    f.instruction(&Instruction::LocalGet(total));
+    f.instruction(&Instruction::LocalGet(digits));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(total));
+
+    begin_string(&mut f, alloc, total, out);
+
+    // The sign, if there is one: `total` was seeded with 1 for it.
+    f.instruction(&Instruction::LocalGet(value));
+    f.instruction(&Instruction::I64Const(0));
+    f.instruction(&Instruction::I64LtS);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(out));
+    f.instruction(&Instruction::I32Const(b'-' as i32));
+    f.instruction(&Instruction::I32Store8(mem_arg(4, 0)));
+    f.instruction(&Instruction::End);
+
+    // Digits, least significant first, written from the far end backwards.
+    f.instruction(&Instruction::LocalGet(total));
+    f.instruction(&Instruction::LocalSet(at));
+    f.instruction(&Instruction::LocalGet(mag));
+    f.instruction(&Instruction::LocalSet(scratch));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(at));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::LocalTee(at));
+    f.instruction(&Instruction::LocalGet(out));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalGet(scratch));
+    f.instruction(&Instruction::I64Const(10));
+    f.instruction(&Instruction::I64RemU);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Const(b'0' as i32));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Store8(mem_arg(4, 0)));
+    f.instruction(&Instruction::LocalGet(scratch));
+    f.instruction(&Instruction::I64Const(10));
+    f.instruction(&Instruction::I64DivU);
+    f.instruction(&Instruction::LocalTee(scratch));
+    f.instruction(&Instruction::I64Const(0));
+    f.instruction(&Instruction::I64Ne);
+    f.instruction(&Instruction::BrIf(0));
+    f.instruction(&Instruction::End);
+
+    f.instruction(&Instruction::LocalGet(out));
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// One UTF-8 width: how many bytes, the lead byte's mask, and where each
+/// trailing byte goes and which six bits it carries.
+type Width = (i32, i32, &'static [(u64, i32)]);
+
+/// One character, UTF-8 encoded, from a Unicode scalar value.
+///
+/// The encoding is written out rather than looped, because there are only four
+/// widths and each writes a different number of bytes.
+fn str_from_char_body(alloc: u32) -> Function {
+    let mut f = Function::new([(4, ValType::I32)]);
+    let code = 0;
+    let (scalar, len, out) = (1, 2, 3);
+
+    f.instruction(&Instruction::LocalGet(code));
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::LocalSet(scalar));
+
+    // Width, by range.
+    for (limit, width) in [(0x80, 1), (0x800, 2), (0x1_0000, 3)] {
+        f.instruction(&Instruction::LocalGet(len));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::LocalGet(scalar));
+        f.instruction(&Instruction::I32Const(limit));
+        f.instruction(&Instruction::I32LtU);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::I32Const(width));
+        f.instruction(&Instruction::LocalSet(len));
+        f.instruction(&Instruction::End);
+    }
+    f.instruction(&Instruction::LocalGet(len));
+    f.instruction(&Instruction::I32Eqz);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::LocalSet(len));
+    f.instruction(&Instruction::End);
+
+    begin_string(&mut f, alloc, len, out);
+
+    let lead = |f: &mut Function, mask: i32, shift: i32| {
+        f.instruction(&Instruction::LocalGet(out));
+        f.instruction(&Instruction::LocalGet(scalar));
+        f.instruction(&Instruction::I32Const(shift));
+        f.instruction(&Instruction::I32ShrU);
+        f.instruction(&Instruction::I32Const(mask));
+        f.instruction(&Instruction::I32Or);
+        f.instruction(&Instruction::I32Store8(mem_arg(4, 0)));
+    };
+    let trail = |f: &mut Function, at: u64, shift: i32| {
+        f.instruction(&Instruction::LocalGet(out));
+        f.instruction(&Instruction::LocalGet(scalar));
+        f.instruction(&Instruction::I32Const(shift));
+        f.instruction(&Instruction::I32ShrU);
+        f.instruction(&Instruction::I32Const(0x3F));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::I32Const(0x80));
+        f.instruction(&Instruction::I32Or);
+        f.instruction(&Instruction::I32Store8(mem_arg(at, 0)));
+    };
+
+    // (width, lead-byte mask, trailing bytes as (offset, shift)).
+    let widths: [Width; 4] = [
+        (1, 0x00, &[]),
+        (2, 0xC0, &[(5, 0)]),
+        (3, 0xE0, &[(5, 6), (6, 0)]),
+        (4, 0xF0, &[(5, 12), (6, 6), (7, 0)]),
+    ];
+    for (width, mask, trailers) in widths {
+        f.instruction(&Instruction::LocalGet(len));
+        f.instruction(&Instruction::I32Const(width));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        lead(&mut f, mask, (6 * trailers.len()) as i32);
+        for (at, shift) in trailers {
+            trail(&mut f, *at, *shift);
+        }
+        f.instruction(&Instruction::End);
+    }
+
+    f.instruction(&Instruction::LocalGet(out));
+    f.instruction(&Instruction::End);
+    f
+}
+
 /// Bump allocator in the guest arena (`docs/abi.md` §6). Never frees: §5.1
 /// reclaims the whole arena when the actor dies.
 fn alloc_body() -> Function {
@@ -1432,11 +1983,21 @@ fn walk_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         }
         ExprKind::Call { args, .. }
         | ExprKind::CallBuiltin { args, .. }
+        | ExprKind::CallHelper { args, .. }
         | ExprKind::MakeRecord { fields: args, .. }
         | ExprKind::MakeVariant { fields: args, .. } => {
             for arg in args {
                 walk_expr(arg, visit);
             }
+        }
+        // A view's props and children hold ordinary expressions, and anything
+        // in them can call `log` or a helper. Missing this meant a `log` inside
+        // a builder's block compiled to a call to an import nobody collected.
+        ExprKind::MakeNode { props, children, .. } => {
+            for (_, value) in props {
+                walk_expr(value, visit);
+            }
+            walk_block(children, visit);
         }
         ExprKind::FieldGet { base, .. } => walk_expr(base, visit),
         ExprKind::MakeOk(inner)
@@ -1481,7 +2042,9 @@ fn collect_expr_strings(expr: &Expr, out: &mut Vec<String>) {
             collect_expr_strings(lhs, out);
             collect_expr_strings(rhs, out);
         }
-        ExprKind::Call { args, .. } | ExprKind::CallBuiltin { args, .. } => {
+        ExprKind::Call { args, .. }
+        | ExprKind::CallBuiltin { args, .. }
+        | ExprKind::CallHelper { args, .. } => {
             for arg in args {
                 collect_expr_strings(arg, out);
             }

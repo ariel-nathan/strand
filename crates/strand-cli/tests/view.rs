@@ -318,3 +318,18 @@ fn many_siblings_survive_the_flat_array() {
     assert_eq!(labels(&tree).first().map(String::as_str), Some("row 0"));
     assert_eq!(labels(&tree).last().map(String::as_str), Some("row 199"));
 }
+
+#[test]
+fn a_view_can_use_the_string_functions() {
+    let tree = draw(
+        r#"
+        view fn main(): Node {
+          column(gap: 4) {
+            text("count: " + str(len("abc")))
+            text(trim("  spaced  "))
+          }
+        }
+        "#,
+    );
+    assert_eq!(labels(&tree), vec!["count: 3", "spaced"]);
+}

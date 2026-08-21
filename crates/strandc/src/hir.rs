@@ -217,6 +217,9 @@ pub enum ExprKind {
     /// A call into the host ABI. Imports occupy the low function indices, so
     /// codegen keeps these separate from ordinary calls.
     CallBuiltin { builtin: Builtin, args: Vec<Expr> },
+    /// A call into a generated WASM helper (`stdlib`). Unlike a builtin these
+    /// never leave the actor, so a module full of them still imports nothing.
+    CallHelper { helper: Helper, args: Vec<Expr> },
 
     MakeRecord { record: RecordId, fields: Vec<Expr> },
     /// Field index is resolved, so codegen just needs the offset.
@@ -251,6 +254,41 @@ pub enum ExprKind {
         /// Empty for a leaf.
         children: Block,
     },
+}
+
+/// A function the emitter generates into the module itself.
+///
+/// Emitted only where used, so a program that never touches a string carries
+/// none of them. Ordering here is the order they are laid out in, which is why
+/// it is an enum rather than a name: an index has to be computable before any
+/// body is emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Helper {
+    /// `a + b` on strings.
+    StrConcat,
+    /// The decimal form of an `int`.
+    StrFromInt,
+    /// One character, UTF-8 encoded, from a Unicode scalar value.
+    StrFromChar,
+    /// Characters, not bytes.
+    StrCharCount,
+    /// The string without its last character.
+    StrDropLast,
+    /// The string without surrounding whitespace.
+    StrTrim,
+}
+
+impl Helper {
+    pub fn name(self) -> &'static str {
+        match self {
+            Helper::StrConcat => "str_concat",
+            Helper::StrFromInt => "str_from_int",
+            Helper::StrFromChar => "str_from_char",
+            Helper::StrCharCount => "str_char_count",
+            Helper::StrDropLast => "str_drop_last",
+            Helper::StrTrim => "str_trim",
+        }
+    }
 }
 
 /// Host functions callable from Strand (`docs/abi.md` §6).

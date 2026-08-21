@@ -177,6 +177,41 @@ about what one means: layout, widgets and the compositor live on the far side
 of a one-method trait, which is what keeps the actor runtime free of the
 renderer.
 
+## 8a. Generated string helpers
+
+`+` on strings and the handful of functions in `crates/strandc/src/stdlib.rs`
+compile to WASM the emitter generates into the module itself — not to host
+imports. A program full of them still instantiates with nothing linked, and
+`strand run` needs no runtime under it.
+
+    str(value: int): string       // decimal
+    char(code: int): string       // one character, from a scalar value
+    len(s: string): int           // characters, not bytes
+    isEmpty(s: string): bool      // len(s) == 0, built from pieces that exist
+    trim(s: string): string
+    dropLast(s: string): string   // what Backspace does
+
+Only the helpers a module calls are emitted, the same rule imports follow, and
+they are laid out last so their presence cannot move an index anything else
+computed.
+
+Three properties worth stating, because each is a bug someone would otherwise
+write:
+
+- **Strings stay immutable** (§5). A helper never edits its argument; it
+  allocates. `a + b` leaves both `a` and `b` usable, which is what makes
+  `first + (a + b)` mean what it reads as.
+- **Characters, not bytes**, wherever a count is user-visible. A UTF-8
+  continuation byte is `0b10xxxxxx`, so `dropLast` steps back over them and
+  removes a whole character rather than leaving a broken tail.
+- **`str` reads the magnitude unsigned.** Negating `int`'s most negative value
+  wraps to itself; read without a sign, that bit pattern is exactly the
+  magnitude wanted. Done the obvious way it prints one wrong digit or loops.
+
+`+` on a string and a number is still rejected — §4.2's complaint about JS is
+`"1" + 1`, not `"a" + "b"`, and mixed operands never reach the concatenation
+path.
+
 ## 9. Input: the platform's own message type
 
 A UI actor receives input as ordinary messages (§6.1, §6.5), so its mailbox

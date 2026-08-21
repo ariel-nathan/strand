@@ -281,3 +281,29 @@ fn allocation_grows_memory_when_needed() {
         }";
     assert_eq!(call_int(src, "build", (40, 0)), 42);
 }
+
+#[test]
+fn a_host_call_inside_a_builder_block_is_still_collected() {
+    // The bug this exists for: the walker that finds which imports a module
+    // needs did not descend into a built node, so a `log` among a container's
+    // children was never collected — and codegen then emitted a call to a
+    // function index that did not exist, panicking rather than compiling.
+    //
+    // `build` validates, which is what catches it: an out-of-range call is a
+    // validation error even before anything runs.
+    let wasm = build(
+        r#"
+        view fn main(): Node {
+          column(gap: 4) {
+            log("building")
+            text("hi")
+          }
+        }
+        "#,
+    );
+    // And the import it needs is actually declared, rather than merely called.
+    assert!(
+        wasm.windows(3).any(|w| w == b"log"),
+        "the module should import `strand.log`"
+    );
+}

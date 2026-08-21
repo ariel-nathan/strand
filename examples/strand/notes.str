@@ -1,0 +1,158 @@
+// A text field that holds what you type, written in Strand.
+//
+//   strand view examples/strand/notes.str
+//
+// Click the field, type, press Enter. Backspace deletes, Escape clears.
+//
+// Everything here is the §6.5 loop: keystrokes arrive as `Input` messages,
+// `receive` returns the next state, and the platform re-invokes the view. The
+// draft lives in the actor's record like any other field — there is no widget
+// state anywhere, and the field on screen is drawn from the string below it.
+//
+// Three slots rather than a list, because `List` and `for` are not in the
+// language yet. That is the only thing standing between this and §7's todo
+// app; everything else it needs — typing, validation, a count on screen — is
+// here.
+
+type Model = {
+  draft: string,
+  // Which node has keyboard focus, or 0 for none. The platform decides; this
+  // records what it said so the view can draw a caret.
+  focus: int,
+  first: string,
+  second: string,
+  third: string,
+  notice: string,
+}
+
+// Node ids, stable across frames so a click keeps landing on the same thing.
+fn FIELD(): int { 1 }
+fn ADD(): int { 2 }
+fn CLEAR(): int { 3 }
+
+fn MAX(): int { 24 }
+
+// §4.5's shape: the validation lives in the return type, so a caller cannot
+// forget it is there.
+type AddError =
+  | EmptyTitle
+  | TooLong(max: int)
+  | NoRoom
+
+fn accept(state: Model, title: string): Result<Model, AddError> {
+  let clean = trim(title)
+  if isEmpty(clean) { return Err(EmptyTitle) }
+  if len(clean) > MAX() { return Err(TooLong(max: MAX())) }
+
+  if isEmpty(state.first) {
+    return Ok(Model { draft: "", focus: state.focus, first: clean, second: state.second, third: state.third, notice: "" })
+  }
+  if isEmpty(state.second) {
+    return Ok(Model { draft: "", focus: state.focus, first: state.first, second: clean, third: state.third, notice: "" })
+  }
+  if isEmpty(state.third) {
+    return Ok(Model { draft: "", focus: state.focus, first: state.first, second: state.second, third: clean, notice: "" })
+  }
+  Err(NoRoom)
+}
+
+// §7: a rejected action surfaces a notice, it does not crash.
+fn commit(state: Model): Model {
+  match accept(state, state.draft) {
+    Ok(next) => next,
+    Err(EmptyTitle) => noticed(state, "a note needs some words"),
+    Err(TooLong(max)) => noticed(state, "keep it under " + str(max) + " characters"),
+    Err(NoRoom) => noticed(state, "no room — clear one first"),
+  }
+}
+
+fn noticed(state: Model, text: string): Model {
+  Model { draft: state.draft, focus: state.focus, first: state.first, second: state.second, third: state.third, notice: text }
+}
+
+fn withDraft(state: Model, draft: string): Model {
+  Model { draft: draft, focus: state.focus, first: state.first, second: state.second, third: state.third, notice: "" }
+}
+
+fn counted(state: Model): string {
+  let n = len(trim(state.draft))
+  if n == 0 { return "nothing typed yet" }
+  str(n) + " of " + str(MAX()) + " characters"
+}
+
+// A parameter named `text` would shadow nothing — `text(...)` always routes to
+// the builder — so it is named for what it is instead.
+view fn note(body: string): Node {
+  row(gap: 8) {
+    muted("•")
+    text(body)
+  }
+}
+
+actor Notes {
+  state: Model
+  message: Input
+
+  fn init(): Model {
+    Model {
+      draft: "",
+      focus: 0,
+      first: "write the compiler",
+      second: "",
+      third: "",
+      notice: "",
+    }
+  }
+
+  fn receive(state: Model, msg: Input): Model {
+    match msg {
+      // The character the user meant, as a scalar value — a message carries no
+      // pointers, so it cannot be a string until this side of the boundary.
+      Typed(ch) => withDraft(state, state.draft + char(ch)),
+      Backspace => withDraft(state, dropLast(state.draft)),
+      Escape => withDraft(state, ""),
+      Enter => commit(state),
+      Click(id) => clicked(state, id),
+      // The platform says where focus went; what that looks like is the view's
+      // business (§6.5).
+      Focus(id) => Model { draft: state.draft, focus: id, first: state.first, second: state.second, third: state.third, notice: state.notice },
+      Scrolled(id, offset) => state,
+    }
+  }
+
+  view fn draw(state: Model): Node {
+    screen(gap: 12, padding: 16) {
+      text("notes — typed into compiled Strand")
+      muted(counted(state))
+
+      row(gap: 8) {
+        textInput(id: FIELD(), value: state.draft, prompt: "what is on your mind?", focused: state.focus == FIELD())
+        button(id: ADD(), label: "Add")
+      }
+
+      if !isEmpty(state.notice) {
+        muted(state.notice)
+      }
+
+      panel(gap: 8) {
+        // The guard is out here, not inside `note`: a branch that does not run
+        // contributes no child at all, so an empty slot costs no row *and* no
+        // gap. A `note` that drew itself empty would still leave a hole.
+        if !isEmpty(state.first) { note(state.first) }
+        if !isEmpty(state.second) { note(state.second) }
+        if !isEmpty(state.third) { note(state.third) }
+      }
+
+      spacer()
+      muted("Enter adds · Backspace deletes · Escape clears · F12 shows the actor")
+    }
+  }
+}
+
+fn clicked(state: Model, id: int): Model {
+  match id {
+    2 => commit(state),
+    3 => Model { draft: "", focus: state.focus, first: "", second: "", third: "", notice: "" },
+    _ => state,
+  }
+}

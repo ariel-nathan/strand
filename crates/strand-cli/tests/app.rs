@@ -36,14 +36,18 @@ impl Frames for Captured {
     }
 }
 
-fn source() -> String {
+fn example(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("examples")
         .join("strand")
-        .join("toggles.str");
+        .join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+}
+
+fn source() -> String {
+    example("toggles.str")
 }
 
 fn compile(src: &str) -> (Hir, Vec<u8>) {
@@ -72,8 +76,11 @@ fn labels(tree: &Node) -> Vec<String> {
 
 /// Runs the actor, feeding it `events`, and hands back every frame it drew.
 fn drive(events: Vec<InputEvent>) -> Vec<Node> {
-    let src = source();
-    let (hir, wasm) = compile(&src);
+    drive_source(&source(), events)
+}
+
+fn drive_source(src: &str, events: Vec<InputEvent>) -> Vec<Node> {
+    let (hir, wasm) = compile(src);
     let message_ty = hir.actor.as_ref().expect("an actor").message.clone();
     let captured = Arc::new(Captured::default());
     let sink = captured.clone();
@@ -221,4 +228,118 @@ fn the_actor_is_an_actor_like_any_other() {
     assert_eq!(row.name, "Toggles");
     assert!(row.alive);
     assert!(row.arena_bytes > 0, "it has an arena of its own");
+}
+
+// ---- typing ---------------------------------------------------------------
+
+fn typing(text: &str) -> Vec<InputEvent> {
+    text.chars()
+        .map(|character| InputEvent::Key { id: HitId(1), key: Key::Char(character) })
+        .collect()
+}
+
+/// Drives `notes.str`, the example with a text field.
+fn notes(events: Vec<InputEvent>) -> Vec<Node> {
+    drive_source(&example("notes.str"), events)
+}
+
+#[test]
+fn a_field_holds_what_was_typed_into_it() {
+    // The loop this closes: a keystroke arrives as `Typed(ch)`, `receive`
+    // appends `char(ch)` to a string in the actor's own record, and the field
+    // is redrawn from it. There is no widget state anywhere.
+    let frames = notes(typing("milk"));
+    let last = labels(frames.last().expect("a frame"));
+    assert!(last.iter().any(|t| t == "milk"), "{last:?}");
+    assert!(last.iter().any(|t| t == "4 of 24 characters"), "and it is counted: {last:?}");
+}
+
+#[test]
+fn backspace_removes_a_character_from_the_draft() {
+    let mut events = typing("milk");
+    events.push(InputEvent::Key { id: HitId(1), key: Key::Backspace });
+    let last = labels(&notes(events).pop().expect("a frame"));
+    assert!(last.iter().any(|t| t == "mil"), "{last:?}");
+}
+
+#[test]
+fn a_character_that_is_not_ascii_survives_the_round_trip() {
+    // It crosses as a scalar value because a message carries no pointers, and
+    // becomes a string again on the far side.
+    let last = labels(&notes(typing("café")).pop().expect("a frame"));
+    assert!(last.iter().any(|t| t == "café"), "{last:?}");
+}
+
+#[test]
+fn enter_commits_the_draft_and_empties_the_field() {
+    let mut events = typing("buy milk");
+    events.push(InputEvent::Key { id: HitId(1), key: Key::Enter });
+    let last = labels(&notes(events).pop().expect("a frame"));
+
+    assert!(last.iter().any(|t| t == "buy milk"), "the note was kept: {last:?}");
+    assert!(
+        last.iter().any(|t| t == "nothing typed yet"),
+        "and the field is ready for the next one: {last:?}"
+    );
+}
+
+#[test]
+fn a_committed_note_is_trimmed() {
+    let mut events = typing("   spaced   ");
+    events.push(InputEvent::Key { id: HitId(1), key: Key::Enter });
+    let last = labels(&notes(events).pop().expect("a frame"));
+    assert!(last.iter().any(|t| t == "spaced"), "{last:?}");
+}
+
+#[test]
+fn committing_nothing_is_a_notice_rather_than_a_note() {
+    // §7: a rejected action surfaces a notice, it does not crash.
+    let events = vec![InputEvent::Key { id: HitId(1), key: Key::Enter }];
+    let last = labels(&notes(events).pop().expect("a frame"));
+    assert!(last.iter().any(|t| t == "a note needs some words"), "{last:?}");
+}
+
+#[test]
+fn an_over_long_note_says_how_long_is_too_long() {
+    let mut events = typing(&"x".repeat(30));
+    events.push(InputEvent::Key { id: HitId(1), key: Key::Enter });
+    let last = labels(&notes(events).pop().expect("a frame"));
+    assert!(
+        last.iter().any(|t| t == "keep it under 24 characters"),
+        "the number came from `str(MAX())`: {last:?}"
+    );
+}
+
+#[test]
+fn escape_abandons_the_draft() {
+    let mut events = typing("never mind");
+    events.push(InputEvent::Key { id: HitId(1), key: Key::Escape });
+    let last = labels(&notes(events).pop().expect("a frame"));
+    assert!(last.iter().any(|t| t == "nothing typed yet"), "{last:?}");
+    assert!(!last.iter().any(|t| t == "never mind"), "{last:?}");
+}
+
+#[test]
+fn an_empty_slot_costs_no_row_and_no_gap() {
+    // The guard is outside `note`, so an empty slot contributes no child at
+    // all. Two notes should sit exactly one gap apart.
+    let mut events = typing("one");
+    events.push(InputEvent::Key { id: HitId(1), key: Key::Enter });
+    events.extend(typing("two"));
+    events.push(InputEvent::Key { id: HitId(1), key: Key::Enter });
+
+    let tree = notes(events).pop().expect("a frame");
+    let mut layouter = Layouter::new();
+    let frame = layouter.layout(&tree, (700.0, 500.0));
+
+    let ys: Vec<f32> = frame
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Text { text, y, .. } if text == "one" || text == "two" => Some(*y),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ys.len(), 2, "both notes are drawn");
+    assert_eq!(ys[1] - ys[0], 28.0, "a 20px line plus the panel's 8px gap, and nothing else");
 }

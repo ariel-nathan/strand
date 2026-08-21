@@ -10,6 +10,7 @@ pub mod input;
 pub mod lexer;
 pub mod line_index;
 pub mod parser;
+pub mod stdlib;
 pub mod ui;
 
 /// Front end: source to typed IR, with every diagnostic gathered against the
