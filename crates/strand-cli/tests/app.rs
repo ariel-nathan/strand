@@ -343,3 +343,126 @@ fn an_empty_slot_costs_no_row_and_no_gap() {
     assert_eq!(ys.len(), 2, "both notes are drawn");
     assert_eq!(ys[1] - ys[0], 28.0, "a 20px line plus the panel's 8px gap, and nothing else");
 }
+
+// ---- §7's todo app, in Strand (M4) ---------------------------------------
+
+/// Drives `todo_app.str`.
+fn todo(events: Vec<InputEvent>) -> Vec<Node> {
+    drive_source(&example("todo_app.str"), events)
+}
+
+fn enter() -> InputEvent {
+    InputEvent::Key { id: HitId(1), key: Key::Enter }
+}
+
+#[test]
+fn the_todo_app_starts_with_a_list_it_built_from_a_for_loop() {
+    let last = labels(&todo(vec![]).pop().expect("a frame"));
+    assert!(last.iter().any(|t| t == "todo — 3/4 done"), "a count, via str(): {last:?}");
+    assert!(last.iter().any(|t| t == "write the compiler"), "{last:?}");
+    assert!(last.iter().any(|t| t == "write the todo app in Strand"), "{last:?}");
+}
+
+#[test]
+fn typing_and_enter_adds_a_todo() {
+    let mut events = typing("buy milk");
+    events.push(enter());
+    let last = labels(&todo(events).pop().expect("a frame"));
+
+    assert!(last.iter().any(|t| t == "buy milk"), "the new todo: {last:?}");
+    assert!(last.iter().any(|t| t == "todo — 3/5 done"), "the count grew: {last:?}");
+}
+
+#[test]
+fn clicking_a_row_toggles_it() {
+    // Toggle ids are 1000 + the todo's own id, so a row keeps its identity
+    // when the ones above it are deleted.
+    let last = labels(&todo(vec![click(1004)]).pop().expect("a frame"));
+    assert!(last.iter().any(|t| t == "todo — 4/4 done"), "{last:?}");
+
+    let twice = labels(&todo(vec![click(1004), click(1004)]).pop().expect("a frame"));
+    assert!(twice.iter().any(|t| t == "todo — 3/4 done"), "and back again: {twice:?}");
+}
+
+#[test]
+fn clicking_the_cross_deletes_that_row_and_only_that_row() {
+    let last = labels(&todo(vec![click(2002)]).pop().expect("a frame"));
+    assert!(!last.iter().any(|t| t == "write the runtime"), "it went: {last:?}");
+    assert!(last.iter().any(|t| t == "write the compiler"), "its neighbours stayed: {last:?}");
+    assert!(last.iter().any(|t| t == "todo — 2/3 done"), "{last:?}");
+}
+
+#[test]
+fn an_id_survives_a_deletion_above_it() {
+    // The bug this rules out: ids derived from position would slide up when a
+    // row is deleted, so the next click would land on the wrong todo.
+    let last = labels(&todo(vec![click(2001), click(1004)]).pop().expect("a frame"));
+    assert!(last.iter().any(|t| t == "todo — 3/3 done"), "{last:?}");
+}
+
+#[test]
+fn clear_done_sweeps_the_completed_ones() {
+    let last = labels(&todo(vec![click(3)]).pop().expect("a frame"));
+    assert!(last.iter().any(|t| t == "todo — 0/1 done"), "{last:?}");
+    assert!(last.iter().any(|t| t == "write the todo app in Strand"), "{last:?}");
+    assert!(!last.iter().any(|t| t == "write the compiler"), "{last:?}");
+}
+
+#[test]
+fn clearing_nothing_is_a_notice_rather_than_a_no_op() {
+    // §7: a rejected action surfaces a notice.
+    let last = labels(&todo(vec![click(3), click(3)]).pop().expect("a frame"));
+    assert!(last.iter().any(|t| t == "nothing completed to clear"), "{last:?}");
+}
+
+#[test]
+fn an_empty_title_is_refused_and_what_was_typed_is_kept() {
+    let events = vec![enter()];
+    let last = labels(&todo(events).pop().expect("a frame"));
+    assert!(last.iter().any(|t| t == "a todo needs a title"), "{last:?}");
+    assert!(last.iter().any(|t| t == "todo — 3/4 done"), "nothing was added: {last:?}");
+}
+
+#[test]
+fn an_over_long_title_says_how_long_is_too_long() {
+    let mut events = typing(&"x".repeat(50));
+    events.push(enter());
+    let last = labels(&todo(events).pop().expect("a frame"));
+    assert!(last.iter().any(|t| t == "keep it under 40 characters"), "{last:?}");
+    // §7: what was typed stays put so it can be fixed rather than retyped.
+    assert!(last.iter().any(|t| t.starts_with("xxxx")), "{last:?}");
+}
+
+#[test]
+fn emptying_the_list_shows_the_branch_that_says_so() {
+    let last = labels(&todo(vec![click(2001), click(2002), click(2003), click(2004)])
+        .pop()
+        .expect("a frame"));
+    assert!(last.iter().any(|t| t == "nothing yet — type something above"), "{last:?}");
+    assert!(last.iter().any(|t| t == "todo — 0/0 done"), "{last:?}");
+}
+
+#[test]
+fn a_long_list_scrolls_and_the_offset_comes_back_from_the_platform() {
+    let mut events = Vec::new();
+    for index in 0..20 {
+        events.extend(typing(&format!("todo number {index}")));
+        events.push(enter());
+    }
+    let tree = todo(events).pop().expect("a frame");
+
+    let mut layouter = Layouter::new();
+    let frame = layouter.layout(&tree, (800.0, 600.0));
+    let extent = frame.scrolls.first().expect("the list reports itself scrollable");
+    assert_eq!(extent.id, HitId(4));
+    assert!(extent.max_offset > 0.0, "24 rows do not fit in 600px");
+
+    // And the actor takes the clamped position the platform hands back.
+    let scrolled = drive_source(
+        &example("todo_app.str"),
+        vec![InputEvent::Scroll { id: HitId(4), offset: 40.0 }],
+    );
+    let mut layouter = Layouter::new();
+    let after = layouter.layout(scrolled.last().expect("a frame"), (800.0, 600.0));
+    assert_eq!(after.scrolls[0].offset, 0.0, "four rows fit, so there is nowhere to go");
+}

@@ -227,6 +227,18 @@ pub enum ExprKind {
 
     MakeVariant { sum: SumId, variant: u32, fields: Vec<Expr> },
 
+    /// `[a, b, c]`. The element type is on the expression itself.
+    MakeList { elems: Vec<Expr> },
+    /// How many elements. Read straight out of the header.
+    ListLen { list: Box<Expr> },
+    /// `push(list, value)` — a *new* list one longer. §4.2 makes data
+    /// immutable, so appending copies; at POC sizes that is the honest trade,
+    /// and the alternative is a growable buffer with a capacity nobody can see.
+    ListPush { list: Box<Expr>, value: Box<Expr> },
+    /// `for x in list { ... }`. Yields unit: what it produces, it produces by
+    /// running — which is exactly what lets it stand among a view's children.
+    For { slot: u32, list: Box<Expr>, body: Block },
+
     /// `Ok`/`Err`/`Some`. `None` carries no payload.
     MakeOk(Box<Expr>),
     MakeErr(Box<Expr>),

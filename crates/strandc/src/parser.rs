@@ -657,6 +657,39 @@ impl Parser {
     fn primary(&mut self) -> PResult<Expr> {
         let span = self.span();
         match self.peek().clone() {
+            Tok::LBracket => {
+                self.advance();
+                let items = self.allowing_records(|p| {
+                    let mut items = Vec::new();
+                    while !p.at(&Tok::RBracket) {
+                        items.push(p.expr()?);
+                        if !p.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    Ok(items)
+                })?;
+                let end = self.expect(Tok::RBracket)?;
+                Ok(Expr::ListLit { items, span: Self::join(span, end) })
+            }
+
+            Tok::For => {
+                self.advance();
+                let (name, name_span) = self.expect_ident()?;
+                self.expect(Tok::In)?;
+                // Same restriction `if` needs: without it, `for t in todos {`
+                // reads `todos { ... }` as a record literal.
+                let iter = self.head_expr()?;
+                let body = self.block()?;
+                Ok(Expr::For {
+                    span: Self::join(span, body.span),
+                    name,
+                    name_span,
+                    iter: Box::new(iter),
+                    body,
+                })
+            }
+
             Tok::Int(value) => {
                 self.advance();
                 Ok(Expr::Int { value, span })

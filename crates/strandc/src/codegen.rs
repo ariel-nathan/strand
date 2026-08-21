@@ -24,6 +24,17 @@ const WORD: u64 = 8;
 /// never a valid value.
 const DATA_START: u32 = 16;
 
+/// A list is `{ i32 len, <pad>, elements... }`. The header is a whole word so
+/// the elements after it stay 8-byte aligned, which is what lets an element be
+/// loaded by exactly the code that loads a record field.
+const LIST_HEADER: u64 = WORD;
+
+/// Bytes one element of `elem` occupies. Whole words, like a record's fields —
+/// a two-word `Result` takes two.
+fn stride(elem: &Ty) -> u64 {
+    words(elem).max(1) * WORD
+}
+
 type Code = Vec<Instruction<'static>>;
 
 /// The WASM representation of a Strand type (`docs/abi.md`).
@@ -575,6 +586,144 @@ impl<'hir> Emitter<'hir> {
                     self.expr(ctx, code, arg)?;
                 }
                 code.push(Instruction::Call(self.helper_index(*helper)));
+            }
+
+            ExprKind::MakeList { elems } => {
+                let Ty::List(elem) = &expr.ty else {
+                    return bail("a list literal reached codegen without a list type");
+                };
+                let elem = (**elem).clone();
+                let step = stride(&elem);
+
+                let ptr = ctx.scratch(ValType::I32);
+                code.push(Instruction::I32Const(
+                    (LIST_HEADER + step * elems.len() as u64) as i32,
+                ));
+                code.push(Instruction::Call(self.alloc_index));
+                code.push(Instruction::LocalTee(ptr));
+                code.push(Instruction::I32Const(elems.len() as i32));
+                code.push(Instruction::I32Store(mem_arg(0, 2)));
+
+                for (index, value) in elems.iter().enumerate() {
+                    let offset = LIST_HEADER + step * index as u64;
+                    self.store_at(ctx, code, ptr, offset, &elem, value)?;
+                }
+                code.push(Instruction::LocalGet(ptr));
+            }
+
+            ExprKind::ListLen { list } => {
+                self.expr(ctx, code, list)?;
+                code.push(Instruction::I32Load(mem_arg(0, 2)));
+                // `int` is 64-bit; a length is not.
+                code.push(Instruction::I64ExtendI32U);
+            }
+
+            ExprKind::ListPush { list, value } => {
+                let Ty::List(elem) = &expr.ty else {
+                    return bail("a push reached codegen without a list type");
+                };
+                let elem = (**elem).clone();
+                let step = stride(&elem);
+
+                let source = ctx.scratch(ValType::I32);
+                let count = ctx.scratch(ValType::I32);
+                let ptr = ctx.scratch(ValType::I32);
+                let slot = ctx.scratch(ValType::I32);
+
+                self.expr(ctx, code, list)?;
+                code.push(Instruction::LocalTee(source));
+                code.push(Instruction::I32Load(mem_arg(0, 2)));
+                code.push(Instruction::LocalSet(count));
+
+                // A new list, one longer. The old one is untouched and stays
+                // valid for anyone still holding it (§4.2).
+                code.push(Instruction::LocalGet(count));
+                code.push(Instruction::I32Const(1));
+                code.push(Instruction::I32Add);
+                code.push(Instruction::I32Const(step as i32));
+                code.push(Instruction::I32Mul);
+                code.push(Instruction::I32Const(LIST_HEADER as i32));
+                code.push(Instruction::I32Add);
+                code.push(Instruction::Call(self.alloc_index));
+                code.push(Instruction::LocalTee(ptr));
+                code.push(Instruction::LocalGet(count));
+                code.push(Instruction::I32Const(1));
+                code.push(Instruction::I32Add);
+                code.push(Instruction::I32Store(mem_arg(0, 2)));
+
+                code.push(Instruction::LocalGet(ptr));
+                code.push(Instruction::I32Const(LIST_HEADER as i32));
+                code.push(Instruction::I32Add);
+                code.push(Instruction::LocalGet(source));
+                code.push(Instruction::I32Const(LIST_HEADER as i32));
+                code.push(Instruction::I32Add);
+                code.push(Instruction::LocalGet(count));
+                code.push(Instruction::I32Const(step as i32));
+                code.push(Instruction::I32Mul);
+                code.push(Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+
+                // The new element goes at the end, through the same typed store
+                // a record field uses.
+                code.push(Instruction::LocalGet(ptr));
+                code.push(Instruction::LocalGet(count));
+                code.push(Instruction::I32Const(step as i32));
+                code.push(Instruction::I32Mul);
+                code.push(Instruction::I32Add);
+                code.push(Instruction::LocalSet(slot));
+                self.store_at(ctx, code, slot, LIST_HEADER, &elem, value)?;
+
+                code.push(Instruction::LocalGet(ptr));
+            }
+
+            ExprKind::For { slot, list, body } => {
+                let Ty::List(elem) = &list.ty else {
+                    return bail("a `for` reached codegen without a list to walk");
+                };
+                let elem = (**elem).clone();
+                let step = stride(&elem);
+
+                let source = ctx.scratch(ValType::I32);
+                let count = ctx.scratch(ValType::I32);
+                let index = ctx.scratch(ValType::I32);
+                let at = ctx.scratch(ValType::I32);
+
+                self.expr(ctx, code, list)?;
+                code.push(Instruction::LocalTee(source));
+                code.push(Instruction::I32Load(mem_arg(0, 2)));
+                code.push(Instruction::LocalSet(count));
+                code.push(Instruction::I32Const(0));
+                code.push(Instruction::LocalSet(index));
+
+                code.push(Instruction::Block(BlockType::Empty));
+                code.push(Instruction::Loop(BlockType::Empty));
+                code.push(Instruction::LocalGet(index));
+                code.push(Instruction::LocalGet(count));
+                code.push(Instruction::I32GeU);
+                code.push(Instruction::BrIf(1));
+
+                // The element's address, then the same load a record field uses.
+                code.push(Instruction::LocalGet(source));
+                code.push(Instruction::LocalGet(index));
+                code.push(Instruction::I32Const(step as i32));
+                code.push(Instruction::I32Mul);
+                code.push(Instruction::I32Add);
+                code.push(Instruction::LocalSet(at));
+                load_at(code, at, LIST_HEADER, &elem);
+                store_locals(code, &ctx.slot_locals[*slot as usize]);
+
+                self.block(ctx, code, body)?;
+                // A body that leaves a value behind would unbalance the loop.
+                for _ in rep(&body.ty) {
+                    code.push(Instruction::Drop);
+                }
+
+                code.push(Instruction::LocalGet(index));
+                code.push(Instruction::I32Const(1));
+                code.push(Instruction::I32Add);
+                code.push(Instruction::LocalSet(index));
+                code.push(Instruction::Br(0));
+                code.push(Instruction::End);
+                code.push(Instruction::End);
             }
 
             ExprKind::MakeNode { kind, props, numbers, children } => {
@@ -1985,10 +2134,20 @@ fn walk_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         | ExprKind::CallBuiltin { args, .. }
         | ExprKind::CallHelper { args, .. }
         | ExprKind::MakeRecord { fields: args, .. }
-        | ExprKind::MakeVariant { fields: args, .. } => {
+        | ExprKind::MakeVariant { fields: args, .. }
+        | ExprKind::MakeList { elems: args } => {
             for arg in args {
                 walk_expr(arg, visit);
             }
+        }
+        ExprKind::ListLen { list } => walk_expr(list, visit),
+        ExprKind::ListPush { list, value } => {
+            walk_expr(list, visit);
+            walk_expr(value, visit);
+        }
+        ExprKind::For { list, body, .. } => {
+            walk_expr(list, visit);
+            walk_block(body, visit);
         }
         // A view's props and children hold ordinary expressions, and anything
         // in them can call `log` or a helper. Missing this meant a `log` inside
@@ -2044,10 +2203,20 @@ fn collect_expr_strings(expr: &Expr, out: &mut Vec<String>) {
         }
         ExprKind::Call { args, .. }
         | ExprKind::CallBuiltin { args, .. }
-        | ExprKind::CallHelper { args, .. } => {
+        | ExprKind::CallHelper { args, .. }
+        | ExprKind::MakeList { elems: args } => {
             for arg in args {
                 collect_expr_strings(arg, out);
             }
+        }
+        ExprKind::ListLen { list } => collect_expr_strings(list, out),
+        ExprKind::ListPush { list, value } => {
+            collect_expr_strings(list, out);
+            collect_expr_strings(value, out);
+        }
+        ExprKind::For { list, body, .. } => {
+            collect_expr_strings(list, out);
+            collect_block_strings(body, out);
         }
         ExprKind::MakeRecord { fields, .. } | ExprKind::MakeVariant { fields, .. } => {
             for field in fields {

@@ -52,6 +52,33 @@ a new record — the same leak caveat applies, and the same M5 revisit.
 
 Pointer to `{ i32 len, bytes... }`, UTF-8, immutable. No interning in the POC.
 
+## 5a. Lists
+
+Pointer to `{ i32 len, <pad>, elements... }`. The header is a whole word so the
+elements after it stay 8-byte aligned, which is what lets an element be loaded
+by exactly the code that loads a record field.
+
+An element occupies `words(T)` slots, the same rule a record's fields follow.
+That matters more than it looks: a `List<int>` strides by 8, a `List<Todo>`
+strides by 8 (a pointer), and a `List<Result<int, E>>` strides by **16**,
+because §2 gives `Result` two words. A stride that assumed one word would read
+each element's tag out of the previous element's payload.
+
+Immutable, like everything else (§4.2). `push` allocates a new list one longer
+and copies — O(n), and honest at POC scale. The alternative is a growable
+buffer with a capacity nobody can see, which is a different design rather than
+a faster version of this one.
+
+An empty literal takes its element type from context and is refused where there
+is none: a `List<?>` has no representation, and guessing would surface as a
+confusing failure much later.
+
+`for x in list { ... }` walks it. The loop is an *expression* of type unit, so
+it can stand among a container's children (§6.2) exactly the way `if` does —
+and because a view appends as it evaluates, a `for` in a children block needs
+no special handling at all. Each iteration simply appends, and the parent's
+child count comes out right on its own.
+
 ## 6. Host ABI
 
 Guests import from module `strand` and export a small set of entry points.

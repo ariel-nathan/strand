@@ -931,6 +931,12 @@ impl Checker {
                 self.check_record_lit(name.as_deref(), fields, *span, expected)
             }
 
+            ast::Expr::ListLit { items, span } => self.check_list_lit(items, *span, expected),
+
+            ast::Expr::For { name, name_span, iter, body, span } => {
+                self.check_for(name, *name_span, iter, body, *span)
+            }
+
             ast::Expr::If { cond, then_block, else_block, span } => {
                 let cond = self.check_expr(cond, Some(&Ty::Bool));
                 if !cond.ty.unifies(&Ty::Bool) {
@@ -1076,6 +1082,188 @@ impl Checker {
         Expr {
             ty,
             kind: ExprKind::Binary { op: hir_op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
+        }
+    }
+
+    /// `[a, b, c]`.
+    ///
+    /// The element type comes from the items, or — when there are none — from
+    /// whatever the surrounding code was expecting. An empty list with nothing
+    /// to learn from is refused rather than guessed at, because a `List<?>`
+    /// has no representation and the error would surface much later.
+    fn check_list_lit(&mut self, items: &[ast::Expr], span: Span, expected: Option<&Ty>) -> Expr {
+        let wanted = match expected {
+            Some(Ty::List(elem)) => Some((**elem).clone()),
+            _ => None,
+        };
+
+        let mut checked = Vec::new();
+        let mut elem = wanted.clone().unwrap_or(Ty::Error);
+        for item in items {
+            let value = self.check_expr(item, Some(&elem));
+            if !value.ty.unifies(&elem) {
+                let (found, want) = (self.show(&value.ty), self.show(&elem));
+                self.error_labeled(
+                    item.span(),
+                    format!("this list holds {want}, but this item is {found}"),
+                    "mismatched element",
+                    "every element of a list has the same type (§4.2)",
+                );
+            } else {
+                elem = elem.join(&value.ty);
+            }
+            checked.push(value);
+        }
+
+        if items.is_empty() && wanted.is_none() {
+            self.error_labeled(
+                span,
+                "an empty list needs to be told what it holds",
+                "element type unknown",
+                "annotate it — `let todos: List<Todo> = []`",
+            );
+        }
+
+        Expr { ty: Ty::List(Box::new(elem)), kind: ExprKind::MakeList { elems: checked } }
+    }
+
+    /// `for x in list { ... }`.
+    fn check_for(
+        &mut self,
+        name: &str,
+        name_span: Span,
+        iter: &ast::Expr,
+        body: &ast::Block,
+        span: Span,
+    ) -> Expr {
+        let list = self.check_expr(iter, None);
+        let elem = match &list.ty {
+            Ty::List(elem) => (**elem).clone(),
+            Ty::Error | Ty::Never => Ty::Error,
+            other => {
+                let found = self.show(other);
+                self.error_labeled(
+                    span,
+                    format!("`for` needs a list, found {found}"),
+                    "not a list",
+                    "only `List<T>` can be walked over in the POC (§4.6)",
+                );
+                Ty::Error
+            }
+        };
+
+        // The loop variable is scoped to the body, like any other binding.
+        self.scopes.push(HashMap::new());
+        let slot = self.declare(name.to_string(), elem, false, name_span);
+        let body = self.check_block(body, None);
+        self.scopes.pop();
+
+        Expr {
+            ty: Ty::Unit,
+            kind: ExprKind::For { slot, list: Box::new(list), body },
+        }
+    }
+
+    /// `push` and the list half of `len`/`isEmpty`.
+    ///
+    /// `len` reads naturally on both a string and a list, so it means both, and
+    /// which one is decided by the argument rather than by the name. Two names
+    /// for one question would be the worse trade.
+    fn check_list_call(&mut self, name: &str, args: &[ast::Arg], span: Span) -> Option<Expr> {
+        if name == "push" {
+            if args.len() != 2 {
+                self.error_labeled(
+                    span,
+                    format!("`push` takes a list and a value, found {} argument(s)", args.len()),
+                    "wrong number of arguments",
+                    "fn push(list: List<T>, value: T): List<T>",
+                );
+                return Some(Expr { ty: Ty::Error, kind: ExprKind::Unit });
+            }
+            let list = self.check_expr(&args[0].value, None);
+            let elem = match &list.ty {
+                Ty::List(elem) => (**elem).clone(),
+                Ty::Error | Ty::Never => Ty::Error,
+                other => {
+                    let found = self.show(other);
+                    self.error_labeled(
+                        args[0].span,
+                        format!("`push` needs a list, found {found}"),
+                        "not a list",
+                        "fn push(list: List<T>, value: T): List<T>",
+                    );
+                    Ty::Error
+                }
+            };
+            let value = self.check_expr(&args[1].value, Some(&elem));
+            if !value.ty.unifies(&elem) {
+                let (found, want) = (self.show(&value.ty), self.show(&elem));
+                self.error_labeled(
+                    args[1].span,
+                    format!("this list holds {want}, but this value is {found}"),
+                    "mismatched element",
+                    "push adds an element, so it must be one",
+                );
+            }
+            let ty = Ty::List(Box::new(elem.join(&value.ty)));
+            return Some(Expr {
+                ty,
+                kind: ExprKind::ListPush { list: Box::new(list), value: Box::new(value) },
+            });
+        }
+
+        if (name != "len" && name != "isEmpty") || args.len() != 1 {
+            return None;
+        }
+        // Peek at the argument to decide which `len` this is. Checking it here
+        // and again in the string path would report every error inside it twice.
+        let checked = self.check_expr(&args[0].value, None);
+        if !matches!(checked.ty, Ty::List(_)) {
+            return Some(self.finish_stdlib(name, checked, args[0].span));
+        }
+
+        let length = Expr { ty: Ty::Int, kind: ExprKind::ListLen { list: Box::new(checked) } };
+        if name == "len" {
+            return Some(length);
+        }
+        Some(Expr {
+            ty: Ty::Bool,
+            kind: ExprKind::Binary {
+                op: BinOp::EqInt,
+                lhs: Box::new(length),
+                rhs: Box::new(Expr { ty: Ty::Int, kind: ExprKind::Int(0) }),
+            },
+        })
+    }
+
+    /// The string half of an already-checked `len`/`isEmpty` argument.
+    fn finish_stdlib(&mut self, name: &str, arg: Expr, span: Span) -> Expr {
+        let fun = stdlib::lookup(name).expect("only called for stdlib names");
+        if !arg.ty.unifies(&Ty::Str) {
+            let found = self.show(&arg.ty);
+            self.error_labeled(
+                span,
+                format!("`{name}` takes a string or a list, found {found}"),
+                "wrong type",
+                fun.signature(),
+            );
+            return Expr { ty: if name == "len" { Ty::Int } else { Ty::Bool }, kind: ExprKind::Unit };
+        }
+
+        let count = Expr {
+            ty: Ty::Int,
+            kind: ExprKind::CallHelper { helper: Helper::StrCharCount, args: vec![arg] },
+        };
+        if name == "len" {
+            return count;
+        }
+        Expr {
+            ty: Ty::Bool,
+            kind: ExprKind::Binary {
+                op: BinOp::EqInt,
+                lhs: Box::new(count),
+                rhs: Box::new(Expr { ty: Ty::Int, kind: ExprKind::Int(0) }),
+            },
         }
     }
 
@@ -1384,10 +1572,13 @@ impl Checker {
             return self.check_variant_call(sum, index, name, args, span);
         }
 
-        if let Some(fun) = stdlib::lookup(name) {
+        if !self.signatures.contains_key(name) {
             // A user function of the same name wins, so nothing here takes a
             // name out of circulation.
-            if !self.signatures.contains_key(name) {
+            if let Some(expr) = self.check_list_call(name, args, span) {
+                return expr;
+            }
+            if let Some(fun) = stdlib::lookup(name) {
                 return self.check_stdlib_call(fun, args, span);
             }
         }

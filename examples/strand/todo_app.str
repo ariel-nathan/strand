@@ -1,0 +1,230 @@
+// §7's todo app, written in Strand. M4.
+//
+//   strand view examples/strand/todo_app.str
+//
+// Type a title and press Enter. Click a row to toggle it, `x` to delete it,
+// "Clear done" to sweep. The list scrolls when it outgrows the window.
+//
+// Everything the design doc asks for is here and nothing is host-side:
+//
+//   §6.2  `for todo in state.todos { todoRow(todo) }` — the sample, verbatim
+//   §6.5  state in a record, events as messages, the handler returns the next
+//         state, the view is a pure function of it
+//   §4.5  `Result` with a typed error, so validation cannot be forgotten
+//   §7    a rejected action surfaces a notice rather than crashing
+//
+// Press F12: the actor drawing this window has a row in the debug overlay like
+// any other, because it is one.
+
+type Todo = { id: int, title: string, done: bool }
+
+type Model = {
+  todos: List<Todo>,
+  draft: string,
+  // What the platform said has keyboard focus, and where the list is scrolled
+  // to. Both are the platform's to report and this record's to remember.
+  focus: int,
+  scroll: float,
+  // Ids are handed out rather than derived from position, so a row keeps its
+  // identity when the ones above it are deleted.
+  nextId: int,
+  notice: string,
+}
+
+fn FIELD(): int { 1 }
+fn ADD(): int { 2 }
+fn CLEAR(): int { 3 }
+fn LIST(): int { 4 }
+
+// Each todo owns two node ids, derived from its own id.
+fn TOGGLE_BASE(): int { 1000 }
+fn DELETE_BASE(): int { 2000 }
+
+fn MAX(): int { 40 }
+
+// §4.5's shape. The error is in the return type, so a caller has to say what it
+// does about each case.
+type AddError =
+  | EmptyTitle
+  | TooLong(max: int)
+
+fn accept(title: string): Result<string, AddError> {
+  let clean = trim(title)
+  if isEmpty(clean) { return Err(EmptyTitle) }
+  if len(clean) > MAX() { return Err(TooLong(max: MAX())) }
+  Ok(clean)
+}
+
+// ---- state transitions ----------------------------------------------------
+//
+// Every one of these returns a whole new record. Strand has no update syntax
+// yet — `Model { ...state, draft: x }` would halve this file — so the fields
+// are spelled out. Verbose, but the immutability it spells out is the point.
+
+fn withDraft(state: Model, draft: string): Model {
+  Model { todos: state.todos, draft: draft, focus: state.focus, scroll: state.scroll, nextId: state.nextId, notice: "" }
+}
+
+fn withFocus(state: Model, focus: int): Model {
+  Model { todos: state.todos, draft: state.draft, focus: focus, scroll: state.scroll, nextId: state.nextId, notice: state.notice }
+}
+
+fn withScroll(state: Model, scroll: float): Model {
+  Model { todos: state.todos, draft: state.draft, focus: state.focus, scroll: scroll, nextId: state.nextId, notice: state.notice }
+}
+
+fn withTodos(state: Model, todos: List<Todo>): Model {
+  Model { todos: todos, draft: state.draft, focus: state.focus, scroll: state.scroll, nextId: state.nextId, notice: "" }
+}
+
+fn noticed(state: Model, notice: string): Model {
+  Model { todos: state.todos, draft: state.draft, focus: state.focus, scroll: state.scroll, nextId: state.nextId, notice: notice }
+}
+
+fn commit(state: Model): Model {
+  match accept(state.draft) {
+    Ok(clean) => Model {
+      todos: push(state.todos, Todo { id: state.nextId, title: clean, done: false }),
+      draft: "",
+      focus: state.focus,
+      scroll: state.scroll,
+      nextId: state.nextId + 1,
+      notice: "",
+    },
+    // §7: the rejection shows as a notice, and what was typed stays put so it
+    // can be fixed rather than retyped.
+    Err(EmptyTitle) => noticed(state, "a todo needs a title"),
+    Err(TooLong(max)) => noticed(state, "keep it under " + str(max) + " characters"),
+  }
+}
+
+// Rebuilding rather than mutating: walk the list, swap the one that matches.
+fn toggle(state: Model, id: int): Model {
+  var out: List<Todo> = []
+  for todo in state.todos {
+    if todo.id == id {
+      out = push(out, Todo { id: todo.id, title: todo.title, done: !todo.done })
+    } else {
+      out = push(out, todo)
+    }
+  }
+  withTodos(state, out)
+}
+
+fn remove(state: Model, id: int): Model {
+  var out: List<Todo> = []
+  for todo in state.todos {
+    if todo.id != id { out = push(out, todo) }
+  }
+  withTodos(state, out)
+}
+
+fn clearDone(state: Model): Model {
+  var out: List<Todo> = []
+  for todo in state.todos {
+    if !todo.done { out = push(out, todo) }
+  }
+  if len(out) == len(state.todos) {
+    return noticed(state, "nothing completed to clear")
+  }
+  withTodos(state, out)
+}
+
+fn doneCount(todos: List<Todo>): int {
+  var total = 0
+  for todo in todos {
+    if todo.done { total = total + 1 }
+  }
+  total
+}
+
+fn clicked(state: Model, id: int): Model {
+  if id == ADD() { return commit(state) }
+  if id == CLEAR() { return clearDone(state) }
+  // Deletes are checked first: their base is the higher one.
+  if id >= DELETE_BASE() { return remove(state, id - DELETE_BASE()) }
+  if id >= TOGGLE_BASE() { return toggle(state, id - TOGGLE_BASE()) }
+  state
+}
+
+// ---- the view -------------------------------------------------------------
+
+view fn todoRow(todo: Todo): Node {
+  row(gap: 8) {
+    checkbox(id: TOGGLE_BASE() + todo.id, checked: todo.done, label: todo.title)
+    // Pushes the delete button to the far end of the row.
+    spacer()
+    button(id: DELETE_BASE() + todo.id, label: "x")
+  }
+}
+
+fn heading(state: Model): string {
+  str(doneCount(state.todos)) + "/" + str(len(state.todos)) + " done"
+}
+
+actor TodoApp {
+  state: Model
+  message: Input
+
+  fn init(): Model {
+    Model {
+      todos: [
+        Todo { id: 1, title: "write the compiler", done: true },
+        Todo { id: 2, title: "write the runtime", done: true },
+        Todo { id: 3, title: "write the renderer", done: true },
+        Todo { id: 4, title: "write the todo app in Strand", done: false },
+      ],
+      draft: "",
+      focus: 0,
+      scroll: 0.0,
+      nextId: 5,
+      notice: "",
+    }
+  }
+
+  fn receive(state: Model, msg: Input): Model {
+    match msg {
+      Typed(ch) => withDraft(state, state.draft + char(ch)),
+      Backspace => withDraft(state, dropLast(state.draft)),
+      Escape => withDraft(state, ""),
+      Enter => commit(state),
+      Click(id) => clicked(state, id),
+      Focus(id) => withFocus(state, id),
+      // Already clamped against the content the platform just measured, so it
+      // is a position rather than a request.
+      Scrolled(id, offset) => withScroll(state, offset),
+    }
+  }
+
+  view fn draw(state: Model): Node {
+    screen(gap: 12, padding: 16) {
+      text("todo — " + heading(state))
+
+      row(gap: 8) {
+        textInput(id: FIELD(), value: state.draft, prompt: "what needs doing?", focused: state.focus == FIELD())
+        button(id: ADD(), label: "Add")
+      }
+
+      // A branch that does not run contributes no child, so there is no empty
+      // row holding a place for a notice that is not there.
+      if !isEmpty(state.notice) {
+        muted(state.notice)
+      }
+
+      scroll(id: LIST(), offset: state.scroll) {
+        // §6.2's sample, verbatim.
+        for todo in state.todos {
+          todoRow(todo)
+        }
+
+        if isEmpty(state.todos) {
+          muted("nothing yet — type something above")
+        }
+      }
+
+      row(gap: 8) {
+        button(id: CLEAR(), label: "Clear done")
+      }
+    }
+  }
+}

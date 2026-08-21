@@ -231,6 +231,22 @@ pub enum Expr {
     /// `Todo { id: ..., title: ... }`
     RecordLit { name: Option<String>, fields: Vec<FieldInit>, span: Span },
 
+    /// `[a, b, c]`. An empty one takes its element type from context.
+    ListLit { items: Vec<Expr>, span: Span },
+
+    /// `for t in todos { ... }`.
+    ///
+    /// An expression rather than a statement, so it can stand among a
+    /// container's children (§6.2) exactly the way an `if` does. Its value is
+    /// unit; what it produces, it produces by running.
+    For {
+        name: String,
+        name_span: Span,
+        iter: Box<Expr>,
+        body: Block,
+        span: Span,
+    },
+
     If { cond: Box<Expr>, then_block: Block, else_block: Option<Box<Expr>>, span: Span },
     Match { scrutinee: Box<Expr>, arms: Vec<MatchArm>, span: Span },
     Block(Block),
@@ -253,6 +269,8 @@ impl Expr {
             | Expr::Build { span, .. }
             | Expr::Field { span, .. }
             | Expr::RecordLit { span, .. }
+            | Expr::ListLit { span, .. }
+            | Expr::For { span, .. }
             | Expr::If { span, .. }
             | Expr::Match { span, .. }
             | Expr::Try { span, .. } => *span,
