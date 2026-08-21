@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/strand-runtime", "crates/strand-render", "crates/strand-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"

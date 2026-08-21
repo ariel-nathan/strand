@@ -1,0 +1,11 @@
+[package]
+name = "strand-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio = { version = "1.53.1", features = ["full"] }
+tracing.workspace = true
+wasmtime = "48.0.0"
