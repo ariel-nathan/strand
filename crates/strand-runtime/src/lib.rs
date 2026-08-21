@@ -1,8 +1,17 @@
-//! Strand actor runtime — M0 walking skeleton.
+//! Strand actor runtime.
 //!
 //! An actor is a wasmtime `Store` (its memory arena), a tokio task (its
 //! scheduling unit), and a mailbox (its only channel to the outside world).
 //! Actors share no memory: the only way in is a `Message`.
+//!
+//! Two design commitments from `docs/inspiration-canon.md`:
+//!
+//! - **TigerBeetle.** Every scheduling-visible event is recorded on a `Trace`,
+//!   and `sim` runs a scenario on a single thread with virtual time, so a run
+//!   is reproducible. Determinism is designed in here rather than retrofitted
+//!   once the scheduler exists.
+//! - **§8.4.** That same causal log *is* the message-tracing debugger the
+//!   design doc asks for. One mechanism, two uses.
 //!
 //! Error-type note: wasmtime 48 no longer uses `anyhow`, it has its own
 //! `wasmtime::Error`. Host callbacks must hand back `wasmtime::Result`
@@ -11,17 +20,23 @@
 //! `anyhow` feature, which is on by default.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
+// tokio's clock, not std's: under `sim` it is virtual, so elapsed times in a
+// trace are reproducible instead of wall-clock noise.
+use tokio::time::Instant;
 use wasmtime::error::Context as _;
 use wasmtime::{Caller, Config, Engine, Extern, Instance, Linker, Module, Store};
 
+pub mod sim;
+
 pub type ActorId = u32;
 
-/// The typed message set. For M0 this is deliberately tiny; §5.3's
+/// The typed message set. For M0/M1 this is deliberately tiny; §5.3's
 /// buffer-transfer variants land in M2.
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -31,29 +46,134 @@ pub enum Message {
     Stop,
 }
 
+/// One scheduling-visible event. Deliberately free of wall-clock time so two
+/// runs of the same scenario compare equal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    Spawned { id: ActorId, name: String },
+    Sent { from: ActorId, to: ActorId, len: usize },
+    Delivered { to: ActorId, from: ActorId, len: usize },
+    Logged { id: ActorId, text: String },
+    Stopped { id: ActorId },
+}
+
+/// A causal log of what every actor did, in the order it happened.
+#[derive(Clone, Default)]
+pub struct Trace {
+    events: Arc<Mutex<Vec<Event>>>,
+}
+
+impl Trace {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn record(&self, event: Event) {
+        self.events.lock().unwrap().push(event);
+    }
+
+    pub fn events(&self) -> Vec<Event> {
+        self.events.lock().unwrap().clone()
+    }
+
+    /// Renders the log the way §8.4's message tracing should read.
+    pub fn render(&self) -> String {
+        self.events()
+            .iter()
+            .map(|event| match event {
+                Event::Spawned { id, name } => format!("spawn   {id} ({name})"),
+                Event::Sent { from, to, len } => format!("send    {from} -> {to} ({len}B)"),
+                Event::Delivered { to, from, len } => {
+                    format!("deliver {from} -> {to} ({len}B)")
+                }
+                Event::Logged { id, text } => format!("log     {id}: {text}"),
+                Event::Stopped { id } => format!("stop    {id}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Controls how the scheduler behaves. Production leaves `chaos` off; `sim`
+/// turns it on to explore a different — but still reproducible — interleaving.
+#[derive(Debug)]
+pub struct SimConfig {
+    /// When set, actors yield for a seeded pseudo-random spell before handling
+    /// each message, shaking out order-dependent bugs.
+    pub chaos: bool,
+    state: AtomicU64,
+}
+
+impl SimConfig {
+    pub fn new(seed: u64, chaos: bool) -> Self {
+        // Any non-zero state; xorshift stalls at zero.
+        Self { chaos, state: AtomicU64::new(seed | 1) }
+    }
+
+    /// xorshift64*. Small, deterministic, and good enough to perturb ordering.
+    fn next(&self) -> u64 {
+        let mut x = self.state.load(Ordering::Relaxed);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state.store(x, Ordering::Relaxed);
+        x
+    }
+}
+
+impl Default for SimConfig {
+    fn default() -> Self {
+        Self::new(0, false)
+    }
+}
+
 /// Shared address book. Actors hold senders, never each other's memory.
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<Mutex<HashMap<ActorId, mpsc::UnboundedSender<Message>>>>,
     start: Instant,
+    trace: Trace,
+    config: Arc<SimConfig>,
 }
 
 impl Registry {
     pub fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(HashMap::new())), start: Instant::now() }
+        Self::with_config(Arc::new(SimConfig::default()))
     }
 
-    fn register(&self, id: ActorId) -> mpsc::UnboundedReceiver<Message> {
+    pub fn with_config(config: Arc<SimConfig>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            start: Instant::now(),
+            trace: Trace::new(),
+            config,
+        }
+    }
+
+    pub fn trace(&self) -> Trace {
+        self.trace.clone()
+    }
+
+    fn register(&self, id: ActorId, name: &str) -> mpsc::UnboundedReceiver<Message> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.inner.lock().unwrap().insert(id, tx);
+        self.trace.record(Event::Spawned { id, name: name.to_string() });
         rx
     }
 
     pub fn send(&self, to: ActorId, msg: Message) -> Result<()> {
+        self.send_from(u32::MAX, to, msg)
+    }
+
+    /// `from` is `u32::MAX` for messages originating outside any actor.
+    pub fn send_from(&self, from: ActorId, to: ActorId, msg: Message) -> Result<()> {
         let tx = {
             let map = self.inner.lock().unwrap();
             map.get(&to).cloned().ok_or_else(|| anyhow!("no actor {to}"))?
         };
+        if let Message::Blob { bytes, .. } = &msg {
+            self.trace.record(Event::Sent { from, to, len: bytes.len() });
+        }
         tx.send(msg).map_err(|_| anyhow!("actor {to} mailbox closed"))
     }
 
@@ -80,6 +200,7 @@ pub struct ActorCtx {
 impl ActorCtx {
     fn log(&self, line: &str) {
         println!("[{:>5}ms] {:<6} {}", self.registry.elapsed_ms(), self.name, line);
+        self.registry.trace.record(Event::Logged { id: self.id, text: line.to_string() });
     }
 }
 
@@ -120,13 +241,13 @@ fn link_host_abi(linker: &mut Linker<ActorCtx>) -> Result<()> {
             let bytes = read_guest_bytes(&mut caller, ptr, len)?;
             let ctx = caller.data();
             ctx.registry
-                .send(to as ActorId, Message::Blob { from: ctx.id, bytes })
+                .send_from(ctx.id, to as ActorId, Message::Blob { from: ctx.id, bytes })
                 .map_err(wasmtime::Error::from_anyhow)
         },
     )?;
 
     // The colorless-concurrency load-bearing call: suspends the *fiber*, not
-    // the OS thread. Everything else in M0 is scaffolding around this.
+    // the OS thread.
     linker.func_wrap_async(
         "strand",
         "sleep_ms",
@@ -167,8 +288,10 @@ pub async fn spawn_actor(
     store.set_epoch_deadline(1);
     store.epoch_deadline_async_yield_and_update(1);
 
-    let mut mailbox = registry.register(id);
+    let mut mailbox = registry.register(id, name);
     let instance = linker.instantiate_async(&mut store, &module).await?;
+    let trace = registry.trace();
+    let config = registry.config.clone();
 
     Ok(tokio::spawn(async move {
         if let Ok(main) = instance.get_typed_func::<(), ()>(&mut store, "strand_main") {
@@ -180,12 +303,20 @@ pub async fn spawn_actor(
             match msg {
                 Message::Stop => break,
                 Message::Blob { from, bytes } => {
+                    if config.chaos {
+                        // Seeded jitter: a different interleaving per seed, but
+                        // the same one every time for a given seed.
+                        let delay = config.next() % 8;
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    trace.record(Event::Delivered { to: id, from, len: bytes.len() });
                     let Ok(handler) = &on_message else { continue };
                     let ptr = write_into_guest(&mut store, &instance, &bytes, from).await?;
                     handler.call_async(&mut store, (ptr, bytes.len() as i32)).await?;
                 }
             }
         }
+        trace.record(Event::Stopped { id });
         Ok(())
     }))
 }

@@ -15,7 +15,7 @@ strand — the Strand toolchain
 usage:
   strand run <file.str>            compile and run `main`
   strand build <file.str> [-o out] compile to a .wasm module
-  strand demo [--window]           run the M0 actor skeleton
+  strand demo [--window|--trace]   run the M0 actor skeleton
   strand help                      show this message
 ";
 
@@ -33,6 +33,7 @@ fn main() -> ExitCode {
         ["build", file, "-o", out] => build(Path::new(file), Some(Path::new(out))),
         ["demo"] => strand_cli::demo::run(false),
         ["demo", "--window"] => strand_cli::demo::run(true),
+        ["demo", "--trace"] => strand_cli::demo::run_with(false, true),
         _ => {
             eprint!("{USAGE}");
             return ExitCode::FAILURE;

@@ -14,6 +14,11 @@ const ACTORS: [(u32, &str, &str); 3] = [
 ];
 
 pub fn run(windowed: bool) -> Result<()> {
+    run_with(windowed, false)
+}
+
+/// `traced` prints the causal message log afterwards (§8.4).
+pub fn run_with(windowed: bool, traced: bool) -> Result<()> {
     // ONE worker thread on purpose. If a sleeping actor held its OS thread,
     // the ticker could not tick during ping's 300ms sleep.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -22,7 +27,7 @@ pub fn run(windowed: bool) -> Result<()> {
         .build()?;
 
     if !windowed {
-        return rt.block_on(run_actors());
+        return rt.block_on(run_actors(traced));
     }
 
     // Windowed: the actor runtime becomes a guest of the compositor. winit
@@ -30,15 +35,15 @@ pub fn run(windowed: bool) -> Result<()> {
     // main() belongs to the renderer for the rest of the process lifetime.
     println!("--- strand M0: actors + compositor ---");
     let _guard = rt.enter();
-    rt.spawn(async {
-        if let Err(e) = run_actors().await {
+    rt.spawn(async move {
+        if let Err(e) = run_actors(traced).await {
             eprintln!("actor runtime failed: {e:#}");
         }
     });
     strand_render::run()
 }
 
-async fn run_actors() -> Result<()> {
+async fn run_actors(traced: bool) -> Result<()> {
     let engine = engine()?;
     let registry = Registry::new();
 
@@ -59,5 +64,12 @@ async fn run_actors() -> Result<()> {
     }
 
     println!("--- actors done ---");
+    if traced {
+        // §8.4: actors interact only through typed messages, so this log is a
+        // complete record of their inputs.
+        println!("
+--- message trace ---
+{}", registry.trace().render());
+    }
     Ok(())
 }

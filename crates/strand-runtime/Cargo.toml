@@ -6,6 +6,6 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.53.1", features = ["full", "test-util"] }
 tracing.workspace = true
 wasmtime = "48.0.0"
