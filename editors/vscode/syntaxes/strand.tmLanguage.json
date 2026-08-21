@@ -131,17 +131,26 @@
           "name": "support.type.primitive.strand"
         },
         {
-          "comment": "check.rs:441-476 -- Node plus the generic built-ins.",
-          "match": "\\b(Node|List|Option|Result)\\b",
+          "comment": "check.rs -- Node plus the generic built-ins, and Input: the message type a UI actor opts into by writing `message: Input` (input.rs).",
+          "match": "\\b(Node|List|Option|Result|Input)\\b",
           "name": "support.type.strand"
         }
       ]
     },
 
     "builtin-function": {
-      "comment": "hir.rs:258-261 -- log is the entire Builtin enum.",
-      "match": "\\blog\\b(?=\\s*\\()",
-      "name": "support.function.builtin.strand"
+      "patterns": [
+        {
+          "comment": "hir.rs -- log is the entire Builtin enum: the only builtin that leaves the actor.",
+          "match": "\\blog\\b(?=\\s*\\()",
+          "name": "support.function.builtin.strand"
+        },
+        {
+          "comment": "The closed table at stdlib.rs, plus push -- the one list operation with a name of its own. These compile to generated WASM rather than to imports, but they read as builtins either way. len and isEmpty mean both a string and a list, decided by the argument.",
+          "match": "\\b(str|char|len|isEmpty|trim|dropLast|push)\\b(?=\\s*\\()",
+          "name": "support.function.builtin.strand"
+        }
+      ]
     },
 
     "widget": {
@@ -151,8 +160,8 @@
     },
 
     "constructor": {
-      "comment": "lexer.rs:29-30 -- these are ordinary identifiers to the lexer, resolved as constructors by the checker.",
-      "match": "\\b(Ok|Err|Some|None)\\b",
+      "comment": "lexer.rs -- ordinary identifiers to the lexer, resolved as constructors by the checker. The second group is the platform Input type (input.rs), in scope only in a module that writes `message: Input`; highlighting them unconditionally is the same trade `view` takes.",
+      "match": "\\b(Ok|Err|Some|None|Click|Typed|Backspace|Enter|Escape|Focus|Scrolled)\\b",
       "name": "support.constant.constructor.strand"
     },
 

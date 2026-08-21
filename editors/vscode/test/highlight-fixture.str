@@ -168,18 +168,79 @@ fn not_a_widget(): int {
   text + row
 }
 
+// 9b. Lists and `for`. `List` is a built-in type, `push` a built-in function,
+//     and `for`/`in` are control keywords — all three colour differently from
+//     the user names around them.
+
+type Note = { id: int, body: string }
+
+fn without(notes: List<Note>, id: int): List<Note> {
+  var out: List<Note> = []
+  for note in notes {
+    if note.id != id { out = push(out, note) }
+  }
+  out
+}
+
+// 9c. The generated string functions (stdlib.rs). They are `support.function`
+//     like `log`, even though only `log` leaves the actor — the distinction
+//     that matters to a reader is "the platform provides this", not where the
+//     body lives.
+
+fn describe(notes: List<Note>, draft: string): string {
+  let count = str(len(notes))
+  let typed = trim(draft) + char(33)
+  if isEmpty(typed) { return count }
+  count + " · " + dropLast(typed)
+}
+
+// 9d. `Input`, the platform's message type (input.rs). It exists only in a
+//     module that asks for it by writing `message: Input` — outside an actor
+//     that does, `Input` is an unknown type and `Click` an unknown name. The
+//     grammar colours them unconditionally anyway: a regex cannot see the
+//     actor declaration, and it is the same trade `view` takes.
+
+type Model = { tab: int, draft: string }
+
+actor Editor {
+  state: Model
+  message: Input
+
+  fn init(): Model {
+    Model { tab: 0, draft: "" }
+  }
+
+  fn receive(state: Model, msg: Input): Model {
+    match msg {
+      Click(id) => Model { tab: id, draft: state.draft },
+      Typed(ch) => Model { tab: state.tab, draft: state.draft + char(ch) },
+      Backspace => Model { tab: state.tab, draft: dropLast(state.draft) },
+      Enter => state,
+      Escape => Model { tab: state.tab, draft: "" },
+      Focus(id) => state,
+      Scrolled(id, offset) => state,
+    }
+  }
+
+  view fn draw(state: Model): Node {
+    screen(gap: 8) {
+      textInput(id: 1, value: state.draft, prompt: "type", focused: true)
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // NOT VALID STRAND BELOW THIS LINE — everything from here on is deliberately
 // rejected by the compiler. It exists so the keyword and `invalid.illegal.*`
 // scopes can be eyeballed. Do not point `strandc` at this file.
 // ---------------------------------------------------------------------------
 
-// 10. Reserved but not yet parsed: `scope`, `spawn`, `for`, `in`. The lexer
-//     emits keyword tokens for these, so they colour as keywords, but the
-//     parser has no rule for them yet — these two lines are parse errors today.
+// 10. Reserved but not yet parsed: `scope` and `spawn`. The lexer emits keyword
+//     tokens for them, so they colour as keywords, but the parser has no rule
+//     for them yet — this line is a parse error today. (`for`/`in` used to be
+//     listed here; they are real now, and covered in section 9b above.)
 fn reserved(): int {
   scope { let user = spawn fetchUser()? }
-  for t in todos { todoRow(t) }
   0
 }
 

@@ -330,6 +330,14 @@ impl Checker {
         }
     }
 
+    /// Notes what to say when the cursor lands on `span`.
+    ///
+    /// For anything the platform provides rather than the file declares, since
+    /// there is no declaration for go-to-definition to land on and be read.
+    fn describe(&mut self, span: Span, signature: &str, doc: &str) {
+        self.analysis.descriptions.push((span, format!("{signature}\n{doc}")));
+    }
+
     /// `Node` is a value you may build and hand back, and nothing else.
     ///
     /// A node is emitted into the frame's array at the point it is written, so
@@ -537,7 +545,19 @@ impl Checker {
         }
     }
 
+    /// Resolves a written type, recording what it resolved to.
+    ///
+    /// A type annotation is not an expression, so nothing else records one —
+    /// and an annotation is exactly where someone asks what a name means. The
+    /// spans nest (`List<Todo>` contains `Todo`), and hover takes the narrowest,
+    /// so both answer for themselves.
     fn resolve_ty(&mut self, ty: &ast::TypeExpr) -> Ty {
+        let resolved = self.resolve_ty_inner(ty);
+        self.analysis.types.push((ty.span(), resolved.clone()));
+        resolved
+    }
+
+    fn resolve_ty_inner(&mut self, ty: &ast::TypeExpr) -> Ty {
         match ty {
             ast::TypeExpr::Optional { inner, .. } => Ty::Option(Box::new(self.resolve_ty(inner))),
             ast::TypeExpr::Fn { span, .. } => {
@@ -676,6 +696,10 @@ impl Checker {
     }
 
     fn declare(&mut self, name: String, ty: Ty, mutable: bool, def_span: Span) -> u32 {
+        // Every binding in the language comes through here — parameters, lets,
+        // a `for` variable, a pattern binding — so recording the type once here
+        // is what makes hover work on all four.
+        self.analysis.types.push((def_span, ty.clone()));
         let slot = self.locals.len() as u32;
         self.locals.push(ty.clone());
         self.scopes
@@ -1169,8 +1193,19 @@ impl Checker {
     /// `len` reads naturally on both a string and a list, so it means both, and
     /// which one is decided by the argument rather than by the name. Two names
     /// for one question would be the worse trade.
-    fn check_list_call(&mut self, name: &str, args: &[ast::Arg], span: Span) -> Option<Expr> {
+    fn check_list_call(
+        &mut self,
+        name: &str,
+        name_span: Span,
+        args: &[ast::Arg],
+        span: Span,
+    ) -> Option<Expr> {
         if name == "push" {
+            self.describe(
+                name_span,
+                "fn push(list: List<T>, value: T): List<T>",
+                "A new list one longer. The original is untouched (§4.2).",
+            );
             if args.len() != 2 {
                 self.error_labeled(
                     span,
@@ -1219,7 +1254,17 @@ impl Checker {
         // and again in the string path would report every error inside it twice.
         let checked = self.check_expr(&args[0].value, None);
         if !matches!(checked.ty, Ty::List(_)) {
-            return Some(self.finish_stdlib(name, checked, args[0].span));
+            return Some(self.finish_stdlib(name, name_span, checked, args[0].span));
+        }
+
+        if name == "len" {
+            self.describe(name_span, "fn len(list: List<T>): int", "How many elements.");
+        } else {
+            self.describe(
+                name_span,
+                "fn isEmpty(list: List<T>): bool",
+                "Whether there is nothing in it.",
+            );
         }
 
         let length = Expr { ty: Ty::Int, kind: ExprKind::ListLen { list: Box::new(checked) } };
@@ -1237,8 +1282,9 @@ impl Checker {
     }
 
     /// The string half of an already-checked `len`/`isEmpty` argument.
-    fn finish_stdlib(&mut self, name: &str, arg: Expr, span: Span) -> Expr {
+    fn finish_stdlib(&mut self, name: &str, name_span: Span, arg: Expr, span: Span) -> Expr {
         let fun = stdlib::lookup(name).expect("only called for stdlib names");
+        self.describe(name_span, &fun.signature(), fun.doc);
         if !arg.ty.unifies(&Ty::Str) {
             let found = self.show(&arg.ty);
             self.error_labeled(
@@ -1272,7 +1318,13 @@ impl Checker {
     /// Checked exactly like a user function — the argument count and every type
     /// — because from the caller's side that is what it is. The only difference
     /// is where the body comes from.
-    fn check_stdlib_call(&mut self, fun: &stdlib::Fun, args: &[ast::Arg], span: Span) -> Expr {
+    fn check_stdlib_call(
+        &mut self,
+        fun: &stdlib::Fun,
+        name_span: Span,
+        args: &[ast::Arg],
+        span: Span,
+    ) -> Expr {
         let kind_ty = |kind: stdlib::Kind| match kind {
             stdlib::Kind::Int => Ty::Int,
             stdlib::Kind::Str => Ty::Str,
@@ -1319,7 +1371,7 @@ impl Checker {
         // hover has to say.
         self.analysis
             .descriptions
-            .push((span, format!("{}\n{}", fun.signature(), fun.doc)));
+            .push((name_span, format!("{}\n{}", fun.signature(), fun.doc)));
 
         let kind = match fun.body {
             stdlib::Body::Helper(helper) => ExprKind::CallHelper { helper, args: checked },
@@ -1575,11 +1627,15 @@ impl Checker {
         if !self.signatures.contains_key(name) {
             // A user function of the same name wins, so nothing here takes a
             // name out of circulation.
-            if let Some(expr) = self.check_list_call(name, args, span) {
+            // The *name's* span, not the call's: a description covering the
+            // whole call would answer for every argument inside it too, so
+            // hovering `title` in `trim(title)` would report `trim`.
+            let name_span = callee.span();
+            if let Some(expr) = self.check_list_call(name, name_span, args, span) {
                 return expr;
             }
             if let Some(fun) = stdlib::lookup(name) {
-                return self.check_stdlib_call(fun, args, span);
+                return self.check_stdlib_call(fun, name_span, args, span);
             }
         }
 

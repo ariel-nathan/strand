@@ -335,3 +335,205 @@ fn a_view_hovers_as_a_node() {
     assert!(text.contains("spacer()"), "got: {text}");
     assert!(text.contains("-> Node"), "got: {text}");
 }
+
+// ---- hover on things the file does not declare ---------------------------
+
+#[test]
+fn hover_on_a_type_annotation_says_what_it_resolved_to() {
+    // Reported from the editor: nothing at all came back on `List`, `Result`
+    // or a user type in an annotation. A type is not an expression, so nothing
+    // was recording one — and an annotation is exactly where someone asks what
+    // a name means.
+    let src = "\
+type Todo = { id: int, title: string }
+
+fn add(todos: List<Todo>, title: string): Result<int, string> {
+  Ok(len(todos))
+}
+";
+    let document = Document::new(src);
+
+    let list = hover_text(&document, position_of(src, "List", 0)).expect("should hover");
+    assert!(list.contains("List<Todo>"), "got: {list}");
+
+    let result = hover_text(&document, position_of(src, "Result", 0)).expect("should hover");
+    assert!(result.contains("Result<int, string>"), "got: {result}");
+
+    let primitive = hover_text(&document, position_of(src, "int", 0)).expect("should hover");
+    assert!(primitive.contains("int"), "got: {primitive}");
+}
+
+#[test]
+fn the_narrowest_type_name_answers_for_itself() {
+    // `List<Todo>` contains `Todo`, and both are recorded. Hover takes the
+    // narrower one, so each name reports what it is rather than what encloses
+    // it.
+    let src = "type Todo = { id: int }\nfn f(xs: List<Todo>): int { 1 }\n";
+    let document = Document::new(src);
+    let inner = hover_text(&document, position_of(src, "Todo", 1)).expect("should hover");
+    assert_eq!(inner.trim(), "```strand\nTodo\n```", "got: {inner}");
+}
+
+#[test]
+fn hover_on_a_binding_reports_its_type() {
+    // Every binding goes through one place in the checker, so this covers a
+    // parameter, a `let`, a `for` variable and a pattern binding alike.
+    let src = "\
+fn f(count: int): int {
+  let doubled = count * 2
+  var total = 0
+  for n in [doubled] {
+    total = total + n
+  }
+  match total {
+    other => other,
+  }
+}
+";
+    let document = Document::new(src);
+    for (name, want) in
+        [("count", "int"), ("doubled", "int"), ("total", "int"), ("n", "int"), ("other", "int")]
+    {
+        let text = hover_text(&document, position_of(src, name, 0))
+            .unwrap_or_else(|| panic!("no hover on `{name}`"));
+        assert!(text.contains(want), "`{name}` should hover as {want}, got: {text}");
+    }
+}
+
+#[test]
+fn a_function_signature_does_not_answer_for_its_arguments() {
+    // A description covering the whole call would report `trim` for everything
+    // written inside it. It covers the name only.
+    let src = "fn f(title: string): string {\n  trim(title)\n}\n";
+    let document = Document::new(src);
+
+    let name = hover_text(&document, position_of(src, "trim", 0)).expect("should hover");
+    assert!(name.contains("fn trim(s: string): string"), "got: {name}");
+
+    let argument = hover_text(&document, position_of(src, "title", 1)).expect("should hover");
+    assert!(argument.contains("string"), "got: {argument}");
+    assert!(!argument.contains("fn trim"), "the argument is not the function: {argument}");
+}
+
+#[test]
+fn hover_describes_the_list_operations() {
+    let src = "fn f(xs: List<int>): List<int> {\n  push(xs, len(xs))\n}\n";
+    let document = Document::new(src);
+
+    let push = hover_text(&document, position_of(src, "push", 0)).expect("should hover");
+    assert!(push.contains("fn push(list: List<T>, value: T)"), "got: {push}");
+
+    // `len` means both a string and a list, and hover says which one this is.
+    let len = hover_text(&document, position_of(src, "len", 0)).expect("should hover");
+    assert!(len.contains("fn len(list: List<T>): int"), "got: {len}");
+}
+
+#[test]
+fn len_on_a_string_still_describes_the_string_one() {
+    let src = "fn f(s: string): int {\n  len(s)\n}\n";
+    let document = Document::new(src);
+    let len = hover_text(&document, position_of(src, "len", 0)).expect("should hover");
+    assert!(len.contains("fn len(s: string): int"), "got: {len}");
+}
+
+#[test]
+fn a_list_mistake_is_reported_like_any_other() {
+    let src = "fn main(): int { len([]) }\n";
+    let diagnostics = Document::new(src).diagnostics();
+    assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+    assert!(diagnostics[0].message.contains("told what it holds"), "{diagnostics:?}");
+}
+
+#[test]
+fn a_type_name_still_goes_to_its_declaration() {
+    // Recording a type for hover must not have displaced the definition.
+    let src = "type Todo = { id: int }\nfn f(xs: List<Todo>): int { 1 }\n";
+    let document = Document::new(src);
+    let target = document.definition(position_of(src, "Todo", 1)).expect("should resolve");
+    assert_eq!(target.start.line, 0, "the declaration is on line 0: {target:?}");
+}
+
+// ---- the grammar's fixture -----------------------------------------------
+
+/// The half of `highlight-fixture.str` above the "NOT VALID" line.
+fn valid_fixture() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("editors")
+        .join("vscode")
+        .join("test")
+        .join("highlight-fixture.str");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let marker = "// NOT VALID STRAND BELOW THIS LINE";
+    let (valid, _) = source
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("{} lost its {marker} divider", path.display()));
+    valid.to_string()
+}
+
+#[test]
+fn the_grammar_fixture_parses_above_the_line() {
+    // What the divider claims: below it is rejected by the *parser* or the
+    // lexer, above it is not. Deliberately not "above it type-checks" —
+    // section 1 exists to show the lexer's dot rule and writes `1.max(2)`,
+    // which lexes and parses exactly as intended and then fails to check.
+    //
+    // Nothing enforced even this much, and the file drifted once: it listed
+    // `for` and `in` as reserved-but-unparsed after they became real.
+    let (_, errors) = strandc::parser::parse_recovering(&valid_fixture());
+    assert!(
+        errors.is_empty(),
+        "the fixture stopped parsing above the divider:\n{}",
+        errors
+            .iter()
+            .map(|error| format!("  line {}: {}", error.span.line, error.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn the_new_sections_of_the_fixture_also_check() {
+    // Sections 9b-9d demonstrate lists, the generated string functions and the
+    // platform's `Input` type. Unlike section 1 they are meant to be real
+    // Strand, so they are checked as well as parsed — cut out on their own,
+    // since the sections above them are not.
+    let fixture = valid_fixture();
+    let start = fixture.find("// 9b.").expect("section 9b");
+    let diagnostics = Document::new(&fixture[start..]).diagnostics();
+    assert!(
+        diagnostics.is_empty(),
+        "sections 9b-9d no longer compile:\n{}",
+        diagnostics
+            .iter()
+            .map(|d| format!("  line {}: {}", d.range.start.line + 1, d.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn the_fixture_covers_every_widget_and_builtin_the_grammar_claims() {
+    // The grammar lists closed tables from `ui.rs` and `stdlib.rs`. If one
+    // gains a name and the fixture does not, nobody ever looks at its colour.
+    let fixture = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("editors")
+            .join("vscode")
+            .join("test")
+            .join("highlight-fixture.str"),
+    )
+    .expect("the fixture should be readable");
+
+    let missing: Vec<&str> = strandc::ui::BUILDERS
+        .iter()
+        .map(|builder| builder.name)
+        .chain(strandc::stdlib::FUNCTIONS.iter().map(|fun| fun.name))
+        .filter(|name| !fixture.contains(&format!("{name}(")))
+        .collect();
+    assert!(missing.is_empty(), "the fixture never exercises: {missing:?}");
+}
