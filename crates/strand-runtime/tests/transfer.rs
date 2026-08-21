@@ -43,7 +43,7 @@ fn run(seed: u64) -> (Vec<Event>, String) {
             &registry,
             RECEIVER,
             "pong",
-            &wat("pong.wat"),
+            wat("pong.wat").as_bytes(),
             Policy::Restart,
             None,
         );
@@ -54,7 +54,7 @@ fn run(seed: u64) -> (Vec<Event>, String) {
             &registry,
             SENDER,
             "sender",
-            &wat("transfer.wat"),
+            wat("transfer.wat").as_bytes(),
             // Stop, not Restart: we want the report rather than a new life.
             Policy::Stop,
             None,

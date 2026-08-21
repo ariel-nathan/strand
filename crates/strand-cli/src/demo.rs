@@ -52,7 +52,7 @@ async fn run_actors(traced: bool) -> Result<()> {
     for (id, name, path) in ACTORS {
         let wat =
             std::fs::read_to_string(Path::new(path)).with_context(|| format!("reading {path}"))?;
-        handles.push(spawn_actor(&engine, &registry, id, name, &wat).await?);
+        handles.push(spawn_actor(&engine, &registry, id, name, wat.as_bytes()).await?);
     }
 
     tokio::time::sleep(Duration::from_millis(900)).await;
@@ -97,7 +97,7 @@ async fn run_crash(traced: bool) -> Result<()> {
         &registry,
         CRASHER,
         "crasher",
-        &std::fs::read_to_string("examples/wasm/crasher.wat")?,
+        std::fs::read_to_string("examples/wasm/crasher.wat")?.as_bytes(),
         Policy::Restart,
         None,
     );
@@ -106,7 +106,7 @@ async fn run_crash(traced: bool) -> Result<()> {
         &registry,
         TICKER,
         "ticker",
-        &std::fs::read_to_string("examples/wasm/ticker.wat")?,
+        std::fs::read_to_string("examples/wasm/ticker.wat")?.as_bytes(),
         Policy::Restart,
         None,
     );

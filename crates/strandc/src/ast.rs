@@ -1,8 +1,8 @@
-//! Abstract syntax tree for the M1 language subset (§4.6).
+//! Abstract syntax tree for the language subset built so far (§4.6).
 //!
 //! Every node carries a `Span` so the checker can point at source. Nodes for
-//! later milestones (`scope`/`spawn`, `actor`, `view`) are deliberately absent
-//! rather than stubbed.
+//! later milestones (`scope`/`spawn`, `view`) are deliberately absent rather
+//! than stubbed.
 
 use crate::lexer::Span;
 
@@ -15,6 +15,26 @@ pub struct Program {
 pub enum Item {
     Fn(FnDecl),
     Type(TypeDecl),
+    Actor(ActorDecl),
+}
+
+/// An actor declaration (§5.1). Elm-shaped, as §6.5 describes: the handler
+/// returns the next state rather than mutating the current one.
+///
+/// ```text
+/// actor Counter {
+///   state: Count
+///   fn init(): Count { ... }
+///   fn receive(state: Count, msg: string): Count { ... }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActorDecl {
+    pub name: String,
+    pub state: TypeExpr,
+    pub init: FnDecl,
+    pub receive: FnDecl,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]

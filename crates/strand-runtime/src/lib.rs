@@ -447,7 +447,7 @@ async fn run_actor_once(
     registry: &Registry,
     id: ActorId,
     name: &str,
-    wat: &str,
+    module_bytes: &[u8],
     generation: u32,
 ) -> Result<(), CrashReport> {
     let died = |reason: String, handling: Option<String>| CrashReport {
@@ -458,7 +458,7 @@ async fn run_actor_once(
         handling,
     };
 
-    let module = Module::new(engine, wat)
+    let module = Module::new(engine, module_bytes)
         .map_err(|e| died(format!("failed to compile: {}", reason(&e)), None))?;
     let mut linker = Linker::new(engine);
     link_host_abi(&mut linker).map_err(|e| died(format!("failed to link host ABI: {e}"), None))?;
@@ -516,18 +516,22 @@ async fn run_actor_once(
 }
 
 /// Spawns one unsupervised actor. A crash ends the task.
+///
+/// `module_bytes` is either a compiled module or `.wat` source — wasmtime
+/// accepts both, so a Strand-compiled actor and a hand-written fixture host
+/// the same way.
 pub async fn spawn_actor(
     engine: &Engine,
     registry: &Registry,
     id: ActorId,
     name: &str,
-    wat: &str,
+    module_bytes: &[u8],
 ) -> Result<tokio::task::JoinHandle<Result<(), CrashReport>>> {
     let engine = engine.clone();
     let registry = registry.clone();
-    let (name, wat) = (name.to_string(), wat.to_string());
+    let (name, bytes) = (name.to_string(), module_bytes.to_vec());
     Ok(tokio::spawn(
-        async move { run_actor_once(&engine, &registry, id, &name, &wat, 0).await },
+        async move { run_actor_once(&engine, &registry, id, &name, &bytes, 0).await },
     ))
 }
 
@@ -541,18 +545,18 @@ pub fn spawn_supervised(
     registry: &Registry,
     id: ActorId,
     name: &str,
-    wat: &str,
+    module_bytes: &[u8],
     policy: Policy,
     parent: Option<ActorId>,
 ) -> tokio::task::JoinHandle<Result<(), CrashReport>> {
     let engine = engine.clone();
     let registry = registry.clone();
-    let (name, wat) = (name.to_string(), wat.to_string());
+    let (name, bytes) = (name.to_string(), module_bytes.to_vec());
 
     tokio::spawn(async move {
         let mut generation = 0;
         loop {
-            match run_actor_once(&engine, &registry, id, &name, &wat, generation).await {
+            match run_actor_once(&engine, &registry, id, &name, &bytes, generation).await {
                 Ok(()) => return Ok(()),
                 Err(report) => {
                     registry.trace.record(Event::Crashed { id, reason: report.reason.clone() });

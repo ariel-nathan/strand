@@ -113,6 +113,17 @@ pub struct Hir {
     pub records: Vec<RecordDef>,
     pub sums: Vec<SumDef>,
     pub funcs: Vec<Func>,
+    /// At most one per module: the runtime instantiates one module per actor.
+    pub actor: Option<ActorInfo>,
+}
+
+/// What codegen needs to wire an actor to the host ABI.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActorInfo {
+    pub name: String,
+    pub state: Ty,
+    pub init: FuncId,
+    pub receive: FuncId,
 }
 
 impl Hir {

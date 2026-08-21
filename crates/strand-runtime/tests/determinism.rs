@@ -30,7 +30,7 @@ async fn ping_pong(registry: Registry) -> Result<()> {
     let engine = engine()?;
     let mut handles = Vec::new();
     for (id, name, file) in ACTORS {
-        handles.push(spawn_actor(&engine, &registry, id, name, &wat(file)).await?);
+        handles.push(spawn_actor(&engine, &registry, id, name, wat(file).as_bytes()).await?);
     }
 
     // Virtual time: this returns immediately, having advanced the clock.

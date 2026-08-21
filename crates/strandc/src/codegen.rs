@@ -131,6 +131,8 @@ impl<'hir> Emitter<'hir> {
         let alloc_ty = self.intern_type(vec![ValType::I32], vec![ValType::I32]);
         let str_eq_ty =
             self.intern_type(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
+        let actor_main_ty = self.intern_type(Vec::new(), Vec::new());
+        let actor_recv_ty = self.intern_type(vec![ValType::I32, ValType::I32], Vec::new());
 
         // Bodies are emitted before the type section is finalised, because a
         // multi-value block inside a body can intern a new type.
@@ -153,6 +155,10 @@ impl<'hir> Emitter<'hir> {
         }
         functions.function(alloc_ty);
         functions.function(str_eq_ty);
+        if self.hir.actor.is_some() {
+            functions.function(actor_main_ty);
+            functions.function(actor_recv_ty);
+        }
         module.section(&functions);
 
         let mut memories = MemorySection::new();
@@ -170,6 +176,15 @@ impl<'hir> Emitter<'hir> {
             GlobalType { val_type: ValType::I32, mutable: true, shared: false },
             &ConstExpr::i32_const(self.heap_start as i32),
         );
+        if let Some(actor) = &self.hir.actor {
+            // Global 1 holds the current state. `receive` returns the next one,
+            // so a message handler never mutates in place (§6.5).
+            let val_type = state_type(&actor.state)?;
+            globals.global(
+                GlobalType { val_type, mutable: true, shared: false },
+                &zero_of(val_type),
+            );
+        }
         module.section(&globals);
 
         let mut exports = ExportSection::new();
@@ -177,8 +192,14 @@ impl<'hir> Emitter<'hir> {
         for (index, func) in self.hir.funcs.iter().enumerate() {
             exports.export(&func.name, ExportKind::Func, index as u32);
         }
-        // The host ABI name from docs/abi.md §6.
+        // The host ABI names from docs/abi.md §6.
         exports.export("strand_alloc", ExportKind::Func, self.alloc_index);
+        if self.hir.actor.is_some() {
+            exports.export("strand_main", ExportKind::Func, self.str_eq_index + 1);
+            exports.export("strand_on_message", ExportKind::Func, self.str_eq_index + 2);
+            // Lets a host read the actor's state without the actor logging it.
+            exports.export("strand_state", ExportKind::Global, 1);
+        }
         module.section(&exports);
 
         let mut code = CodeSection::new();
@@ -187,6 +208,10 @@ impl<'hir> Emitter<'hir> {
         }
         code.function(&alloc_body());
         code.function(&str_eq_body());
+        if let Some(actor) = &self.hir.actor {
+            code.function(&actor_main_body(actor));
+            code.function(&actor_receive_body(actor, self.alloc_index));
+        }
         module.section(&code);
 
         if !self.data.is_empty() {
@@ -841,6 +866,67 @@ fn narrow(ty: ValType) -> Instruction<'static> {
         ValType::F64 => Instruction::F64ReinterpretI64,
         other => unreachable!("unexpected representation {other:?}"),
     }
+}
+
+/// The WASM type of an actor's state global.
+fn state_type(state: &Ty) -> EResult<ValType> {
+    match rep(state).as_slice() {
+        [single] => Ok(*single),
+        _ => bail("an actor's state must be a single-word type, such as a record"),
+    }
+}
+
+fn zero_of(ty: ValType) -> ConstExpr {
+    match ty {
+        ValType::I64 => ConstExpr::i64_const(0),
+        ValType::F64 => ConstExpr::f64_const(0.0.into()),
+        _ => ConstExpr::i32_const(0),
+    }
+}
+
+/// `strand_main`: build the starting state and park it in the global.
+fn actor_main_body(actor: &ActorInfo) -> Function {
+    let mut f = Function::new([]);
+    f.instruction(&Instruction::Call(actor.init.0));
+    f.instruction(&Instruction::GlobalSet(1));
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// `strand_on_message`: wrap the delivered bytes as a Strand string, hand it to
+/// `receive` along with the current state, and keep whatever comes back.
+///
+/// The runtime writes raw bytes; `docs/abi.md` §5 says a string is a length
+/// header followed by its bytes, so the header is added here rather than
+/// teaching the runtime the language's layout.
+fn actor_receive_body(actor: &ActorInfo, alloc: u32) -> Function {
+    let mut f = Function::new([(1, ValType::I32)]);
+    let (ptr, len, text) = (0, 1, 2);
+
+    f.instruction(&Instruction::LocalGet(len));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::Call(alloc));
+    f.instruction(&Instruction::LocalTee(text));
+
+    // header: the length
+    f.instruction(&Instruction::LocalGet(len));
+    f.instruction(&Instruction::I32Store(mem_arg(0, 2)));
+
+    // body: copy the delivered bytes in after it
+    f.instruction(&Instruction::LocalGet(text));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalGet(ptr));
+    f.instruction(&Instruction::LocalGet(len));
+    f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+
+    f.instruction(&Instruction::GlobalGet(1));
+    f.instruction(&Instruction::LocalGet(text));
+    f.instruction(&Instruction::Call(actor.receive.0));
+    f.instruction(&Instruction::GlobalSet(1));
+    f.instruction(&Instruction::End);
+    f
 }
 
 /// Bump allocator in the guest arena (`docs/abi.md` §6). Never frees: §5.1

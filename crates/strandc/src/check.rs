@@ -16,6 +16,7 @@ pub fn check(program: &ast::Program) -> Result<Hir, Vec<Diagnostic>> {
     let mut cx = Checker::default();
     cx.collect_types(program);
     cx.collect_signatures(program);
+    cx.collect_actor(program);
     cx.check_bodies(program);
 
     if cx.errors.is_empty() {
@@ -23,6 +24,22 @@ pub fn check(program: &ast::Program) -> Result<Hir, Vec<Diagnostic>> {
     } else {
         Err(cx.errors)
     }
+}
+
+/// Every function in the module, whether top-level or inside an actor.
+fn fn_decls(program: &ast::Program) -> Vec<&ast::FnDecl> {
+    let mut out = Vec::new();
+    for item in &program.items {
+        match item {
+            ast::Item::Fn(decl) => out.push(decl),
+            ast::Item::Actor(decl) => {
+                out.push(&decl.init);
+                out.push(&decl.receive);
+            }
+            ast::Item::Type(_) => {}
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +75,7 @@ struct Checker {
 
 impl Default for Hir {
     fn default() -> Self {
-        Hir { records: Vec::new(), sums: Vec::new(), funcs: Vec::new() }
+        Hir { records: Vec::new(), sums: Vec::new(), funcs: Vec::new(), actor: None }
     }
 }
 
@@ -170,8 +187,7 @@ impl Checker {
     }
 
     fn collect_signatures(&mut self, program: &ast::Program) {
-        for item in &program.items {
-            let ast::Item::Fn(decl) = item else { continue };
+        for decl in fn_decls(program) {
             if self.signatures.contains_key(&decl.name) {
                 self.error(decl.span, format!("function `{}` is declared twice", decl.name));
                 continue;
@@ -184,6 +200,78 @@ impl Checker {
             let ret = decl.ret.as_ref().map_or(Ty::Unit, |t| self.resolve_ty(t));
             let id = FuncId(self.signatures.len() as u32);
             self.signatures.insert(decl.name.clone(), Signature { id, params, ret });
+        }
+    }
+
+    /// Validates the actor shape and records what codegen needs (§5.1).
+    fn collect_actor(&mut self, program: &ast::Program) {
+        let mut seen: Option<&ast::ActorDecl> = None;
+        for item in &program.items {
+            let ast::Item::Actor(decl) = item else { continue };
+            if let Some(first) = seen {
+                self.error(
+                    decl.span,
+                    format!(
+                        "a module declares at most one actor; `{}` is already declared",
+                        first.name
+                    ),
+                );
+                continue;
+            }
+            seen = Some(decl);
+
+            let state = self.resolve_ty(&decl.state);
+            let Some(init) = self.signatures.get("init").cloned() else { continue };
+            let Some(receive) = self.signatures.get("receive").cloned() else { continue };
+
+            if !init.params.is_empty() {
+                self.error(decl.init.span, "`init` takes no parameters");
+            }
+            if !init.ret.unifies(&state) {
+                let (found, want) = (self.show(&init.ret), self.show(&state));
+                self.error(
+                    decl.init.span,
+                    format!("`init` must return the actor state {want}, found {found}"),
+                );
+            }
+
+            match receive.params.as_slice() {
+                [(_, first), (_, second)] => {
+                    if !first.unifies(&state) {
+                        let (found, want) = (self.show(first), self.show(&state));
+                        self.error(
+                            decl.receive.span,
+                            format!("`receive` takes the state {want} first, found {found}"),
+                        );
+                    }
+                    if !second.unifies(&Ty::Str) {
+                        let found = self.show(second);
+                        self.error(
+                            decl.receive.span,
+                            format!("`receive` takes the message as a string, found {found}"),
+                        );
+                    }
+                }
+                _ => self.error(
+                    decl.receive.span,
+                    "`receive` takes exactly the state and the message",
+                ),
+            }
+
+            if !receive.ret.unifies(&state) {
+                let (found, want) = (self.show(&receive.ret), self.show(&state));
+                self.error(
+                    decl.receive.span,
+                    format!("`receive` must return the next state {want}, found {found}"),
+                );
+            }
+
+            self.hir.actor = Some(ActorInfo {
+                name: decl.name.clone(),
+                state,
+                init: init.id,
+                receive: receive.id,
+            });
         }
     }
 
@@ -264,8 +352,7 @@ impl Checker {
     fn check_bodies(&mut self, program: &ast::Program) {
         // Emit functions in signature id order so FuncId indexes `hir.funcs`.
         let mut decls: Vec<&ast::FnDecl> = Vec::new();
-        for item in &program.items {
-            let ast::Item::Fn(decl) = item else { continue };
+        for decl in fn_decls(program) {
             // Only the first declaration of a name owns the id; a duplicate has
             // already been reported and emits no body.
             let is_first = !decls.iter().any(|d: &&ast::FnDecl| d.name == decl.name);

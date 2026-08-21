@@ -1,0 +1,27 @@
+// An actor written in Strand (§5.1), in the Elm shape §6.5 describes: the
+// handler returns the next state rather than mutating the current one.
+//
+//   strand build examples/strand/counter.str
+//
+// The compiled module exports the host ABI the runtime expects, so it is
+// hosted exactly like a hand-written .wat actor.
+
+type Count = { total: int, seen: int }
+
+actor Counter {
+  state: Count
+
+  fn init(): Count {
+    Count { total: 0, seen: 0 }
+  }
+
+  fn receive(state: Count, msg: string): Count {
+    match msg {
+      "inc"   => Count { total: state.total + 1, seen: state.seen + 1 },
+      "dec"   => Count { total: state.total - 1, seen: state.seen + 1 },
+      "reset" => Count { total: 0, seen: state.seen + 1 },
+      // Anything else is counted as seen but changes nothing.
+      _       => Count { total: state.total, seen: state.seen + 1 },
+    }
+  }
+}

@@ -45,12 +45,12 @@ async fn crash_and_restart(registry: Registry) -> Result<()> {
         &registry,
         CRASHER,
         "crasher",
-        &wat("crasher.wat"),
+        wat("crasher.wat").as_bytes(),
         Policy::Restart,
         None,
     );
     let ticker =
-        spawn_supervised(&engine, &registry, TICKER, "ticker", &wat("ticker.wat"), Policy::Restart, None);
+        spawn_supervised(&engine, &registry, TICKER, "ticker", wat("ticker.wat").as_bytes(), Policy::Restart, None);
 
     settle().await;
     ping(&registry); // #1
@@ -178,7 +178,7 @@ fn a_stop_policy_surfaces_the_report_instead_of_restarting() {
             &registry,
             CRASHER,
             "crasher",
-            &wat("crasher.wat"),
+            wat("crasher.wat").as_bytes(),
             Policy::Stop,
             None,
         );

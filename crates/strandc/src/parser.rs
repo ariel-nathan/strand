@@ -126,7 +126,8 @@ impl Parser {
         match self.peek() {
             Tok::Fn => Ok(Item::Fn(self.fn_decl()?)),
             Tok::Type => Ok(Item::Type(self.type_decl()?)),
-            other => self.error(format!("expected `fn` or `type`, found {other}")),
+            Tok::Actor => Ok(Item::Actor(self.actor_decl()?)),
+            other => self.error(format!("expected `fn`, `type` or `actor`, found {other}")),
         }
     }
 
@@ -156,6 +157,46 @@ impl Parser {
 
         let body = self.block()?;
         Ok(FnDecl { name, params, ret, span: Self::join(start, body.span), body })
+    }
+
+    fn actor_decl(&mut self) -> PResult<ActorDecl> {
+        let start = self.expect(Tok::Actor)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(Tok::LBrace)?;
+
+        // `state: T` — the record this actor owns.
+        let (keyword, keyword_span) = self.expect_ident()?;
+        if keyword != "state" {
+            return Err(Diagnostic::new(keyword_span, format!("expected `state`, found `{keyword}`"))
+                .with_label("actors declare their state first")
+                .with_help("write `state: SomeRecord` as the first line of the actor"));
+        }
+        self.expect(Tok::Colon)?;
+        let state = self.type_expr()?;
+
+        let mut init = None;
+        let mut receive = None;
+        while self.at(&Tok::Fn) {
+            let decl = self.fn_decl()?;
+            match decl.name.as_str() {
+                "init" => init = Some(decl),
+                "receive" => receive = Some(decl),
+                other => {
+                    return Err(Diagnostic::new(decl.span, format!("unexpected function `{other}`"))
+                        .with_label("not part of an actor")
+                        .with_help("an actor declares exactly `init` and `receive`"));
+                }
+            }
+        }
+        let end = self.expect(Tok::RBrace)?;
+
+        let (Some(init), Some(receive)) = (init, receive) else {
+            return Err(Diagnostic::new(Self::join(start, end), format!("actor `{name}` is incomplete"))
+                .with_label("missing `init` or `receive`")
+                .with_help("an actor needs `fn init()` for its starting state and `fn receive(state, msg)` for each message"));
+        };
+
+        Ok(ActorDecl { name, state, init, receive, span: Self::join(start, end) })
     }
 
     fn type_decl(&mut self) -> PResult<TypeDecl> {
