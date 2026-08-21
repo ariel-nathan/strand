@@ -53,11 +53,8 @@ impl Sizing {
         }
     }
 
-    fn grow_factor(self) -> f32 {
-        match self {
-            Sizing::Grow => 1.0,
-            _ => 0.0,
-        }
+    fn is_grow(self) -> bool {
+        matches!(self, Sizing::Grow)
     }
 }
 
@@ -130,6 +127,17 @@ pub enum Node {
 }
 
 impl Node {
+    /// The style a node carries, if it has one. `Text` styles its glyphs, not
+    /// its box, so it has none.
+    pub fn style(&self) -> Option<&Style> {
+        match self {
+            Node::Row { style, .. } | Node::Column { style, .. } | Node::Box { style } => {
+                Some(style)
+            }
+            Node::Text { .. } => None,
+        }
+    }
+
     pub fn row(style: Style, children: Vec<Node>) -> Self {
         Node::Row { style, children }
     }
@@ -235,7 +243,24 @@ impl Layouter {
         self.frame.clear();
 
         let mut tree: TaffyTree<()> = TaffyTree::new();
-        let Ok(node) = build(&mut tree, root) else { return &self.frame };
+        let Ok(node) = build(&mut tree, root, None) else { return &self.frame };
+
+        // The root has no parent to grow inside, so `Grow` there means "fill
+        // the viewport". Without this a root that asks to grow sizes to its
+        // content and leaves the rest of the window unpainted.
+        if let Some(style) = root.style() {
+            if style.width.is_grow() || style.height.is_grow() {
+                if let Ok(mut root_style) = tree.style(node).cloned() {
+                    if style.width.is_grow() {
+                        root_style.size.width = length(viewport.0);
+                    }
+                    if style.height.is_grow() {
+                        root_style.size.height = length(viewport.1);
+                    }
+                    let _ = tree.set_style(node, root_style);
+                }
+            }
+        }
 
         let space = Size {
             width: AvailableSpace::Definite(viewport.0),
@@ -250,12 +275,32 @@ impl Layouter {
     }
 }
 
-fn taffy_style(style: &Style, direction: FlexDirection) -> taffy::Style {
+/// `parent` is the direction of the containing flex box, which decides what
+/// growing means: along the parent's main axis a node flexes, across it a node
+/// stretches. Using the node's own direction here — as this did originally —
+/// makes `width: Grow` inside a column grow the node vertically.
+fn taffy_style(
+    style: &Style,
+    direction: FlexDirection,
+    parent: Option<FlexDirection>,
+) -> taffy::Style {
+    let (grows_along, grows_across) = match parent {
+        Some(FlexDirection::Row) | Some(FlexDirection::RowReverse) => {
+            (style.width.is_grow(), style.height.is_grow())
+        }
+        Some(FlexDirection::Column) | Some(FlexDirection::ColumnReverse) => {
+            (style.height.is_grow(), style.width.is_grow())
+        }
+        // The root flexes inside nothing; `layout` sizes it to the viewport.
+        None => (false, false),
+    };
+
     taffy::Style {
         display: Display::Flex,
         flex_direction: direction,
         size: Size { width: style.width.to_dimension(), height: style.height.to_dimension() },
-        flex_grow: style.width.grow_factor().max(style.height.grow_factor()),
+        flex_grow: if grows_along { 1.0 } else { 0.0 },
+        align_self: grows_across.then_some(AlignItems::STRETCH),
         padding: Rect::length(style.padding),
         gap: Size { width: length(style.gap), height: length(style.gap) },
         justify_content: Some(match style.main_axis {
@@ -276,7 +321,11 @@ fn taffy_style(style: &Style, direction: FlexDirection) -> taffy::Style {
     }
 }
 
-fn build(tree: &mut TaffyTree<()>, node: &Node) -> Result<NodeId, taffy::TaffyError> {
+fn build(
+    tree: &mut TaffyTree<()>,
+    node: &Node,
+    parent: Option<FlexDirection>,
+) -> Result<NodeId, taffy::TaffyError> {
     match node {
         Node::Row { style, children } | Node::Column { style, children } => {
             let direction = match node {
@@ -284,10 +333,10 @@ fn build(tree: &mut TaffyTree<()>, node: &Node) -> Result<NodeId, taffy::TaffyEr
                 _ => FlexDirection::Column,
             };
             let ids: Result<Vec<NodeId>, _> =
-                children.iter().map(|child| build(tree, child)).collect();
-            tree.new_with_children(taffy_style(style, direction), &ids?)
+                children.iter().map(|child| build(tree, child, Some(direction))).collect();
+            tree.new_with_children(taffy_style(style, direction, parent), &ids?)
         }
-        Node::Box { style } => tree.new_leaf(taffy_style(style, FlexDirection::Row)),
+        Node::Box { style } => tree.new_leaf(taffy_style(style, FlexDirection::Row, parent)),
         Node::Text { text, style } => {
             let (width, height) = measure_text(text, style.size);
             tree.new_leaf(taffy::Style {
@@ -404,6 +453,49 @@ mod tests {
         );
         let mut layouter = Layouter::new();
         assert_eq!(rects(layouter.layout(&tree, (200.0, 200.0)))[0], (12.0, 12.0, 10.0, 10.0));
+    }
+
+    #[test]
+    fn a_growing_root_fills_the_viewport() {
+        // Found by a screenshot: the root has no parent to flex inside, so
+        // without special handling it sized to its content and left the rest
+        // of the window unpainted.
+        let tree = Node::column(
+            Style {
+                width: Sizing::Grow,
+                height: Sizing::Grow,
+                background: Some(RED),
+                ..Default::default()
+            },
+            vec![boxed(10.0, 10.0, BLUE)],
+        );
+        let mut layouter = Layouter::new();
+        let frame = layouter.layout(&tree, (640.0, 480.0));
+        assert_eq!(rects(frame)[0], (0.0, 0.0, 640.0, 480.0));
+    }
+
+    #[test]
+    fn growing_across_the_parent_axis_stretches_rather_than_flexes() {
+        // `width: Grow` inside a column is a cross-axis request: span the
+        // parent's width. It must not make the node taller.
+        let tree = Node::column(
+            Style { width: Sizing::Fixed(200.0), height: Sizing::Fixed(100.0), ..Default::default() },
+            vec![
+                Node::Box {
+                    style: Style {
+                        width: Sizing::Grow,
+                        height: Sizing::Fixed(20.0),
+                        background: Some(RED),
+                        ..Default::default()
+                    },
+                },
+                boxed(10.0, 10.0, BLUE),
+            ],
+        );
+        let mut layouter = Layouter::new();
+        let laid = rects(layouter.layout(&tree, (400.0, 400.0)));
+        assert_eq!(laid[0], (0.0, 0.0, 200.0, 20.0), "full width, unchanged height");
+        assert_eq!(laid[1].1, 20.0, "and the sibling still follows it");
     }
 
     #[test]

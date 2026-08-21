@@ -112,10 +112,13 @@ impl Gpu {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
+                        // Linear, for the same reason the instance colours are
+                        // (see paint::to_linear). This is only visible where
+                        // no scene has been submitted yet.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.06,
-                            b: 0.09,
+                            r: 0.004,
+                            g: 0.005,
+                            b: 0.008,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -161,7 +164,7 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("Strand — M0");
+        let attrs = Window::default_attributes().with_title("Strand");
         match event_loop.create_window(attrs) {
             Ok(window) => {
                 let window = Arc::new(window);

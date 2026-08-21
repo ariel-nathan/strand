@@ -10,6 +10,19 @@ use wgpu::util::DeviceExt;
 
 use crate::scene::{Command, Frame};
 
+/// Colours are authored the way a designer reads them — sRGB, as in "0.35,
+/// 0.55, 0.95 is a medium blue". The surface format is sRGB, and the GPU
+/// converts linear to sRGB when writing to it, so what the shader must supply
+/// is the *linear* value. Skipping this makes everything washed out: 0.05
+/// arrives on screen as 0.25.
+fn to_linear(channel: f32) -> f32 {
+    if channel <= 0.04045 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 /// One rectangle, as the GPU sees it.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -206,7 +219,13 @@ impl Painter {
                 Command::Rect { x, y, width, height, color } => {
                     self.instances.push(Instance {
                         rect: [*x, *y, *width, *height],
-                        color: [color.r, color.g, color.b, color.a],
+                        color: [
+                            to_linear(color.r),
+                            to_linear(color.g),
+                            to_linear(color.b),
+                            // Alpha is already linear; it is not a colour.
+                            color.a,
+                        ],
                     });
                 }
                 // Text needs glyph rasterisation; §12 keeps that scoped out for
