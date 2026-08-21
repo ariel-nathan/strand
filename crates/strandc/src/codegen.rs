@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function,
-    FunctionSection, GlobalSection, GlobalType, Instruction, MemArg, MemorySection, MemoryType,
-    Module, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
+    Function, FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction, MemArg,
+    MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
 use crate::hir::*;
@@ -82,6 +82,9 @@ struct Emitter<'hir> {
     heap_start: u32,
     alloc_index: u32,
     str_eq_index: u32,
+    /// Host functions this module actually calls. Imports take the lowest
+    /// function indices, so everything defined here is offset past them.
+    imports: Vec<Builtin>,
 }
 
 impl<'hir> Emitter<'hir> {
@@ -95,6 +98,7 @@ impl<'hir> Emitter<'hir> {
             heap_start: DATA_START,
             alloc_index: helpers,
             str_eq_index: helpers + 1,
+            imports: Vec::new(),
         }
     }
 
@@ -119,6 +123,13 @@ impl<'hir> Emitter<'hir> {
 
     fn run(mut self) -> EResult<Vec<u8>> {
         self.collect_strings();
+        self.collect_imports();
+
+        // Imports shift every defined function, so fix the helper indices here
+        // rather than sprinkling the offset through emission.
+        let offset = self.imports.len() as u32;
+        self.alloc_index += offset;
+        self.str_eq_index += offset;
 
         // Function types, in index order: user functions, then the two helpers.
         let mut signatures = Vec::new();
@@ -148,6 +159,15 @@ impl<'hir> Emitter<'hir> {
             types.ty().function(params.iter().copied(), results.iter().copied());
         }
         module.section(&types);
+
+        if !self.imports.is_empty() {
+            let mut imports = ImportSection::new();
+            for builtin in &self.imports {
+                let (module_name, field) = builtin.import();
+                imports.import(module_name, field, EntityType::Function(builtin_type(*builtin, &mut self.types)));
+            }
+            module.section(&imports);
+        }
 
         let mut functions = FunctionSection::new();
         for signature in &signatures {
@@ -190,7 +210,7 @@ impl<'hir> Emitter<'hir> {
         let mut exports = ExportSection::new();
         exports.export("memory", ExportKind::Memory, 0);
         for (index, func) in self.hir.funcs.iter().enumerate() {
-            exports.export(&func.name, ExportKind::Func, index as u32);
+            exports.export(&func.name, ExportKind::Func, offset + index as u32);
         }
         // The host ABI names from docs/abi.md §6.
         exports.export("strand_alloc", ExportKind::Func, self.alloc_index);
@@ -209,8 +229,8 @@ impl<'hir> Emitter<'hir> {
         code.function(&alloc_body());
         code.function(&str_eq_body());
         if let Some(actor) = &self.hir.actor {
-            code.function(&actor_main_body(actor));
-            code.function(&actor_receive_body(actor, self.alloc_index, self.hir));
+            code.function(&actor_main_body(actor, offset));
+            code.function(&actor_receive_body(actor, self.alloc_index, self.hir, offset));
         }
         module.section(&code);
 
@@ -221,6 +241,21 @@ impl<'hir> Emitter<'hir> {
         }
 
         Ok(module.finish())
+    }
+
+    /// Finds which host functions the program calls, so only those are imported.
+    fn collect_imports(&mut self) {
+        let mut used = Vec::new();
+        for func in &self.hir.funcs {
+            collect_block_builtins(&func.body, &mut used);
+        }
+        for builtin in used {
+            if !self.imports.contains(&builtin) {
+                self.imports.push(builtin);
+            }
+        }
+        // Stable order keeps emitted modules reproducible.
+        self.imports.sort_by_key(|b| b.name());
     }
 
     // ---- static data -----------------------------------------------------
@@ -349,7 +384,31 @@ impl<'hir> Emitter<'hir> {
                 for arg in args {
                     self.expr(ctx, code, arg)?;
                 }
-                code.push(Instruction::Call(func.0));
+                let offset = self.imports.len() as u32;
+                code.push(Instruction::Call(offset + func.0));
+            }
+
+            ExprKind::CallBuiltin { builtin, args } => {
+                match builtin {
+                    // log(msg) takes a Strand string; the host ABI takes
+                    // (ptr, len), so unpack the header here (docs/abi.md §5).
+                    Builtin::Log => {
+                        let text = ctx.scratch(ValType::I32);
+                        self.expr(ctx, code, &args[0])?;
+                        code.push(Instruction::LocalSet(text));
+                        code.push(Instruction::LocalGet(text));
+                        code.push(Instruction::I32Const(4));
+                        code.push(Instruction::I32Add);
+                        code.push(Instruction::LocalGet(text));
+                        code.push(Instruction::I32Load(mem_arg(0, 2)));
+                    }
+                }
+                let index = self
+                    .imports
+                    .iter()
+                    .position(|b| b == builtin)
+                    .expect("import was collected");
+                code.push(Instruction::Call(index as u32));
             }
 
             ExprKind::MakeRecord { record, fields } => {
@@ -868,6 +927,19 @@ fn narrow(ty: ValType) -> Instruction<'static> {
     }
 }
 
+/// Interns the signature of a host import.
+fn builtin_type(builtin: Builtin, types: &mut Vec<(Vec<ValType>, Vec<ValType>)>) -> u32 {
+    let signature = match builtin {
+        // log(ptr, len)
+        Builtin::Log => (vec![ValType::I32, ValType::I32], Vec::new()),
+    };
+    if let Some(index) = types.iter().position(|t| *t == signature) {
+        return index as u32;
+    }
+    types.push(signature);
+    (types.len() - 1) as u32
+}
+
 /// The WASM type of an actor's state global.
 fn state_type(state: &Ty) -> EResult<ValType> {
     match rep(state).as_slice() {
@@ -885,9 +957,9 @@ fn zero_of(ty: ValType) -> ConstExpr {
 }
 
 /// `strand_main`: build the starting state and park it in the global.
-fn actor_main_body(actor: &ActorInfo) -> Function {
+fn actor_main_body(actor: &ActorInfo, offset: u32) -> Function {
     let mut f = Function::new([]);
-    f.instruction(&Instruction::Call(actor.init.0));
+    f.instruction(&Instruction::Call(offset + actor.init.0));
     f.instruction(&Instruction::GlobalSet(1));
     f.instruction(&Instruction::End);
     f
@@ -901,7 +973,7 @@ fn actor_main_body(actor: &ActorInfo) -> Function {
 /// type holds no pointers needing relocation, so a boxed variant is used
 /// in place with no decoding at all. Strings are the one relocated case —
 /// codegen knows their layout (`docs/abi.md` §5), so it adds the header.
-fn actor_receive_body(actor: &ActorInfo, alloc: u32, hir: &Hir) -> Function {
+fn actor_receive_body(actor: &ActorInfo, alloc: u32, hir: &Hir, offset: u32) -> Function {
     let mut f = Function::new([(1, ValType::I32)]);
     let (ptr, len, text) = (0, 1, 2);
 
@@ -951,7 +1023,7 @@ fn actor_receive_body(actor: &ActorInfo, alloc: u32, hir: &Hir) -> Function {
         }
     }
 
-    f.instruction(&Instruction::Call(actor.receive.0));
+    f.instruction(&Instruction::Call(offset + actor.receive.0));
     f.instruction(&Instruction::GlobalSet(1));
     f.instruction(&Instruction::End);
     f
@@ -1070,6 +1142,73 @@ fn collect_block_strings(block: &Block, out: &mut Vec<String>) {
     }
 }
 
+fn collect_block_builtins(block: &Block, out: &mut Vec<Builtin>) {
+    walk_block(block, &mut |expr| {
+        if let ExprKind::CallBuiltin { builtin, .. } = &expr.kind {
+            out.push(*builtin);
+        }
+    });
+}
+
+/// Visits every expression in a block. Used by the builtin collector; the
+/// string collector predates it and keeps its own traversal.
+fn walk_block(block: &Block, visit: &mut impl FnMut(&Expr)) {
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Let { value, .. } | Stmt::AssignLocal { value, .. } | Stmt::Expr(value) => {
+                walk_expr(value, visit)
+            }
+            Stmt::Return(value) => {
+                if let Some(value) = value {
+                    walk_expr(value, visit);
+                }
+            }
+        }
+    }
+    if let Some(tail) = &block.tail {
+        walk_expr(tail, visit);
+    }
+}
+
+fn walk_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
+    visit(expr);
+    match &expr.kind {
+        ExprKind::Unary { expr, .. } => walk_expr(expr, visit),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            walk_expr(lhs, visit);
+            walk_expr(rhs, visit);
+        }
+        ExprKind::Call { args, .. }
+        | ExprKind::CallBuiltin { args, .. }
+        | ExprKind::MakeRecord { fields: args, .. }
+        | ExprKind::MakeVariant { fields: args, .. } => {
+            for arg in args {
+                walk_expr(arg, visit);
+            }
+        }
+        ExprKind::FieldGet { base, .. } => walk_expr(base, visit),
+        ExprKind::MakeOk(inner)
+        | ExprKind::MakeErr(inner)
+        | ExprKind::MakeSome(inner)
+        | ExprKind::Try { expr: inner, .. } => walk_expr(inner, visit),
+        ExprKind::If { cond, then_block, else_block } => {
+            walk_expr(cond, visit);
+            walk_block(then_block, visit);
+            if let Some(else_block) = else_block {
+                walk_expr(else_block, visit);
+            }
+        }
+        ExprKind::Match { scrutinee, arms, .. } => {
+            walk_expr(scrutinee, visit);
+            for arm in arms {
+                walk_expr(&arm.body, visit);
+            }
+        }
+        ExprKind::Block(block) => walk_block(block, visit),
+        _ => {}
+    }
+}
+
 fn collect_pattern_strings(pattern: &Pattern, out: &mut Vec<String>) {
     match pattern {
         Pattern::Str(text) => out.push(text.clone()),
@@ -1090,7 +1229,7 @@ fn collect_expr_strings(expr: &Expr, out: &mut Vec<String>) {
             collect_expr_strings(lhs, out);
             collect_expr_strings(rhs, out);
         }
-        ExprKind::Call { args, .. } => {
+        ExprKind::Call { args, .. } | ExprKind::CallBuiltin { args, .. } => {
             for arg in args {
                 collect_expr_strings(arg, out);
             }

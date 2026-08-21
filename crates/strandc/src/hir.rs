@@ -197,6 +197,9 @@ pub enum ExprKind {
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
 
     Call { func: FuncId, args: Vec<Expr> },
+    /// A call into the host ABI. Imports occupy the low function indices, so
+    /// codegen keeps these separate from ordinary calls.
+    CallBuiltin { builtin: Builtin, args: Vec<Expr> },
 
     MakeRecord { record: RecordId, fields: Vec<Expr> },
     /// Field index is resolved, so codegen just needs the offset.
@@ -216,6 +219,28 @@ pub enum ExprKind {
 
     /// `expr?` — on the error arm, returns from the enclosing function (§4.3).
     Try { expr: Box<Expr>, kind: TryKind },
+}
+
+/// Host functions callable from Strand (`docs/abi.md` §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Builtin {
+    /// `log(msg: string)` — writes through to the runtime's actor log.
+    Log,
+}
+
+impl Builtin {
+    pub fn name(self) -> &'static str {
+        match self {
+            Builtin::Log => "log",
+        }
+    }
+
+    /// The `(module, field)` pair this import is linked against.
+    pub fn import(self) -> (&'static str, &'static str) {
+        match self {
+            Builtin::Log => ("strand", "log"),
+        }
+    }
 }
 
 /// Which discriminated shape a `?` is unwrapping. Determines what the early

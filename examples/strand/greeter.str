@@ -1,0 +1,34 @@
+// A Strand actor that calls into the host ABI (§6 of docs/abi.md).
+//
+// `log` is a builtin, so the emitted module imports `strand.log`. Imports
+// occupy the low function indices, which is why adding them was a change to
+// codegen rather than an addition to it.
+
+type Seen = { count: int }
+
+type Greeting =
+  | Hello
+  | Bye
+
+actor Greeter {
+  state: Seen
+  message: Greeting
+
+  fn init(): Seen {
+    log("greeter: ready")
+    Seen { count: 0 }
+  }
+
+  fn receive(state: Seen, msg: Greeting): Seen {
+    match msg {
+      Hello => {
+        log("greeter: hello")
+        Seen { count: state.count + 1 }
+      },
+      Bye => {
+        log("greeter: goodbye")
+        Seen { count: state.count + 1 }
+      },
+    }
+  }
+}

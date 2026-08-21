@@ -844,6 +844,25 @@ impl Checker {
             return self.check_variant_call(sum, index, name, args, span);
         }
 
+        // Host builtins are not user functions and cannot be shadowed.
+        if name == "log" {
+            if args.len() != 1 {
+                self.error(span, "`log` takes exactly one argument");
+            }
+            let arg = args
+                .first()
+                .map(|a| self.check_expr(&a.value, Some(&Ty::Str)))
+                .unwrap_or(Expr { ty: Ty::Error, kind: ExprKind::Unit });
+            if !arg.ty.unifies(&Ty::Str) {
+                let found = self.show(&arg.ty);
+                self.error(span, format!("`log` takes a string, found {found}"));
+            }
+            return Expr {
+                ty: Ty::Unit,
+                kind: ExprKind::CallBuiltin { builtin: Builtin::Log, args: vec![arg] },
+            };
+        }
+
         let Some(signature) = self.signatures.get(name).cloned() else {
             self.error(span, format!("unknown function `{name}`"));
             for arg in args {

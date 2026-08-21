@@ -57,6 +57,14 @@ Pointer to `{ i32 len, bytes... }`, UTF-8, immutable. No interning in the POC.
 Guests import from module `strand` and export a small set of entry points.
 Established in M0, extended per milestone.
 
+Imports are emitted **only when the program calls them**, so a module that
+never touches the host stays standalone and can be instantiated with no imports
+at all. Because imports occupy the lowest function indices, every defined
+function shifts past them — that offset is applied once, in the emitter.
+
+Callable from Strand today: `log(msg: string)`. It takes a Strand string and
+unpacks §5's header into the `(ptr, len)` pair the host expects.
+
 Imports:
 
     strand.log(ptr: i32, len: i32)

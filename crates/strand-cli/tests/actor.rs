@@ -289,3 +289,76 @@ fn the_runtime_delivers_typed_messages() {
         trace.events().iter().filter(|e| matches!(e, Event::Delivered { to: 0, .. })).count();
     assert_eq!(delivered, 3, "all three typed messages arrive:\n{}", trace.render());
 }
+
+// ---- host builtins (docs/abi.md §6) ---------------------------------------
+
+#[test]
+fn a_strand_actor_can_call_the_host() {
+    // The module imports `strand.log`, so it can only run under the runtime —
+    // which is the point: Strand code reaching the host through the real ABI.
+    let (hir, wasm) = compile("greeter.str");
+    let message_ty = hir.actor.as_ref().unwrap().message.clone();
+    let payloads: Vec<Vec<u8>> = ["Hello", "Bye"]
+        .iter()
+        .map(|spec| strand_cli::encode::encode(&hir, &message_ty, spec).expect("encode"))
+        .collect();
+
+    let trace = sim::run(SimOptions::new(4), move |registry: Registry| async move {
+        let engine = engine()?;
+        let handle =
+            spawn_supervised(&engine, &registry, 0, "greeter", &wasm, Policy::Restart, None);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for bytes in payloads {
+            let _ = registry.send(0, Message::Blob { from: HOST, bytes });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = registry.send(0, Message::Stop);
+        let _ = handle.await;
+        Ok(())
+    })
+    .expect("simulation failed");
+
+    let logged: Vec<String> = trace
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Logged { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        logged,
+        vec!["greeter: ready", "greeter: hello", "greeter: goodbye"],
+        "init and both handlers should reach the host log"
+    );
+}
+
+#[test]
+fn only_used_builtins_are_imported() {
+    // A module that never calls the host must stay import-free, or it could not
+    // be instantiated standalone — which the golden suite relies on.
+    let (_, plain) = compile("counter.str");
+    let (_, logging) = compile("greeter.str");
+
+    let imports = |wasm: &[u8]| {
+        wasmparser::Parser::new(0)
+            .parse_all(wasm)
+            .filter_map(|payload| match payload {
+                Ok(wasmparser::Payload::ImportSection(section)) => Some(section.count()),
+                _ => None,
+            })
+            .sum::<u32>()
+    };
+    assert_eq!(imports(&plain), 0, "counter.str calls no host functions");
+    assert_eq!(imports(&logging), 1, "greeter.str imports exactly strand.log");
+}
+
+#[test]
+fn log_rejects_a_non_string() {
+    let source = "fn main(): int { log(1) 0 }";
+    let program = strandc::parser::parse(source).expect("should parse");
+    let errors = strandc::check::check(&program).expect_err("should not check");
+    let text: Vec<String> = errors.iter().map(|e| e.message.clone()).collect();
+    assert!(text.join(" | ").contains("`log` takes a string"), "was: {text:?}");
+}
