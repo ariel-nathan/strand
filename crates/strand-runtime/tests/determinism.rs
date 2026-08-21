@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use strand_runtime::sim::{self, SimOptions};
-use strand_runtime::{engine, spawn_actor, Event, Message, Registry, Trace};
+use strand_runtime::{engine, spawn_actor, Event, Message, Registry, Trace, Wiring};
 
 const ACTORS: [(u32, &str, &str); 3] = [
     (0, "ping", "ping.wat"),
@@ -28,6 +28,11 @@ fn wat(file: &str) -> String {
 /// The M0 scenario, driven through the simulated scheduler.
 async fn ping_pong(registry: Registry) -> Result<()> {
     let engine = engine()?;
+    // The two fixtures name a port of their own and know nothing else; that
+    // ping's out port 0 arrives at pong is decided here, the way an `app`
+    // block decides it for compiled Strand.
+    registry.route_out(0, vec![Some(Wiring { to: 1, port: 0 })]);
+    registry.route_out(1, vec![Some(Wiring { to: 0, port: 0 })]);
     let mut handles = Vec::new();
     for (id, name, file) in ACTORS {
         handles.push(spawn_actor(&engine, &registry, id, name, wat(file).as_bytes()).await?);

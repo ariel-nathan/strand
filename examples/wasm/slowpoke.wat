@@ -20,7 +20,7 @@
     (global.set $bump (i32.add (global.get $bump) (local.get $n)))
     (local.get $p))
 
-  (func (export "strand_on_message") (param $ptr i32) (param $len i32)
+  (func (export "strand_on_message") (param $port i32) (param $ptr i32) (param $len i32)
     (call $sleep (i64.const 40))
     ;; One more 64K page held for the rest of this life — and handed straight
     ;; back on restart, because the arena goes with the actor (§5.1).

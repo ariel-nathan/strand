@@ -243,8 +243,9 @@ fn an_actor_nests_its_members() {
 type Count = { total: int }
 actor Counter {
   state: Count
+  in inbox: string
   fn init(): Count { Count { total: 0 } }
-  fn receive(state: Count, msg: string): Count { state }
+  on inbox(state: Count, msg: string): Count { state }
 }
 ";
     let symbols = Document::new(src).symbols();
@@ -252,7 +253,7 @@ actor Counter {
 
     let members = actor.children.as_ref().expect("members");
     let names: Vec<&str> = members.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["init", "receive"]);
+    assert_eq!(names, ["init", "inbox"], "a handler is listed under its port's name");
 }
 
 #[test]

@@ -16,6 +16,7 @@ pub enum Item {
     Fn(FnDecl),
     Type(TypeDecl),
     Actor(ActorDecl),
+    App(AppDecl),
 }
 
 /// An actor declaration (§5.1). Elm-shaped, as §6.5 describes: the handler
@@ -24,22 +25,95 @@ pub enum Item {
 /// ```text
 /// actor Counter {
 ///   state: Count
+///   in  bumps: Bump
+///   out total: Total
 ///   fn init(): Count { ... }
-///   fn receive(state: Count, msg: string): Count { ... }
+///   on bumps(state: Count, msg: Bump): Count { ... }
 /// }
 /// ```
+///
+/// An actor names its channels rather than holding addresses: `in` is what it
+/// can be told, `out` is what it can say, and the `app` block decides which
+/// out meets which in. Nothing in an actor knows who is on the other end,
+/// which is what §9.5 means by location transparency — and why there is no
+/// actor address anywhere in the language.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActorDecl {
     pub name: String,
     /// Just the name, where `span` covers the whole declaration.
     pub name_span: Span,
     pub state: TypeExpr,
-    /// `message: T` declares the channel's payload type. Defaults to `string`.
-    pub message: Option<TypeExpr>,
+    /// `in <name>: T` — a channel this actor receives on. Each needs an `on`
+    /// handler of the same name.
+    pub inbox: Vec<Port>,
+    /// `out <name>: T` — a channel this actor sends on, via `send(<name>, v)`.
+    pub outbox: Vec<Port>,
     pub init: FnDecl,
-    pub receive: FnDecl,
+    /// `on <port>(state, msg): State`, one per `in` port. The `FnDecl`'s name
+    /// is the port's.
+    pub handlers: Vec<FnDecl>,
     /// `view fn view(state) -> Node`, when the actor draws itself (§6.2).
     pub view: Option<FnDecl>,
+    pub span: Span,
+}
+
+/// One `in` or `out` declaration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Port {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: TypeExpr,
+    pub span: Span,
+}
+
+/// `app Name { ... }` — the supervision tree (§7), written down.
+///
+/// ```text
+/// app Todo {
+///   ui    = TodoUi
+///   stats = Stats
+///   ui.stats     -> stats.commands
+///   stats.tally  -> ui.tally
+/// }
+/// ```
+///
+/// It is in the source rather than in a config file because the wiring is
+/// typed and the compiler is the thing that can check it (§8.1 asks for zero
+/// config files, and a wiring the compiler cannot see is a wiring that fails
+/// at run time).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub instances: Vec<Instance>,
+    pub wires: Vec<WireDecl>,
+    pub span: Span,
+}
+
+/// `ui = TodoUi` — one running actor, and the name the wires call it by.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Instance {
+    pub name: String,
+    pub name_span: Span,
+    pub actor: String,
+    pub actor_span: Span,
+    pub span: Span,
+}
+
+/// `ui.stats -> stats.commands`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WireDecl {
+    pub from: PortRef,
+    pub to: PortRef,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PortRef {
+    pub instance: String,
+    pub instance_span: Span,
+    pub port: String,
+    pub port_span: Span,
     pub span: Span,
 }
 

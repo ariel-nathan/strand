@@ -450,13 +450,14 @@ fn an_actor_may_declare_a_view() {
         type Count = { total: int }
         actor Counter {
           state: Count
+          in inbox: string
           fn init(): Count { Count { total: 0 } }
-          fn receive(state: Count, msg: string): Count { state }
+          on inbox(state: Count, msg: string): Count { state }
           view fn draw(state: Count): Node { text("counter") }
         }
         "#,
     );
-    let actor = hir.actor.expect("an actor was declared");
+    let actor = hir.lone_actor().expect("an actor was declared").clone();
     assert!(actor.view.is_some(), "and it draws itself");
 }
 
@@ -467,8 +468,9 @@ fn an_actors_view_takes_only_its_state() {
         type Count = { total: int }
         actor Counter {
           state: Count
+          in inbox: string
           fn init(): Count { Count { total: 0 } }
-          fn receive(state: Count, msg: string): Count { state }
+          on inbox(state: Count, msg: string): Count { state }
           view fn draw(state: Count, extra: int): Node { text("counter") }
         }
         "#,
@@ -494,9 +496,9 @@ fn an_actor_that_asks_for_input_gets_the_platform_type() {
         type Model = { tab: int }
         actor App {
           state: Model
-          message: Input
+          in inbox: Input
           fn init(): Model { Model { tab: 0 } }
-          fn receive(state: Model, msg: Input): Model {
+          on inbox(state: Model, msg: Input): Model {
             match msg {
               Click(id) => Model { tab: id },
               Scrolled(id, offset) => state,
@@ -540,9 +542,9 @@ fn a_module_can_declare_its_own_input_type() {
         type Model = { tab: int }
         actor App {
           state: Model
-          message: Input
+          in inbox: Input
           fn init(): Model { Model { tab: 0 } }
-          fn receive(state: Model, msg: Input): Model {
+          on inbox(state: Model, msg: Input): Model {
             match msg {
               Tap(id) => Model { tab: id },
             }
@@ -562,9 +564,9 @@ fn a_match_on_input_must_still_be_exhaustive() {
         type Model = { tab: int }
         actor App {
           state: Model
-          message: Input
+          in inbox: Input
           fn init(): Model { Model { tab: 0 } }
-          fn receive(state: Model, msg: Input): Model {
+          on inbox(state: Model, msg: Input): Model {
             match msg {
               Click(id) => Model { tab: id },
             }
@@ -585,12 +587,12 @@ fn an_actor_with_a_view_records_it() {
         type Model = { tab: int }
         actor App {
           state: Model
-          message: Input
+          in inbox: Input
           fn init(): Model { Model { tab: 0 } }
-          fn receive(state: Model, msg: Input): Model { state }
+          on inbox(state: Model, msg: Input): Model { state }
           view fn draw(state: Model): Node { text("app") }
         }
         "#,
     );
-    assert!(hir.actor.expect("an actor").view.is_some());
+    assert!(hir.lone_actor().expect("an actor").view.is_some());
 }

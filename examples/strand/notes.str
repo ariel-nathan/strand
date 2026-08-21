@@ -91,7 +91,7 @@ view fn note(body: string): Node {
 
 actor Notes {
   state: Model
-  message: Input
+  in input: Input
 
   fn init(): Model {
     Model {
@@ -104,7 +104,7 @@ actor Notes {
     }
   }
 
-  fn receive(state: Model, msg: Input): Model {
+  on input(state: Model, msg: Input): Model {
     match msg {
       // The character the user meant, as a scalar value — a message carries no
       // pointers, so it cannot be a string until this side of the boundary.

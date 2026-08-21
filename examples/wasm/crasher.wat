@@ -24,7 +24,7 @@
   (func (export "strand_main")
     (call $log (i32.const 64) (i32.const 11)))
 
-  (func (export "strand_on_message") (param $ptr i32) (param $len i32)
+  (func (export "strand_on_message") (param $port i32) (param $ptr i32) (param $len i32)
     ;; 'B' is 66: the BOOM message kills this actor and nothing else.
     (if (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 66))
       (then (unreachable)))

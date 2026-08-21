@@ -47,26 +47,68 @@ pub fn analyze(program: &ast::Program) -> (Hir, Analysis, Vec<Diagnostic>) {
     let mut cx = Checker::default();
     cx.collect_types(program);
     cx.collect_signatures(program);
-    cx.collect_actor(program);
+    cx.collect_actors(program);
     cx.check_bodies(program);
+    // Last: a wire names ports, and ports are only known once every actor has
+    // been collected.
+    cx.collect_app(program);
     (cx.hir, cx.analysis, cx.errors)
 }
 
-/// Every function in the module, whether top-level or inside an actor.
-fn fn_decls(program: &ast::Program) -> Vec<&ast::FnDecl> {
+/// Every function in the module, paired with the key it is known by.
+///
+/// An actor's own functions are qualified with the actor's name, because two
+/// actors in one file both declaring `init` — or both handling a port called
+/// `input` — is the ordinary case rather than a clash. The qualification is
+/// internal: `Func::name` keeps the name as written, since that is the one a
+/// diagnostic should say back.
+fn fn_decls(program: &ast::Program) -> Vec<(String, &ast::FnDecl, Option<&str>)> {
     let mut out = Vec::new();
     for item in &program.items {
         match item {
-            ast::Item::Fn(decl) => out.push(decl),
+            ast::Item::Fn(decl) => out.push((decl.name.clone(), decl, None)),
             ast::Item::Actor(decl) => {
-                out.push(&decl.init);
-                out.push(&decl.receive);
-                out.extend(decl.view.as_ref());
+                let owner = decl.name.as_str();
+                out.push((qualified(owner, &decl.init.name), &decl.init, Some(owner)));
+                for handler in &decl.handlers {
+                    out.push((qualified(owner, &handler.name), handler, Some(owner)));
+                }
+                if let Some(view) = &decl.view {
+                    out.push((qualified(owner, &view.name), view, Some(owner)));
+                }
             }
-            ast::Item::Type(_) => {}
+            ast::Item::Type(_) | ast::Item::App(_) => {}
         }
     }
     out
+}
+
+/// How an actor's own functions are keyed in the signature table.
+fn qualified(actor: &str, name: &str) -> String {
+    format!("{actor}.{name}")
+}
+
+/// Which end of a channel a name is being looked up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    In,
+    Out,
+}
+
+impl Direction {
+    fn word(self) -> &'static str {
+        match self {
+            Direction::In => "in",
+            Direction::Out => "out",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Direction::In => "receives",
+            Direction::Out => "sends",
+        }
+    }
 }
 
 /// The Strand type a prop argument must have.
@@ -126,6 +168,9 @@ struct Checker {
     /// only here, which is what confines a node's lifetime to the expression
     /// that built it.
     in_view: bool,
+    /// Which actor owns the body being checked, when one does. `send` names a
+    /// port, and only this actor's ports are in scope.
+    sender: Option<usize>,
     /// Position-indexed facts for editors. Codegen ignores these; they exist so
     /// hover and go-to-definition do not need a second resolver.
     analysis: Analysis,
@@ -138,7 +183,13 @@ struct Checker {
 
 impl Default for Hir {
     fn default() -> Self {
-        Hir { records: Vec::new(), sums: Vec::new(), funcs: Vec::new(), actor: None }
+        Hir {
+            records: Vec::new(),
+            sums: Vec::new(),
+            funcs: Vec::new(),
+            actors: Vec::new(),
+            app: None,
+        }
     }
 }
 
@@ -257,7 +308,7 @@ impl Checker {
 
     /// Declares the platform's `Input` type, if this module asked for it.
     ///
-    /// Asking means writing `message: Input` on an actor. That is the whole
+    /// Asking means naming `Input` as the type of a port. That is the whole
     /// opt-in, and it matters because registering the type also registers
     /// `Click`, `Enter` and the rest as constructors — ordinary names a UI
     /// program might want for itself. A file that never mentions `Input`
@@ -266,11 +317,10 @@ impl Checker {
     /// it never asked for.
     fn collect_platform_input(&mut self, program: &ast::Program) {
         let asked = program.items.iter().any(|item| match item {
-            ast::Item::Actor(decl) => matches!(
-                &decl.message,
-                Some(ast::TypeExpr::Named { name, args, .. })
-                    if name == input::TYPE_NAME && args.is_empty()
-            ),
+            ast::Item::Actor(decl) => decl.inbox.iter().chain(&decl.outbox).any(|port| {
+                matches!(&port.ty, ast::TypeExpr::Named { name, args, .. }
+                    if name == input::TYPE_NAME && args.is_empty())
+            }),
             _ => false,
         });
         let declared_here = program.items.iter().any(|item| {
@@ -310,8 +360,8 @@ impl Checker {
     }
 
     fn collect_signatures(&mut self, program: &ast::Program) {
-        for decl in fn_decls(program) {
-            if self.signatures.contains_key(&decl.name) {
+        for (key, decl, _) in fn_decls(program) {
+            if self.signatures.contains_key(&key) {
                 self.error(decl.span, format!("function `{}` is declared twice", decl.name));
                 continue;
             }
@@ -324,7 +374,7 @@ impl Checker {
             self.check_view_signature(decl, &params, &ret);
             let id = FuncId(self.signatures.len() as u32);
             self.signatures.insert(
-                decl.name.clone(),
+                key,
                 Signature { id, params, ret, is_view: decl.is_view, def_span: decl.name_span },
             );
         }
@@ -446,31 +496,40 @@ impl Checker {
         }
     }
 
-    /// Validates the actor shape and records what codegen needs (§5.1).
-    fn collect_actor(&mut self, program: &ast::Program) {
-        let mut seen: Option<&ast::ActorDecl> = None;
+    /// Validates every actor's shape and records what codegen needs (§5.1).
+    fn collect_actors(&mut self, program: &ast::Program) {
         for item in &program.items {
             let ast::Item::Actor(decl) = item else { continue };
-            if let Some(first) = seen {
+            if self.hir.actors.iter().any(|a| a.name == decl.name) {
                 self.error(
-                    decl.span,
-                    format!(
-                        "a module declares at most one actor; `{}` is already declared",
-                        first.name
-                    ),
+                    decl.name_span,
+                    format!("actor `{}` is declared twice", decl.name),
                 );
                 continue;
             }
-            seen = Some(decl);
 
             let state = self.resolve_ty(&decl.state);
-            let message = match &decl.message {
-                Some(ty) => self.resolve_ty(ty),
-                None => Ty::Str,
+            let inbox = self.collect_ports(&decl.inbox);
+            let outbox = self.collect_ports(&decl.outbox);
+
+            // One namespace for both directions. They are different channels,
+            // but `send(counts, ...)` and `on counts(...)` sitting in one actor
+            // and meaning different ports is a reading trap with nothing on the
+            // other side of it.
+            let mut names: Vec<&str> = Vec::new();
+            for port in decl.inbox.iter().chain(&decl.outbox) {
+                if names.contains(&port.name.as_str()) {
+                    self.error(
+                        port.name_span,
+                        format!("port `{}` is declared twice", port.name),
+                    );
+                }
+                names.push(&port.name);
+            }
+
+            let Some(init) = self.signatures.get(&qualified(&decl.name, "init")).cloned() else {
+                continue;
             };
-            self.check_message_is_flat(&message, decl.span);
-            let Some(init) = self.signatures.get("init").cloned() else { continue };
-            let Some(receive) = self.signatures.get("receive").cloned() else { continue };
 
             if !init.params.is_empty() {
                 self.error(decl.init.span, "`init` takes no parameters");
@@ -483,41 +542,68 @@ impl Checker {
                 );
             }
 
-            match receive.params.as_slice() {
-                [(_, first), (_, second)] => {
-                    if !first.unifies(&state) {
-                        let (found, want) = (self.show(first), self.show(&state));
-                        self.error(
-                            decl.receive.span,
-                            format!("`receive` takes the state {want} first, found {found}"),
-                        );
-                    }
-                    if !second.unifies(&message) {
-                        let (found, want) = (self.show(second), self.show(&message));
-                        self.error(
-                            decl.receive.span,
-                            format!("`receive` takes the message as {want}, found {found}"),
-                        );
-                    }
-                }
-                _ => self.error(
-                    decl.receive.span,
-                    "`receive` takes exactly the state and the message",
-                ),
+            // Every `in` port needs its handler, and every handler needs its
+            // port. Either half alone is a channel that silently does nothing.
+            let mut handlers = Vec::new();
+            for (index, port) in decl.inbox.iter().enumerate() {
+                let Some(handler) = decl.handlers.iter().find(|h| h.name == port.name) else {
+                    self.error_labeled(
+                        port.span,
+                        format!("port `{}` has no handler", port.name),
+                        "nothing receives on this port",
+                        format!(
+                            "add `on {}(state: {}, msg: {}): {}` — a port without a \
+                             handler is a channel whose messages go nowhere",
+                            port.name,
+                            self.show(&state),
+                            self.show(&inbox[index].ty),
+                            self.show(&state),
+                        ),
+                    );
+                    continue;
+                };
+                let Some(signature) =
+                    self.signatures.get(&qualified(&decl.name, &handler.name)).cloned()
+                else {
+                    continue;
+                };
+                self.check_handler(handler, &signature, &state, &inbox[index].ty, &port.name);
+                handlers.push(signature.id);
             }
-
-            if !receive.ret.unifies(&state) {
-                let (found, want) = (self.show(&receive.ret), self.show(&state));
-                self.error(
-                    decl.receive.span,
-                    format!("`receive` must return the next state {want}, found {found}"),
-                );
+            for handler in &decl.handlers {
+                if !decl.inbox.iter().any(|port| port.name == handler.name) {
+                    let known: Vec<&str> =
+                        decl.inbox.iter().map(|port| port.name.as_str()).collect();
+                    let help = if known.is_empty() {
+                        format!(
+                            "this actor declares no `in` ports — add `in {}: SomeType` \
+                             above",
+                            handler.name
+                        )
+                    } else {
+                        format!("this actor receives on: {}", known.join(", "))
+                    };
+                    self.error_labeled(
+                        handler.name_span,
+                        format!("`{}` is not a port on this actor", handler.name),
+                        "no such port",
+                        help,
+                    );
+                }
+            }
+            // A handler is only reached through its port, so one that failed
+            // the check above would leave `handlers` short and misalign every
+            // port after it. Refusing to record the actor at all is better than
+            // recording one whose port indices lie.
+            if handlers.len() != decl.inbox.len() {
+                continue;
             }
 
             // A UI actor is one that declares how to draw itself. Everything
             // else about it — mailbox, state, supervision — is unchanged.
             let view = decl.view.as_ref().and_then(|view_decl| {
-                let signature = self.signatures.get(&view_decl.name).cloned()?;
+                let signature =
+                    self.signatures.get(&qualified(&decl.name, &view_decl.name)).cloned()?;
                 match signature.params.as_slice() {
                     [(_, only)] if only.unifies(&state) => {}
                     _ => {
@@ -534,15 +620,250 @@ impl Checker {
                 Some(signature.id)
             });
 
-            self.hir.actor = Some(ActorInfo {
+            self.hir.actors.push(ActorInfo {
                 name: decl.name.clone(),
                 state,
-                message,
+                inbox,
+                outbox,
                 init: init.id,
-                receive: receive.id,
+                handlers,
                 view,
             });
         }
+    }
+
+    /// Resolves a run of port declarations, enforcing §7's flatness rule on
+    /// each: what crosses a channel is copied into another arena, so a payload
+    /// holding a pointer would arrive meaning nothing.
+    fn collect_ports(&mut self, ports: &[ast::Port]) -> Vec<PortInfo> {
+        ports
+            .iter()
+            .map(|port| {
+                let ty = self.resolve_ty(&port.ty);
+                self.check_message_is_flat(&ty, port.span);
+                PortInfo { name: port.name.clone(), ty }
+            })
+            .collect()
+    }
+
+    /// `on <port>(state, msg): State` — the shape §6.5 asks for, checked
+    /// against the port it is named after rather than against a convention.
+    fn check_handler(
+        &mut self,
+        decl: &ast::FnDecl,
+        signature: &Signature,
+        state: &Ty,
+        message: &Ty,
+        port: &str,
+    ) {
+        match signature.params.as_slice() {
+            [(_, first), (_, second)] => {
+                if !first.unifies(state) {
+                    let (found, want) = (self.show(first), self.show(state));
+                    self.error(
+                        decl.span,
+                        format!("`on {port}` takes the state {want} first, found {found}"),
+                    );
+                }
+                if !second.unifies(message) {
+                    let (found, want) = (self.show(second), self.show(message));
+                    self.error(
+                        decl.span,
+                        format!(
+                            "`on {port}` receives {want}, which is what the port \
+                             carries, found {found}"
+                        ),
+                    );
+                }
+            }
+            _ => self.error_labeled(
+                decl.span,
+                format!("`on {port}` takes exactly the state and the message"),
+                "wrong parameters",
+                format!(
+                    "write `on {port}(state: {}, msg: {}): {}`",
+                    self.show(state),
+                    self.show(message),
+                    self.show(state),
+                ),
+            ),
+        }
+
+        if !signature.ret.unifies(state) {
+            let (found, want) = (self.show(&signature.ret), self.show(state));
+            self.error(
+                decl.span,
+                format!("`on {port}` must return the next state {want}, found {found}"),
+            );
+        }
+    }
+
+    /// Resolves `app Name { ... }` into instances and wires (§7).
+    ///
+    /// Everything here is a name that has to mean something: an instance names
+    /// an actor the file declares, and each half of a wire names a port that
+    /// actor has. None of it survives into the running program as a name — the
+    /// runtime is handed indices — so this is the only place the mistakes are
+    /// catchable.
+    fn collect_app(&mut self, program: &ast::Program) {
+        let mut seen: Option<&ast::AppDecl> = None;
+        for item in &program.items {
+            let ast::Item::App(decl) = item else { continue };
+            if let Some(first) = seen {
+                self.error(
+                    decl.name_span,
+                    format!("a file declares at most one app; `{}` is already declared", first.name),
+                );
+                continue;
+            }
+            seen = Some(decl);
+
+            let mut instances: Vec<InstanceInfo> = Vec::new();
+            for instance in &decl.instances {
+                if instances.iter().any(|i| i.name == instance.name) {
+                    self.error(
+                        instance.name_span,
+                        format!("`{}` is already running in this app", instance.name),
+                    );
+                    continue;
+                }
+                let Some(actor) =
+                    self.hir.actors.iter().position(|a| a.name == instance.actor)
+                else {
+                    let known: Vec<&str> =
+                        self.hir.actors.iter().map(|a| a.name.as_str()).collect();
+                    let help = if known.is_empty() {
+                        "this file declares no actors".to_string()
+                    } else {
+                        format!("this file declares: {}", known.join(", "))
+                    };
+                    self.error_labeled(
+                        instance.actor_span,
+                        format!("unknown actor `{}`", instance.actor),
+                        "no such actor",
+                        help,
+                    );
+                    continue;
+                };
+                instances.push(InstanceInfo { name: instance.name.clone(), actor });
+            }
+
+            let mut wires: Vec<Wire> = Vec::new();
+            for wire in &decl.wires {
+                let Some(from) = self.resolve_port_ref(&instances, &wire.from, Direction::Out)
+                else {
+                    continue;
+                };
+                let Some(to) = self.resolve_port_ref(&instances, &wire.to, Direction::In) else {
+                    continue;
+                };
+
+                let out_ty = self.hir.actors[instances[from.0].actor].outbox[from.1].ty.clone();
+                let in_ty = self.hir.actors[instances[to.0].actor].inbox[to.1].ty.clone();
+                if !out_ty.unifies(&in_ty) {
+                    let (sent, taken) = (self.show(&out_ty), self.show(&in_ty));
+                    self.error_labeled(
+                        wire.span,
+                        format!("this wire carries {sent} into a port that takes {taken}"),
+                        "the two ends disagree",
+                        "both halves of a channel are declared, so the compiler can \
+                         say so here rather than the receiver reading nonsense (§5.3)",
+                    );
+                    continue;
+                }
+                if wires.iter().any(|w| w.from == from.0 && w.from_port == from.1) {
+                    self.error_labeled(
+                        wire.from.span,
+                        format!("`{}.{}` is already wired", wire.from.instance, wire.from.port),
+                        "a second destination",
+                        "an out port is one channel with one far end; give the actor \
+                         a second `out` port to send two places",
+                    );
+                    continue;
+                }
+                wires.push(Wire { from: from.0, from_port: from.1, to: to.0, to_port: to.1 });
+            }
+
+            // An out port nobody wired is a `send` that vanishes. §8.2 says a
+            // diagnostic is a product surface, and "your messages went nowhere"
+            // discovered at run time is the opposite of one.
+            let mut dangling: Vec<(String, String)> = Vec::new();
+            for (index, instance) in instances.iter().enumerate() {
+                let actor = &self.hir.actors[instance.actor];
+                for (port, info) in actor.outbox.iter().enumerate() {
+                    if wires.iter().any(|w| w.from == index && w.from_port == port) {
+                        continue;
+                    }
+                    dangling.push((instance.name.clone(), info.name.clone()));
+                }
+            }
+            for (name, port_name) in dangling {
+                self.error_labeled(
+                    decl.name_span,
+                    format!("`{name}.{port_name}` is not wired to anything"),
+                    "an out port with no far end",
+                    format!(
+                        "add `{name}.{port_name} -> someone.somePort`, or drop the \
+                         `out {port_name}` declaration — as written, everything \
+                         sent on it would be discarded"
+                    ),
+                );
+            }
+
+            self.hir.app =
+                Some(AppInfo { name: decl.name.clone(), instances, wires });
+        }
+    }
+
+    /// One half of a wire: which instance, and which of its ports.
+    fn resolve_port_ref(
+        &mut self,
+        instances: &[InstanceInfo],
+        reference: &ast::PortRef,
+        direction: Direction,
+    ) -> Option<(usize, usize)> {
+        let Some(index) = instances.iter().position(|i| i.name == reference.instance) else {
+            let known: Vec<&str> = instances.iter().map(|i| i.name.as_str()).collect();
+            let help = if known.is_empty() {
+                "this app runs no actors yet — write `name = SomeActor` first".to_string()
+            } else {
+                format!("this app runs: {}", known.join(", "))
+            };
+            self.error_labeled(
+                reference.instance_span,
+                format!("`{}` is not running in this app", reference.instance),
+                "unknown name",
+                help,
+            );
+            return None;
+        };
+        let actor = &self.hir.actors[instances[index].actor];
+        let (found, known) = match direction {
+            Direction::Out => (
+                actor.out_port(&reference.port),
+                actor.outbox.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ),
+            Direction::In => (
+                actor.in_port(&reference.port),
+                actor.inbox.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ),
+        };
+        let Some(port) = found else {
+            let (actor_name, word) = (actor.name.clone(), direction.word());
+            let help = if known.is_empty() {
+                format!("`{actor_name}` declares no `{word}` ports")
+            } else {
+                format!("`{actor_name}` {} on: {}", direction.verb(), known.join(", "))
+            };
+            self.error_labeled(
+                reference.port_span,
+                format!("`{actor_name}` has no `{word}` port called `{}`", reference.port),
+                "no such port",
+                help,
+            );
+            return None;
+        };
+        Some((index, port))
     }
 
     /// Resolves a written type, recording what it resolved to.
@@ -644,23 +965,28 @@ impl Checker {
 
     fn check_bodies(&mut self, program: &ast::Program) {
         // Emit functions in signature id order so FuncId indexes `hir.funcs`.
-        let mut decls: Vec<&ast::FnDecl> = Vec::new();
-        for decl in fn_decls(program) {
+        let mut decls: Vec<(String, &ast::FnDecl, Option<&str>)> = Vec::new();
+        for (key, decl, owner) in fn_decls(program) {
             // Only the first declaration of a name owns the id; a duplicate has
             // already been reported and emits no body.
-            let is_first = !decls.iter().any(|d: &&ast::FnDecl| d.name == decl.name);
-            if is_first && self.signatures.contains_key(&decl.name) {
-                decls.push(decl);
+            let is_first = !decls.iter().any(|(seen, _, _)| *seen == key);
+            if is_first && self.signatures.contains_key(&key) {
+                decls.push((key, decl, owner));
             }
         }
-        decls.sort_by_key(|d| self.signatures[&d.name].id.0);
+        decls.sort_by_key(|(key, _, _)| self.signatures[key].id.0);
 
-        for decl in decls {
-            let signature = self.signatures[&decl.name].clone();
+        for (key, decl, owner) in decls {
+            let signature = self.signatures[&key].clone();
             self.scopes.clear();
             self.locals.clear();
             self.ret_ty = signature.ret.clone();
             self.in_view = signature.is_view;
+            // `send` names a port, and a port belongs to an actor. Only the
+            // actor's own functions are inside one, which is exactly the set
+            // that may send.
+            self.sender = owner
+                .and_then(|name| self.hir.actors.iter().position(|a| a.name == name));
 
             self.scopes.push(HashMap::new());
             // `signature.params` carries no spans; the declaration it was built
@@ -1640,6 +1966,10 @@ impl Checker {
         }
 
         // Host builtins are not user functions and cannot be shadowed.
+        if name == "send" {
+            return self.check_send(args, span);
+        }
+
         if name == "log" {
             if args.len() != 1 {
                 self.error(span, "`log` takes exactly one argument");
@@ -1887,6 +2217,96 @@ impl Checker {
                     ty: Ty::Record(id),
                 }),
             },
+        }
+    }
+
+    /// `send(port, value)` — put a value on one of this actor's out ports.
+    ///
+    /// The port is a name rather than an address. Nothing in the language can
+    /// name another actor, so an actor cannot reach one it was not wired to,
+    /// and "who is on the other end" stays the `app` block's question (§9.5).
+    fn check_send(&mut self, args: &[ast::Arg], span: Span) -> Expr {
+        let unit = Expr { ty: Ty::Unit, kind: ExprKind::Unit };
+        if args.len() != 2 {
+            self.error_labeled(
+                span,
+                "`send` takes a port and a value",
+                "wrong arguments",
+                "write `send(somePort, SomeMessage(...))`, naming one of the actor's \n                 `out` ports",
+            );
+            for arg in args {
+                self.check_expr(&arg.value, None);
+            }
+            return unit;
+        }
+
+        let ast::Expr::Ident { name: port, span: port_span } = &args[0].value else {
+            self.error_labeled(
+                args[0].value.span(),
+                "the first argument to `send` is a port name",
+                "not a port",
+                "ports are named where the actor declares them, and the name is \n                 written literally — there is no value that stands for a channel",
+            );
+            self.check_expr(&args[1].value, None);
+            return unit;
+        };
+
+        // A view is a pure function of state (§6.5), and Tier-1 hot reload
+        // (§8.3) rests on re-running one being free of consequences.
+        if self.in_view {
+            self.error_labeled(
+                span,
+                "a view cannot send",
+                "not allowed here",
+                "a view is a pure function of state (§6.5) — the platform re-runs \n                 it whenever it likes, so sending from one would send again each \n                 time. Send from the handler that changed the state.",
+            );
+            self.check_expr(&args[1].value, None);
+            return unit;
+        }
+
+        let Some(actor) = self.sender else {
+            self.error_labeled(
+                span,
+                "`send` only works inside an actor",
+                "no ports in scope",
+                "a port belongs to the actor that declares it, so a plain `fn` has \n                 none to name — send from the actor's `on` handler and pass this \n                 function whatever it needs to compute",
+            );
+            self.check_expr(&args[1].value, None);
+            return unit;
+        };
+
+        let Some(index) = self.hir.actors[actor].out_port(port) else {
+            let known: Vec<&str> =
+                self.hir.actors[actor].outbox.iter().map(|p| p.name.as_str()).collect();
+            let actor_name = self.hir.actors[actor].name.clone();
+            let help = if known.is_empty() {
+                format!("`{actor_name}` declares no `out` ports — add `out {port}: SomeType`")
+            } else {
+                format!("`{actor_name}` sends on: {}", known.join(", "))
+            };
+            self.error_labeled(
+                *port_span,
+                format!("`{actor_name}` has no `out` port called `{port}`"),
+                "no such port",
+                help,
+            );
+            self.check_expr(&args[1].value, None);
+            return unit;
+        };
+
+        let want = self.hir.actors[actor].outbox[index].ty.clone();
+        let value = self.check_expr(&args[1].value, Some(&want));
+        if !value.ty.unifies(&want) {
+            let (found, want) = (self.show(&value.ty), self.show(&want));
+            self.error(
+                args[1].value.span(),
+                format!("`{port}` carries {want}, found {found}"),
+            );
+        }
+
+        Expr {
+            ty: Ty::Unit,
+            kind: ExprKind::Send { port: index as u32, value: Box::new(value) },
         }
     }
 

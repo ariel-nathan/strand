@@ -36,7 +36,7 @@ fn wat(file: &str) -> String {
 }
 
 fn poke(registry: &Registry, to: u32, bytes: &[u8]) {
-    let _ = registry.send(to, Message::Blob { from: HOST, bytes: bytes.to_vec() });
+    let _ = registry.send(to, Message::Blob { from: HOST, port: 0, bytes: bytes.to_vec() });
 }
 
 fn row(stats: &[ActorStats], name: &str) -> ActorStats {

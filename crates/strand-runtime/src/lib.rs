@@ -44,8 +44,14 @@ pub const HOST: ActorId = u32::MAX;
 /// buffer-transfer variants land in M2.
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// A payload produced by guest code, tagged with its sender.
-    Blob { from: ActorId, bytes: Vec<u8> },
+    /// A payload produced by guest code, tagged with its sender and with the
+    /// receiver's port — which channel of theirs it arrived on.
+    ///
+    /// The port is resolved before the message is sent, by the wiring the
+    /// `app` block declared: the sender named a port of its own, and the
+    /// address book turned that into a destination and a port there. Neither
+    /// actor ever holds the other's identity.
+    Blob { from: ActorId, port: u32, bytes: Vec<u8> },
     /// Asks the actor to shut down cleanly after draining.
     Stop,
     /// §5.4: delivered to the parent when a child dies. Host-side supervisors
@@ -299,6 +305,13 @@ impl Default for SimConfig {
     }
 }
 
+/// Where one actor's out port leads: whose mailbox, and which of their ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wiring {
+    pub to: ActorId,
+    pub port: u32,
+}
+
 /// Shared address book. Actors hold senders, never each other's memory.
 #[derive(Clone)]
 pub struct Registry {
@@ -312,6 +325,10 @@ pub struct Registry {
     /// `spawn_supervised`'s arguments because "where does this actor's output
     /// go" is the address book's question, and it is already the address book.
     frames: Arc<Mutex<HashMap<ActorId, Arc<dyn Frames>>>>,
+    /// Each actor's out ports, indexed by port number. The same question as
+    /// `frames` and so the same answer: an actor names a port, and the address
+    /// book is what turns a name into a destination.
+    outbound: Arc<Mutex<HashMap<ActorId, Vec<Option<Wiring>>>>>,
     config: Arc<SimConfig>,
 }
 
@@ -327,6 +344,7 @@ impl Registry {
             trace: Trace::new(),
             stats: Arc::new(Mutex::new(BTreeMap::new())),
             frames: Arc::new(Mutex::new(HashMap::new())),
+            outbound: Arc::new(Mutex::new(HashMap::new())),
             config,
         }
     }
@@ -355,6 +373,20 @@ impl Registry {
         self.frames.lock().unwrap().get(&id).cloned()
     }
 
+    /// Says where actor `id`'s out ports lead. Index is the port number the
+    /// guest was compiled against; `None` is a port that was left unwired.
+    ///
+    /// Set before spawning, for the same reason `route_frames` is: an actor
+    /// may send from `init`, and a wiring installed afterwards would have been
+    /// installed too late.
+    pub fn route_out(&self, id: ActorId, ports: Vec<Option<Wiring>>) {
+        self.outbound.lock().unwrap().insert(id, ports);
+    }
+
+    fn wiring_for(&self, id: ActorId, port: u32) -> Option<Wiring> {
+        self.outbound.lock().unwrap().get(&id)?.get(port as usize).copied().flatten()
+    }
+
     /// A snapshot of every actor this registry has ever spawned, live or dead
     /// (§8.4's debug overlay). Ordered by id.
     pub fn stats(&self) -> Vec<ActorStats> {
@@ -371,6 +403,19 @@ impl Registry {
 
     pub fn send(&self, to: ActorId, msg: Message) -> Result<()> {
         self.send_from(HOST, to, msg)
+    }
+
+    /// Delivers what an actor put on one of its out ports.
+    ///
+    /// An unwired port is a compile error (the checker refuses an `out` with
+    /// no wire), so reaching this with nothing to deliver to means the host
+    /// built a tree the compiler did not describe — worth saying rather than
+    /// dropping.
+    fn send_on_port(&self, from: ActorId, port: u32, bytes: Vec<u8>) -> Result<()> {
+        let wiring = self
+            .wiring_for(from, port)
+            .ok_or_else(|| anyhow!("actor {from} has nothing wired to out port {port}"))?;
+        self.send_from(from, wiring.to, Message::Blob { from, port: wiring.port, bytes })
     }
 
     /// `from` is [`HOST`] for messages originating outside any actor.
@@ -458,14 +503,19 @@ fn link_host_abi(linker: &mut Linker<ActorCtx>) -> Result<()> {
         },
     )?;
 
+    // The guest names one of its own out ports; the registry knows where that
+    // leads. Nothing in the guest can name another actor, so an actor cannot
+    // reach one the `app` block did not wire it to — the capability is the
+    // wiring (§9.2's direction, arrived at by having no addresses rather than
+    // by checking them).
     linker.func_wrap(
         "strand",
         "send",
-        |mut caller: Caller<'_, ActorCtx>, to: i32, ptr: i32, len: i32| -> wasmtime::Result<()> {
+        |mut caller: Caller<'_, ActorCtx>, port: i32, ptr: i32, len: i32| -> wasmtime::Result<()> {
             let bytes = read_guest_bytes(&mut caller, ptr, len)?;
             let ctx = caller.data();
             ctx.registry
-                .send_from(ctx.id, to as ActorId, Message::Blob { from: ctx.id, bytes })
+                .send_on_port(ctx.id, port as u32, bytes)
                 .map_err(wasmtime::Error::from_anyhow)
         },
     )?;
@@ -499,7 +549,7 @@ fn link_host_abi(linker: &mut Linker<ActorCtx>) -> Result<()> {
             };
             let from = ctx.id;
             ctx.registry
-                .send_from(from, to as ActorId, Message::Blob { from, bytes })
+                .send_from(from, to as ActorId, Message::Blob { from, port: 0, bytes })
                 .map_err(wasmtime::Error::from_anyhow)
         },
     )?;
@@ -719,7 +769,8 @@ async fn run_life(
             .map_err(|e| died(reason(&e), Some("first frame".to_string())))?;
     }
 
-    let on_message = instance.get_typed_func::<(i32, i32), ()>(&mut store, "strand_on_message");
+    let on_message =
+        instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "strand_on_message");
     while let Some(msg) = mailbox.recv().await {
         // What is still queued behind the message just taken.
         stats.mailbox.store(mailbox.len() as u64, Ordering::Relaxed);
@@ -727,7 +778,7 @@ async fn run_life(
             Message::Stop => break,
             // A host-side supervisor handles this today; guests ignore it.
             Message::ChildDown { .. } => continue,
-            Message::Blob { from, bytes } => {
+            Message::Blob { from, port, bytes } => {
                 if config.chaos {
                     // Seeded jitter: a different interleaving per seed, but the
                     // same one every time for a given seed.
@@ -743,7 +794,8 @@ async fn run_life(
                     .map_err(|e| died(e.to_string(), Some(summary.clone())))?;
 
                 stats.fibers.store(1, Ordering::Relaxed);
-                let handled = handler.call_async(&mut store, (ptr, bytes.len() as i32)).await;
+                let handled =
+                    handler.call_async(&mut store, (port as i32, ptr, bytes.len() as i32)).await;
                 stats.fibers.store(0, Ordering::Relaxed);
                 // Sampled whether the call returned or trapped: a crash report
                 // is more useful next to the arena size that produced it.

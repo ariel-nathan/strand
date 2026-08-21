@@ -14,7 +14,7 @@ use wasmtime::error::Context as _;
 use strand_render::scene::Node;
 use strand_render::widgets::Theme;
 use strandc::hir::Hir;
-use wasmtime::{Engine, Instance, Store, Val};
+use wasmtime::{Engine, Instance, Linker, Store, Val};
 
 use crate::frame;
 
@@ -57,7 +57,7 @@ fn no_view(hir: &Hir) -> String {
         );
     }
 
-    if let Some(actor) = &hir.actor {
+    if let Some(actor) = hir.actors.first() {
         return format!(
             "actor `{}` does not draw itself. Add a `view fn` inside it — \
              `view fn draw(state: {}) -> Node {{ ... }}` — and it will be \
@@ -81,6 +81,23 @@ fn no_view(hir: &Hir) -> String {
     )
 }
 
+/// Stands in for the host while a view is drawn without a runtime under it.
+///
+/// A view is a pure function of state (§6.5), so it cannot call any of these;
+/// what can is `init`, which runs first to build the state the view draws.
+/// Refusing to instantiate over that would mean `strand view <file> <w> <h>` —
+/// the only way to check a view's geometry without a screen — stopped working
+/// the moment an actor logged a line or sent a message.
+///
+/// The stubs do nothing on purpose. `log` has no console to reach from here,
+/// and a `send` has nowhere to travel: this is one module instantiated alone,
+/// not an app with wiring. The frame that comes out is the same either way.
+fn stub_host(linker: &mut Linker<()>) -> Result<()> {
+    linker.func_wrap("strand", "log", |_: i32, _: i32| {})?;
+    linker.func_wrap("strand", "send", |_: i32, _: i32, _: i32| {})?;
+    Ok(())
+}
+
 impl View {
     /// Instantiates `wasm` and finds the view to call.
     ///
@@ -89,7 +106,7 @@ impl View {
     pub fn new(hir: &Hir, wasm: &[u8]) -> Result<Self> {
         // An actor that draws itself wins: its view needs the state, and only
         // the actor has one.
-        let entry = match hir.actor.as_ref().and_then(|actor| actor.view) {
+        let entry = match hir.actors.iter().find_map(|actor| actor.view) {
             Some(_) => Entry::Actor,
             None => Entry::Function(
                 hir.funcs
@@ -105,15 +122,11 @@ impl View {
         let module =
             wasmtime::Module::new(&engine, wasm).context("wasmtime rejected the module")?;
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).map_err(|error| {
-            // The one likely cause, named: nothing here supplies the host ABI,
-            // because a static snapshot has no runtime under it.
-            anyhow!(
-                "could not instantiate: {error}. A module that calls into the \
-                 host — `log`, for one — needs the runtime, so drop the width \
-                 and height and run it in a window instead."
-            )
-        })?;
+        let mut linker = Linker::new(&engine);
+        stub_host(&mut linker)?;
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .map_err(|error| anyhow!("could not instantiate: {error}"))?;
 
         let mut view = Self { store, instance, entry };
         // An actor's state comes from `init`, which `strand_main` runs.
@@ -182,9 +195,23 @@ impl View {
 ///
 /// The way to check a Strand view without a screen: it reports where every node
 /// actually ended up, measured with the font that would draw it.
-pub fn inspect(hir: &Hir, wasm: &[u8], viewport: (f32, f32)) -> Result<String> {
-    let tree = View::new(hir, wasm)?.frame(&Theme::default())?;
+pub fn inspect(hir: &Hir, viewport: (f32, f32)) -> Result<String> {
+    let wasm = emit(hir)?;
+    let tree = View::new(hir, &wasm)?.frame(&Theme::default())?;
     Ok(strand_render::inspect::describe_with_fonts(&tree, viewport))
+}
+
+/// The module holding the view to draw.
+///
+/// A file may declare several actors, and only one of them draws — emitting
+/// "the module" would be emitting the wrong one half the time.
+fn emit(hir: &Hir) -> Result<Vec<u8>> {
+    let drawing = hir.actors.iter().position(|actor| actor.view.is_some());
+    let wasm = match drawing {
+        Some(index) => strandc::codegen::emit_actor(hir, index),
+        None => strandc::codegen::emit(hir),
+    };
+    wasm.map_err(|error| anyhow!("{error}"))
 }
 
 /// Opens a window showing what a Strand view drew.
@@ -193,12 +220,13 @@ pub fn inspect(hir: &Hir, wasm: &[u8], viewport: (f32, f32)) -> Result<String> {
 /// delivered as messages, and a redraw after each one. A bare `view fn` has no
 /// state to change, so it is drawn once and left alone — which is the honest
 /// behaviour rather than a limitation to apologise for.
-pub fn run(hir: &Hir, wasm: &[u8]) -> Result<()> {
-    if hir.actor.as_ref().is_some_and(|actor| actor.view.is_some()) {
-        return crate::app::run(hir, wasm);
+pub fn run(hir: &Hir) -> Result<()> {
+    if hir.actors.iter().any(|actor| actor.view.is_some()) {
+        return crate::app::run(hir);
     }
 
-    let tree = View::new(hir, wasm)?.frame(&Theme::default())?;
+    let wasm = emit(hir)?;
+    let tree = View::new(hir, &wasm)?.frame(&Theme::default())?;
 
     let (scenes, receiver) = strand_render::compositor::scene_channel();
     scenes.submit(tree);

@@ -124,8 +124,13 @@ pub struct Hir {
     pub records: Vec<RecordDef>,
     pub sums: Vec<SumDef>,
     pub funcs: Vec<Func>,
-    /// At most one per module: the runtime instantiates one module per actor.
-    pub actor: Option<ActorInfo>,
+    /// Every actor the file declares. The runtime instantiates one Store per
+    /// actor, so an app's actors are separate arenas whether or not they were
+    /// written in the same file — the file is a unit of *source*, and §5.1's
+    /// unit of isolation is the instance.
+    pub actors: Vec<ActorInfo>,
+    /// `app Name { ... }`: which actors run, and which port meets which.
+    pub app: Option<AppInfo>,
 }
 
 /// What codegen needs to wire an actor to the host ABI.
@@ -133,18 +138,80 @@ pub struct Hir {
 pub struct ActorInfo {
     pub name: String,
     pub state: Ty,
-    /// The channel's payload type, checked against `receive` (§5.3).
-    pub message: Ty,
+    /// Channels this actor receives on. The index *is* the port number on the
+    /// wire, which is what `strand_on_message` dispatches on.
+    pub inbox: Vec<PortInfo>,
+    /// Channels it sends on, indexed the same way for `strand.send`.
+    pub outbox: Vec<PortInfo>,
     pub init: FuncId,
-    pub receive: FuncId,
+    /// One handler per inbox port, in the same order.
+    pub handlers: Vec<FuncId>,
     /// `view fn view(state) -> Node`, when the actor declares one. Its presence
     /// is what makes a module a UI actor (§6.5).
     pub view: Option<FuncId>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PortInfo {
+    pub name: String,
+    /// The payload type. Flat, per `docs/abi.md` §7.
+    pub ty: Ty,
+}
+
+/// The supervision tree (§7), as the compiler resolved it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppInfo {
+    pub name: String,
+    pub instances: Vec<InstanceInfo>,
+    pub wires: Vec<Wire>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceInfo {
+    /// What the wires call it.
+    pub name: String,
+    /// Index into `Hir::actors`.
+    pub actor: usize,
+}
+
+/// One connection: an out port on one instance feeding an in port on another.
+///
+/// Indices rather than names, because by this point both ends have been
+/// resolved and checked — a wire that survives here cannot be dangling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wire {
+    pub from: usize,
+    pub from_port: usize,
+    pub to: usize,
+    pub to_port: usize,
+}
+
 impl Hir {
     pub fn ty(&self, ty: &Ty) -> String {
         TyDisplay(ty, self).to_string()
+    }
+
+    /// The actor, for the paths that only ever deal with one — `strand view`
+    /// on a single-actor file, and the checks in front of it.
+    ///
+    /// Deliberately `None` rather than "the first" when a file declares
+    /// several: a caller that has not said which one it means is a caller
+    /// about to run the wrong actor.
+    pub fn lone_actor(&self) -> Option<&ActorInfo> {
+        match self.actors.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+}
+
+impl ActorInfo {
+    pub fn in_port(&self, name: &str) -> Option<usize> {
+        self.inbox.iter().position(|p| p.name == name)
+    }
+
+    pub fn out_port(&self, name: &str) -> Option<usize> {
+        self.outbox.iter().position(|p| p.name == name)
     }
 }
 
@@ -252,6 +319,11 @@ pub enum ExprKind {
     /// `expr?` — on the error arm, returns from the enclosing function (§4.3).
     Try { expr: Box<Expr>, kind: TryKind },
 
+    /// `send(port, value)`. `port` is an index into the actor's `outbox`,
+    /// resolved by the checker — the emitted call carries a number, and the
+    /// name never leaves the compiler.
+    Send { port: u32, value: Box<Expr> },
+
     /// §6.2's builder call: append one node to the frame's array, after
     /// evaluating `children` so that whatever they appended becomes its own.
     ///
@@ -308,12 +380,16 @@ impl Helper {
 pub enum Builtin {
     /// `log(msg: string)` — writes through to the runtime's actor log.
     Log,
+    /// `send(port, ptr, len)` — hands bytes to whatever the `app` block wired
+    /// this port to. The guest names a port; the host knows the destination.
+    Send,
 }
 
 impl Builtin {
     pub fn name(self) -> &'static str {
         match self {
             Builtin::Log => "log",
+            Builtin::Send => "send",
         }
     }
 
@@ -321,6 +397,7 @@ impl Builtin {
     pub fn import(self) -> (&'static str, &'static str) {
         match self {
             Builtin::Log => ("strand", "log"),
+            Builtin::Send => ("strand", "send"),
         }
     }
 }

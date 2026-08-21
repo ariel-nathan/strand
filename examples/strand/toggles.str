@@ -21,9 +21,9 @@ type Model = {
   tab: int,
 }
 
-// `message: Input` opts into the platform's event type (§6.1). Its variants —
-// Click, Typed, Enter, Focus, Scrolled and the rest — are then in scope, and
-// `match` is exhaustive over them like any other sum.
+// Naming `Input` as a port's type opts into the platform's event type (§6.1).
+// Its variants — Click, Typed, Enter, Focus, Scrolled and the rest — are then
+// in scope, and `match` is exhaustive over them like any other sum.
 
 // Node ids. Stable across frames, which is what lets a click keep landing on
 // the same thing after the tree is rebuilt.
@@ -67,14 +67,14 @@ view fn task(id: Id, checked: bool, label: string): Node {
 
 actor Toggles {
   state: Model
-  message: Input
+  in input: Input
 
   fn init(): Model {
     Model { compiler: true, runtime: true, renderer: false, tab: 0 }
   }
 
   // The §6.5 handler: an event in, the next state out. Nothing mutates.
-  fn receive(state: Model, msg: Input): Model {
+  on input(state: Model, msg: Input): Model {
     match msg {
       Click(id) => clicked(state, id),
       // Everything else is input this app has no use for. Matching on it is

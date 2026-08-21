@@ -1,0 +1,125 @@
+// Two actors, wired together, in one file (§5.1, §7).
+//
+//   strand view examples/strand/pipeline.str          a window; click the buttons
+//   strand view examples/strand/pipeline.str 400 300  the laid-out tree instead
+//
+// `Meter` takes the clicks and keeps a running total. `Reporter` writes each
+// total down with `log`, so the terminal shows the second actor working while
+// the first one draws. Neither knows the other exists: `Meter` sends on a port
+// it declares, `Reporter` receives on a port it declares, and the `app` block
+// at the bottom is the only place that says those are the same channel.
+//
+// That is the whole idea. There is no actor address anywhere in the language —
+// nothing an actor holds could name another one — so an actor can only reach
+// the peers it was wired to. Location transparency (§9.5) falls out of the
+// same absence: a port whose far end was on another machine would change the
+// `app` block and nothing else.
+//
+// Press F12: both actors have a row in the debug overlay, with their own
+// arenas and their own mailboxes, because they are two Stores (§5.1).
+
+type Reading = { total: int, samples: int }
+type Log = { seen: int }
+
+fn ADD(): int { 1 }
+fn RESET(): int { 2 }
+
+// What crosses a channel must be flat (docs/abi.md §7): a message is copied
+// into a different arena, and a pointer from this one would mean nothing
+// there. The checker enforces that at the port declaration, so the mistake is
+// caught where the channel is described rather than where one is used.
+type Total =
+  | Now(total: int, samples: int)
+  | Cleared
+
+actor Meter {
+  state: Reading
+  in  input:  Input
+  out totals: Total
+
+  fn init(): Reading {
+    Reading { total: 0, samples: 0 }
+  }
+
+  on input(state: Reading, msg: Input): Reading {
+    match msg {
+      Click(id) => {
+        let next = clicked(state, id)
+        // The port is named, not addressed. `totals` is one of this actor's
+        // own declarations; where it leads is not this actor's business.
+        if next.samples == 0 {
+          send(totals, Cleared)
+        } else {
+          send(totals, Now(total: next.total, samples: next.samples))
+        }
+        next
+      },
+      // Everything else leaves the meter exactly as it was. Being exhaustive
+      // is the platform's doing: `Input` is a declared type, so `match` has to
+      // account for every event it can deliver.
+      Typed(ch) => state,
+      Backspace => state,
+      Enter => state,
+      Escape => state,
+      Focus(id) => state,
+      Scrolled(id, offset) => state,
+    }
+  }
+
+  view fn draw(state: Reading): Node {
+    screen(gap: 12, padding: 16) {
+      text("meter — " + str(state.total) + " over " + str(state.samples) + " samples")
+      row(gap: 8) {
+        button(id: ADD(), label: "add 7")
+        button(id: RESET(), label: "reset")
+      }
+      muted("the reporter's tally is in the terminal")
+    }
+  }
+}
+
+// `send` stayed in the handler rather than moving in here, because a port
+// belongs to the actor that declares it and a plain `fn` is not inside one.
+// Which is the honest shape anyway: the handler is what knows an event
+// happened, and this only knows how to add.
+fn clicked(state: Reading, id: int): Reading {
+  if id == ADD() {
+    return Reading { total: state.total + 7, samples: state.samples + 1 }
+  }
+  if id == RESET() {
+    return Reading { total: 0, samples: 0 }
+  }
+  state
+}
+
+actor Reporter {
+  state: Log
+  in totals: Total
+
+  fn init(): Log {
+    Log { seen: 0 }
+  }
+
+  on totals(state: Log, msg: Total): Log {
+    match msg {
+      Now(total, samples) => {
+        log("reporter: total is " + str(total) + " after " + str(samples) + " samples")
+        Log { seen: state.seen + 1 }
+      },
+      Cleared => {
+        log("reporter: the meter was reset")
+        Log { seen: state.seen + 1 }
+      },
+    }
+  }
+}
+
+// The supervision tree, written down. Every `out` port must appear on the left
+// of exactly one wire — an unwired port is a `send` that goes nowhere, and the
+// compiler says so rather than letting the messages vanish at run time.
+app Pipeline {
+  meter    = Meter
+  reporter = Reporter
+
+  meter.totals -> reporter.totals
+}

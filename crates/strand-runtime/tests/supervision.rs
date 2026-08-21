@@ -25,11 +25,11 @@ fn wat(file: &str) -> String {
 }
 
 fn ping(registry: &Registry) {
-    let _ = registry.send(CRASHER, Message::Blob { from: HOST, bytes: b"PING".to_vec() });
+    let _ = registry.send(CRASHER, Message::Blob { from: HOST, port: 0, bytes: b"PING".to_vec() });
 }
 
 fn boom(registry: &Registry) {
-    let _ = registry.send(CRASHER, Message::Blob { from: HOST, bytes: b"BOOM".to_vec() });
+    let _ = registry.send(CRASHER, Message::Blob { from: HOST, port: 0, bytes: b"BOOM".to_vec() });
 }
 
 /// Lets the runtime make progress. Time is virtual, so this is free.

@@ -83,11 +83,35 @@ fn bail<T>(message: impl Into<String>) -> EResult<T> {
 }
 
 pub fn emit(hir: &Hir) -> EResult<Vec<u8>> {
-    Emitter::new(hir).run()
+    match hir.actors.len() {
+        0 => Emitter::new(hir, None).run(),
+        1 => Emitter::new(hir, Some(0)).run(),
+        // A module is one actor's code: the state global, `strand_main` and
+        // `strand_on_message` are singular by construction. A file holding
+        // several is compiled once per actor, which is also what gives each of
+        // them its own arena (§5.1).
+        _ => bail("this file declares several actors — emit each one with `emit_actor`"),
+    }
+}
+
+/// Emits the module for one of the file's actors.
+///
+/// The actors share the file's functions and types, so the emitted modules are
+/// near-identical apart from which `init`, handlers and view the ABI exports
+/// point at. That is the cost of having no imports yet, and it is paid in
+/// bytes rather than in isolation: the instances that run them are separate
+/// Stores either way.
+pub fn emit_actor(hir: &Hir, actor: usize) -> EResult<Vec<u8>> {
+    if actor >= hir.actors.len() {
+        return bail(format!("no actor {actor} in this file"));
+    }
+    Emitter::new(hir, Some(actor)).run()
 }
 
 struct Emitter<'hir> {
     hir: &'hir Hir,
+    /// Which actor this module is being emitted for, if any.
+    actor: Option<&'hir ActorInfo>,
     /// Interned function types, so multi-value block types can be referenced.
     types: Vec<(Vec<ValType>, Vec<ValType>)>,
     /// Literal text -> byte offset of its `{ len, bytes }` header.
@@ -114,17 +138,22 @@ struct Emitter<'hir> {
     /// Host functions this module actually calls. Imports take the lowest
     /// function indices, so everything defined here is offset past them.
     imports: Vec<Builtin>,
+    /// A word of static data `send` writes an immediate into, so that a value
+    /// with no address can still be handed to the host as `(ptr, len)`.
+    immediate_slot: u32,
 }
 
 impl<'hir> Emitter<'hir> {
-    fn new(hir: &'hir Hir) -> Self {
+    fn new(hir: &'hir Hir, actor: Option<usize>) -> Self {
+        let actor = actor.map(|index| &hir.actors[index]);
         let helpers = hir.funcs.len() as u32;
         let builds_nodes = hir.funcs.iter().any(|func| func.is_view);
         // Global 0 is the bump pointer and global 1, when there is an actor, is
         // the state. The frame's arena takes the next three.
-        let first_free = if hir.actor.is_some() { 2 } else { 1 };
+        let first_free = if actor.is_some() { 2 } else { 1 };
         Self {
             hir,
+            actor,
             types: Vec::new(),
             strings: HashMap::new(),
             data: Vec::new(),
@@ -140,7 +169,20 @@ impl<'hir> Emitter<'hir> {
             // Filled in once the conditional helpers before it are counted.
             helpers_base: 0,
             imports: Vec::new(),
+            // Reserved during `collect_strings`, and only when something sends.
+            immediate_slot: 0,
         }
+    }
+
+    /// The functions that belong to an actor rather than to the file.
+    fn actor_owned(&self) -> Vec<u32> {
+        let mut owned = Vec::new();
+        for actor in &self.hir.actors {
+            owned.push(actor.init.0);
+            owned.extend(actor.handlers.iter().map(|id| id.0));
+            owned.extend(actor.view.map(|id| id.0));
+        }
+        owned
     }
 
     /// Where `helper` ended up. Only helpers the module calls are emitted, so
@@ -174,8 +216,10 @@ impl<'hir> Emitter<'hir> {
     }
 
     fn run(mut self) -> EResult<Vec<u8>> {
-        self.collect_strings();
+        // Imports first: whether anything sends decides whether the data
+        // section reserves a scratch word.
         self.collect_imports();
+        self.collect_strings();
         self.collect_helpers();
 
         // Imports shift every defined function, so fix the helper indices here
@@ -191,7 +235,7 @@ impl<'hir> Emitter<'hir> {
         if self.builds_nodes {
             after += 2;
         }
-        if let Some(actor) = &self.hir.actor {
+        if let Some(actor) = self.actor {
             after += 2;
             if actor.view.is_some() {
                 after += 1;
@@ -211,7 +255,9 @@ impl<'hir> Emitter<'hir> {
         let str_eq_ty =
             self.intern_type(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
         let actor_main_ty = self.intern_type(Vec::new(), Vec::new());
-        let actor_recv_ty = self.intern_type(vec![ValType::I32, ValType::I32], Vec::new());
+        // (port, ptr, len): which channel it arrived on, and the bytes.
+        let actor_recv_ty =
+            self.intern_type(vec![ValType::I32, ValType::I32, ValType::I32], Vec::new());
         // node_push(kind, marker, id, flag, text, text2, number, number2)
         let node_push_ty = self.intern_type(
             vec![
@@ -238,6 +284,21 @@ impl<'hir> Emitter<'hir> {
             })
             .collect();
 
+        // Import signatures are interned here rather than where the import
+        // section is written, which is after the type section has been emitted:
+        // an import whose type is new at that point would name an index the
+        // module does not contain. It went unnoticed while `log`'s `(i32, i32)`
+        // happened to be the same shape as `strand_on_message`.
+        let import_types: Vec<u32> = self
+            .imports
+            .clone()
+            .into_iter()
+            .map(|builtin| {
+                let (params, results) = builtin_signature(builtin);
+                self.intern_type(params, results)
+            })
+            .collect();
+
         // Bodies are emitted before the type section is finalised, because a
         // multi-value block inside a body can intern a new type.
         let mut bodies = Vec::new();
@@ -255,9 +316,9 @@ impl<'hir> Emitter<'hir> {
 
         if !self.imports.is_empty() {
             let mut imports = ImportSection::new();
-            for builtin in &self.imports {
+            for (builtin, ty) in self.imports.iter().zip(&import_types) {
                 let (module_name, field) = builtin.import();
-                imports.import(module_name, field, EntityType::Function(builtin_type(*builtin, &mut self.types)));
+                imports.import(module_name, field, EntityType::Function(*ty));
             }
             module.section(&imports);
         }
@@ -272,7 +333,7 @@ impl<'hir> Emitter<'hir> {
             functions.function(node_push_ty);
             functions.function(frame_reset_ty);
         }
-        if let Some(actor) = &self.hir.actor {
+        if let Some(actor) = self.actor {
             functions.function(actor_main_ty);
             functions.function(actor_recv_ty);
             if actor.view.is_some() {
@@ -306,8 +367,8 @@ impl<'hir> Emitter<'hir> {
             GlobalType { val_type: ValType::I32, mutable: true, shared: false },
             &ConstExpr::i32_const(bump_start as i32),
         );
-        if let Some(actor) = &self.hir.actor {
-            // Global 1 holds the current state. `receive` returns the next one,
+        if let Some(actor) = self.actor {
+            // Global 1 holds the current state. A handler returns the next one,
             // so a message handler never mutates in place (§6.5).
             let val_type = state_type(&actor.state)?;
             globals.global(
@@ -332,7 +393,15 @@ impl<'hir> Emitter<'hir> {
 
         let mut exports = ExportSection::new();
         exports.export("memory", ExportKind::Memory, 0);
+        let owned = self.actor_owned();
         for (index, func) in self.hir.funcs.iter().enumerate() {
+            // An actor's own functions are reached through the mailbox and the
+            // ABI's entry points, never by name — and two actors in one file
+            // both declaring `init` is the ordinary case, so exporting them
+            // would be a name clash over a door nobody uses.
+            if owned.contains(&(index as u32)) {
+                continue;
+            }
             exports.export(&func.name, ExportKind::Func, offset + index as u32);
         }
         // The host ABI names from docs/abi.md §6.
@@ -344,7 +413,7 @@ impl<'hir> Emitter<'hir> {
             exports.export("strand_node_count", ExportKind::Global, self.node_count_global);
             exports.export("strand_frame_reset", ExportKind::Func, self.node_push_index + 1);
         }
-        if let Some(actor) = &self.hir.actor {
+        if let Some(actor) = self.actor {
             let actor_base =
                 if self.builds_nodes { self.node_push_index + 1 } else { self.str_eq_index };
             exports.export("strand_main", ExportKind::Func, actor_base + 1);
@@ -374,7 +443,7 @@ impl<'hir> Emitter<'hir> {
             ));
             code.function(&frame_reset_body(self.node_count_global, self.pending_global));
         }
-        if let Some(actor) = &self.hir.actor {
+        if let Some(actor) = self.actor {
             code.function(&actor_main_body(actor, offset));
             code.function(&actor_receive_body(actor, self.alloc_index, self.hir, offset));
             if let Some(view) = actor.view {
@@ -447,6 +516,13 @@ impl<'hir> Emitter<'hir> {
                 self.data.push(0);
             }
             self.strings.insert(text, offset);
+        }
+        // One word of static scratch, for the immediates `send` needs an
+        // address for. Reused by every send: the host copies the bytes out
+        // before the call returns, so nothing outlives the call that wrote it.
+        if self.imports.contains(&Builtin::Send) {
+            self.immediate_slot = DATA_START + self.data.len() as u32;
+            self.data.extend_from_slice(&[0; WORD as usize]);
         }
         self.heap_start = DATA_START + self.data.len() as u32;
     }
@@ -558,6 +634,74 @@ impl<'hir> Emitter<'hir> {
                 code.push(Instruction::Call(offset + func.0));
             }
 
+            // `send(port, value)`: hand the host the bytes that already are
+            // the value (docs/abi.md §7). The port is a constant the checker
+            // resolved; nothing here knows or can know who receives it.
+            ExprKind::Send { port, value } => {
+                let ty = value.ty.clone();
+                let scratch = ctx.scratch(ValType::I32);
+
+                code.push(Instruction::I32Const(*port as i32));
+                match &ty {
+                    // The bytes on the wire are the string's, without the
+                    // length header — codegen rebuilds that on arrival.
+                    Ty::Str => {
+                        self.expr(ctx, code, value)?;
+                        code.push(Instruction::LocalSet(scratch));
+                        code.push(Instruction::LocalGet(scratch));
+                        code.push(Instruction::I32Const(4));
+                        code.push(Instruction::I32Add);
+                        code.push(Instruction::LocalGet(scratch));
+                        code.push(Instruction::I32Load(mem_arg(0, 2)));
+                    }
+                    // A boxed variant is already laid out the way the wire
+                    // wants it, so the pointer is the payload.
+                    Ty::Sum(id)
+                        if self.hir.sums[id.0 as usize]
+                            .variants
+                            .iter()
+                            .any(|v| !v.fields.is_empty()) =>
+                    {
+                        let def = &self.hir.sums[id.0 as usize];
+                        let bytes = (variant_payload_words(def) + 1) * WORD;
+                        self.expr(ctx, code, value)?;
+                        code.push(Instruction::I32Const(bytes as i32));
+                    }
+                    // Immediates have no address, so they need one: a word of
+                    // scratch, written and read inside this call. The host
+                    // copies before returning, so one slot serves every send.
+                    other => {
+                        let slot = self.immediate_slot;
+                        code.push(Instruction::I32Const(slot as i32));
+                        self.expr(ctx, code, value)?;
+                        let bytes = match other {
+                            Ty::Int => {
+                                code.push(Instruction::I64Store(mem_arg(0, 3)));
+                                8
+                            }
+                            Ty::Float => {
+                                code.push(Instruction::F64Store(mem_arg(0, 3)));
+                                8
+                            }
+                            // A bare tag, and `bool`, are both an i32.
+                            _ => {
+                                code.push(Instruction::I32Store(mem_arg(0, 2)));
+                                4
+                            }
+                        };
+                        code.push(Instruction::I32Const(slot as i32));
+                        code.push(Instruction::I32Const(bytes));
+                    }
+                }
+
+                let index = self
+                    .imports
+                    .iter()
+                    .position(|b| *b == Builtin::Send)
+                    .expect("send was collected as an import");
+                code.push(Instruction::Call(index as u32));
+            }
+
             ExprKind::CallBuiltin { builtin, args } => {
                 match builtin {
                     // log(msg) takes a Strand string; the host ABI takes
@@ -571,6 +715,10 @@ impl<'hir> Emitter<'hir> {
                         code.push(Instruction::I32Add);
                         code.push(Instruction::LocalGet(text));
                         code.push(Instruction::I32Load(mem_arg(0, 2)));
+                    }
+                    // Emitted through `ExprKind::Send`, which knows the port.
+                    Builtin::Send => {
+                        return bail("`send` is emitted from its own node, not as a call")
                     }
                 }
                 let index = self
@@ -833,7 +981,13 @@ impl<'hir> Emitter<'hir> {
                     .iter()
                     .map(|(_, t)| t.clone())
                     .collect();
-                let payload: u64 = field_tys.iter().map(words).sum();
+                // Every variant of a sum takes the same room: one word for the
+                // tag, then one per field of the *widest* variant. A few bytes
+                // go unused on the narrow ones, and in exchange the size of a
+                // value is a property of its type rather than of its tag —
+                // which is what lets `send` put a constant length on the wire
+                // instead of computing one from the tag at run time.
+                let payload = variant_payload_words(def);
                 let ptr = ctx.scratch(ValType::I32);
 
                 code.push(Instruction::I32Const(((payload + 1) * WORD) as i32));
@@ -1303,17 +1457,24 @@ fn narrow(ty: ValType) -> Instruction<'static> {
     }
 }
 
-/// Interns the signature of a host import.
-fn builtin_type(builtin: Builtin, types: &mut Vec<(Vec<ValType>, Vec<ValType>)>) -> u32 {
-    let signature = match builtin {
+/// The signature of a host import.
+fn builtin_signature(builtin: Builtin) -> (Vec<ValType>, Vec<ValType>) {
+    match builtin {
         // log(ptr, len)
         Builtin::Log => (vec![ValType::I32, ValType::I32], Vec::new()),
-    };
-    if let Some(index) = types.iter().position(|t| *t == signature) {
-        return index as u32;
+        // send(port, ptr, len)
+        Builtin::Send => (vec![ValType::I32, ValType::I32, ValType::I32], Vec::new()),
     }
-    types.push(signature);
-    (types.len() - 1) as u32
+}
+
+/// How many words a sum's payload occupies — the widest variant's, so that
+/// every value of the type is the same size (see `MakeVariant`).
+fn variant_payload_words(def: &SumDef) -> u64 {
+    def.variants
+        .iter()
+        .map(|variant| variant.fields.iter().map(|(_, ty)| words(ty)).sum::<u64>())
+        .max()
+        .unwrap_or(0)
 }
 
 /// The WASM type of an actor's state global.
@@ -1341,66 +1502,86 @@ fn actor_main_body(actor: &ActorInfo, offset: u32) -> Function {
     f
 }
 
-/// `strand_on_message`: turn the delivered bytes into the actor's message
-/// type, hand it to `receive` with the current state, and keep what comes back.
+/// `strand_on_message`: turn the delivered bytes into the port's message type,
+/// hand them to that port's handler with the current state, and keep what comes
+/// back.
 ///
 /// For a flat message the bytes already *are* the value: the runtime copied
 /// them into this arena with `strand_alloc`, and the checker guaranteed the
 /// type holds no pointers needing relocation, so a boxed variant is used
 /// in place with no decoding at all. Strings are the one relocated case —
 /// codegen knows their layout (`docs/abi.md` §5), so it adds the header.
+///
+/// The port decides which handler runs and how the bytes are read, so the two
+/// come from one table and cannot drift apart. A port number the actor does
+/// not have traps: it can only come from a host that disagrees with this
+/// module about the actor's shape, and a crash report naming the actor is a
+/// better account of that than a message quietly going nowhere.
 fn actor_receive_body(actor: &ActorInfo, alloc: u32, hir: &Hir, offset: u32) -> Function {
     let mut f = Function::new([(1, ValType::I32)]);
-    let (ptr, len, text) = (0, 1, 2);
+    let (port, ptr, len, text) = (0, 1, 2, 3);
 
-    f.instruction(&Instruction::GlobalGet(1));
+    for (index, info) in actor.inbox.iter().enumerate() {
+        f.instruction(&Instruction::LocalGet(port));
+        f.instruction(&Instruction::I32Const(index as i32));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(BlockType::Empty));
 
-    match &actor.message {
-        Ty::Str => {
-            f.instruction(&Instruction::LocalGet(len));
-            f.instruction(&Instruction::I32Const(4));
-            f.instruction(&Instruction::I32Add);
-            f.instruction(&Instruction::Call(alloc));
-            f.instruction(&Instruction::LocalTee(text));
+        f.instruction(&Instruction::GlobalGet(1));
 
-            // header: the length
-            f.instruction(&Instruction::LocalGet(len));
-            f.instruction(&Instruction::I32Store(mem_arg(0, 2)));
+        match &info.ty {
+            Ty::Str => {
+                f.instruction(&Instruction::LocalGet(len));
+                f.instruction(&Instruction::I32Const(4));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::Call(alloc));
+                f.instruction(&Instruction::LocalTee(text));
 
-            // body: the delivered bytes, after it
-            f.instruction(&Instruction::LocalGet(text));
-            f.instruction(&Instruction::I32Const(4));
-            f.instruction(&Instruction::I32Add);
-            f.instruction(&Instruction::LocalGet(ptr));
-            f.instruction(&Instruction::LocalGet(len));
-            f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
-            f.instruction(&Instruction::LocalGet(text));
+                // header: the length
+                f.instruction(&Instruction::LocalGet(len));
+                f.instruction(&Instruction::I32Store(mem_arg(0, 2)));
+
+                // body: the delivered bytes, after it
+                f.instruction(&Instruction::LocalGet(text));
+                f.instruction(&Instruction::I32Const(4));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalGet(ptr));
+                f.instruction(&Instruction::LocalGet(len));
+                f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+                f.instruction(&Instruction::LocalGet(text));
+            }
+            Ty::Sum(id)
+                if hir.sums[id.0 as usize].variants.iter().any(|v| !v.fields.is_empty()) =>
+            {
+                // Boxed variant: the delivered block is already a valid value here.
+                f.instruction(&Instruction::LocalGet(ptr));
+            }
+            // All-niladic sums, and scalars, arrive as their bare value.
+            Ty::Sum(_) | Ty::Bool => {
+                f.instruction(&Instruction::LocalGet(ptr));
+                f.instruction(&Instruction::I32Load(mem_arg(0, 2)));
+            }
+            Ty::Int => {
+                f.instruction(&Instruction::LocalGet(ptr));
+                f.instruction(&Instruction::I64Load(mem_arg(0, 3)));
+            }
+            Ty::Float => {
+                f.instruction(&Instruction::LocalGet(ptr));
+                f.instruction(&Instruction::F64Load(mem_arg(0, 3)));
+            }
+            // The checker rejects anything else before codegen sees it.
+            _ => {
+                f.instruction(&Instruction::LocalGet(ptr));
+            }
         }
-        Ty::Sum(id) if hir.sums[id.0 as usize].variants.iter().any(|v| !v.fields.is_empty()) => {
-            // Boxed variant: the delivered block is already a valid value here.
-            f.instruction(&Instruction::LocalGet(ptr));
-        }
-        // All-niladic sums, and scalars, arrive as their bare value.
-        Ty::Sum(_) | Ty::Bool => {
-            f.instruction(&Instruction::LocalGet(ptr));
-            f.instruction(&Instruction::I32Load(mem_arg(0, 2)));
-        }
-        Ty::Int => {
-            f.instruction(&Instruction::LocalGet(ptr));
-            f.instruction(&Instruction::I64Load(mem_arg(0, 3)));
-        }
-        Ty::Float => {
-            f.instruction(&Instruction::LocalGet(ptr));
-            f.instruction(&Instruction::F64Load(mem_arg(0, 3)));
-        }
-        // The checker rejects anything else before codegen sees it.
-        _ => {
-            f.instruction(&Instruction::LocalGet(ptr));
-        }
+
+        f.instruction(&Instruction::Call(offset + actor.handlers[index].0));
+        f.instruction(&Instruction::GlobalSet(1));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
     }
 
-    f.instruction(&Instruction::Call(offset + actor.receive.0));
-    f.instruction(&Instruction::GlobalSet(1));
+    f.instruction(&Instruction::Unreachable);
     f.instruction(&Instruction::End);
     f
 }
@@ -2095,10 +2276,13 @@ fn collect_block_strings(block: &Block, out: &mut Vec<String>) {
 }
 
 fn collect_block_builtins(block: &Block, out: &mut Vec<Builtin>) {
-    walk_block(block, &mut |expr| {
-        if let ExprKind::CallBuiltin { builtin, .. } = &expr.kind {
-            out.push(*builtin);
-        }
+    walk_block(block, &mut |expr| match &expr.kind {
+        ExprKind::CallBuiltin { builtin, .. } => out.push(*builtin),
+        // `send` is its own node rather than a builtin call, because the port
+        // is a compile-time number and not an argument. It still imports the
+        // host function, so it has to be counted here too.
+        ExprKind::Send { .. } => out.push(Builtin::Send),
+        _ => {}
     });
 }
 
@@ -2140,6 +2324,7 @@ fn walk_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
                 walk_expr(arg, visit);
             }
         }
+        ExprKind::Send { value, .. } => walk_expr(value, visit),
         ExprKind::ListLen { list } => walk_expr(list, visit),
         ExprKind::ListPush { list, value } => {
             walk_expr(list, visit);
@@ -2196,6 +2381,7 @@ fn collect_pattern_strings(pattern: &Pattern, out: &mut Vec<String>) {
 fn collect_expr_strings(expr: &Expr, out: &mut Vec<String>) {
     match &expr.kind {
         ExprKind::Str(text) => out.push(text.clone()),
+        ExprKind::Send { value, .. } => collect_expr_strings(value, out),
         ExprKind::Unary { expr, .. } => collect_expr_strings(expr, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_expr_strings(lhs, out);

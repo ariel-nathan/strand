@@ -27,13 +27,11 @@ use strand_render::widgets::Theme;
 use strand_runtime::{
     engine, spawn_supervised, Frames, Message, Policy, Registry, HOST,
 };
-use strandc::hir::{Hir, Ty};
+use strandc::hir::Hir;
 use strandc::input;
 
 use crate::frame;
-
-/// The one UI actor. §5.1 gives every actor an id; this app has one to give.
-const UI: u32 = 0;
+use crate::plan::{self, Plan};
 
 /// Turns the frames an actor draws into trees the compositor can paint.
 ///
@@ -88,41 +86,46 @@ pub fn spec_for(event: InputEvent) -> Option<String> {
     })
 }
 
-/// Checks that this module can actually receive input before a window opens.
+/// Checks that the drawing actor can actually receive input before a window
+/// opens.
 ///
-/// The failure it exists for is an actor that draws itself but declares some
-/// other message type: it would run, paint once, and then ignore every click in
+/// The failure it exists for is an actor that draws itself but declares no
+/// `Input` port: it would run, paint once, and then ignore every click in
 /// silence. Better to refuse at the door and say why.
-fn check_receives_input(hir: &Hir) -> Result<()> {
-    let Some(actor) = &hir.actor else {
-        return Err(anyhow!("this module declares no actor"));
+fn check_receives_input(hir: &Hir, plan: &Plan) -> Result<()> {
+    let Some(ui) = plan.ui else {
+        return Err(anyhow!("nothing in this app draws a window"));
     };
-    let Ty::Sum(id) = &actor.message else {
-        return Err(anyhow!(
-            "`{}` receives {}, so it cannot be told about clicks — write \
-             `message: {}` to receive input (§6.1)",
-            actor.name,
-            hir.ty(&actor.message),
-            input::TYPE_NAME
-        ));
-    };
-    if hir.sums[id.0 as usize].name != input::TYPE_NAME {
-        return Err(anyhow!(
-            "`{}` receives `{}`, which is not the platform's input type — write \
-             `message: {}` to receive input (§6.1)",
-            actor.name,
-            hir.sums[id.0 as usize].name,
-            input::TYPE_NAME
-        ));
+    if plan.input_port.is_some() {
+        return Ok(());
     }
-    Ok(())
+    let actor = &hir.actors[plan.spawns[ui].actor];
+    let ports: Vec<String> = actor
+        .inbox
+        .iter()
+        .map(|port| format!("`{}` ({})", port.name, hir.ty(&port.ty)))
+        .collect();
+    let has = if ports.is_empty() {
+        "it declares no `in` ports at all".to_string()
+    } else {
+        format!("it receives on {}", ports.join(", "))
+    };
+    Err(anyhow!(
+        "`{}` draws a window but cannot be told about clicks — {has}. Add \
+         `in input: {}` and an `on input` handler (§6.1)",
+        actor.name,
+        input::TYPE_NAME
+    ))
 }
 
-/// Runs a Strand UI actor under the compositor.
-pub fn run(hir: &Hir, wasm: &[u8]) -> Result<()> {
-    check_receives_input(hir)?;
-    let actor = hir.actor.as_ref().expect("checked just above");
-    let (name, message_ty) = (actor.name.clone(), actor.message.clone());
+/// Runs a Strand app: every actor in its own arena, wired as the file says.
+pub fn run(hir: &Hir) -> Result<()> {
+    let plan = plan::plan(hir)?;
+    check_receives_input(hir, &plan)?;
+    let ui = plan.ui.expect("checked just above");
+    let ui_id = plan.spawns[ui].id;
+    let input_port = plan.input_port.expect("checked just above");
+    let message_ty = hir.actors[plan.spawns[ui].actor].inbox[input_port as usize].ty.clone();
 
     let (scenes, scene_receiver) = scene_channel();
     let (input_sender, mut input_receiver) = input_channel();
@@ -138,28 +141,34 @@ pub fn run(hir: &Hir, wasm: &[u8]) -> Result<()> {
     // Cloned because the encoder reads layout from the same `Hir` the compiler
     // produced — both ends of the channel agree by construction (§5.3).
     let hir_for_encoding = hir.clone();
-    let wasm = wasm.to_vec();
 
-    // Before spawning: the actor draws itself once at startup, and a sink
-    // registered afterwards would miss that first frame.
-    registry.route_frames(UI, Arc::new(ToCompositor { theme: Theme::default(), scenes }));
+    // Before spawning: an actor draws itself and may send from `init`, so a
+    // route registered afterwards would already have missed something.
+    registry.route_frames(ui_id, Arc::new(ToCompositor { theme: Theme::default(), scenes }));
+    for spawn in &plan.spawns {
+        registry.route_out(spawn.id, spawn.out.clone());
+    }
 
     let published = stats.clone();
     let _guard = runtime.enter();
     let feeding = registry.clone();
     runtime.spawn(crate::stats::publish(registry.clone(), published));
     runtime.spawn(async move {
-        let handle = spawn_supervised(
-            &engine,
-            &registry,
-            UI,
-            &name,
-            &wasm,
-            // §5.4: a view that traps takes its actor down, and the supervisor
-            // puts a fresh one in its place. The window never closes.
-            Policy::Restart,
-            None,
-        );
+        let mut handles = Vec::new();
+        for spawn in &plan.spawns {
+            handles.push(spawn_supervised(
+                &engine,
+                &registry,
+                spawn.id,
+                &spawn.name,
+                &spawn.wasm,
+                // §5.4: a handler that traps takes its actor down, and the
+                // supervisor puts a fresh one in its place. Its siblings never
+                // notice, and the window never closes.
+                Policy::Restart,
+                None,
+            ));
+        }
 
         loop {
             for event in input_receiver.drain() {
@@ -168,14 +177,16 @@ pub fn run(hir: &Hir, wasm: &[u8]) -> Result<()> {
                     Ok(bytes) => {
                         let _ = feeding.send_from(
                             HOST,
-                            UI,
-                            Message::Blob { from: HOST, bytes },
+                            ui_id,
+                            Message::Blob { from: HOST, port: input_port, bytes },
                         );
                     }
                     Err(error) => eprintln!("!! could not deliver {spec}: {error:#}"),
                 }
             }
-            if handle.is_finished() {
+            // The window follows the actor that draws it: when that one is
+            // gone for good, there is nothing left to show.
+            if handles[ui].is_finished() {
                 return;
             }
             // Input is polled rather than awaited: the channel is a std one, so
@@ -184,8 +195,8 @@ pub fn run(hir: &Hir, wasm: &[u8]) -> Result<()> {
         }
     });
 
-    println!("--- strand M3: a UI actor written in Strand (§6.2, §6.5) ---");
-    println!("press F12 for the debug overlay (§8.4) — the actor drawing this has a row");
+    println!("--- strand: a UI actor written in Strand (§6.2, §6.5) ---");
+    println!("press F12 for the debug overlay (§8.4) — every actor here has a row");
     strand_render::run_with_stats(Some(scene_receiver), Some(input_sender), Some(stats))
 }
 
@@ -246,35 +257,64 @@ mod tests {
         assert_eq!(spec.as_deref(), Some("Typed 233"));
     }
 
+    fn checked(src: &str) -> Result<()> {
+        let hir = strandc::compile("t.str", src).expect("should compile");
+        let plan = plan::plan(&hir)?;
+        check_receives_input(&hir, &plan)
+    }
+
     #[test]
     fn an_actor_that_cannot_hear_input_is_refused_before_a_window_opens() {
-        let src = "\
-type Count = { total: int }
-actor Counter {
-  state: Count
-  fn init(): Count { Count { total: 0 } }
-  fn receive(state: Count, msg: string): Count { state }
-  view fn draw(state: Count): Node { text(\"hi\") }
-}
-";
-        let hir = strandc::compile("t.str", src).expect("should compile");
-        let message = check_receives_input(&hir).unwrap_err().to_string();
-        assert!(message.contains("message: Input"), "{message}");
+        // It would open a window, paint once, and then ignore every click
+        // without saying anything. Refusing at the door and naming the fix is
+        // the whole reason the check exists.
+        let message = checked(
+            "type Count = { total: int }
+             actor Counter {
+               state: Count
+               in ticks: int
+               fn init(): Count { Count { total: 0 } }
+               on ticks(state: Count, msg: int): Count { state }
+               view fn draw(state: Count): Node { text(\"hi\") }
+             }",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("in input: Input"), "{message}");
+        assert!(message.contains("`ticks` (int)"), "it says what it does hear: {message}");
     }
 
     #[test]
     fn an_actor_that_asked_for_input_is_accepted() {
-        let src = "\
-type Count = { total: int }
-actor Counter {
-  state: Count
-  message: Input
-  fn init(): Count { Count { total: 0 } }
-  fn receive(state: Count, msg: Input): Count { state }
-  view fn draw(state: Count): Node { text(\"hi\") }
-}
-";
-        let hir = strandc::compile("t.str", src).expect("should compile");
-        check_receives_input(&hir).expect("this one can hear");
+        checked(
+            "type Count = { total: int }
+             actor Counter {
+               state: Count
+               in input: Input
+               fn init(): Count { Count { total: 0 } }
+               on input(state: Count, msg: Input): Count { state }
+               view fn draw(state: Count): Node { text(\"hi\") }
+             }",
+        )
+        .expect("this one can hear");
+    }
+
+    #[test]
+    fn the_input_port_is_found_by_type_rather_than_by_name() {
+        // Calling it `input` is a convention; carrying `Input` is the fact. A
+        // port named anything still receives clicks, because the platform
+        // matches on the type it declared (docs/abi.md §9) — the same reason
+        // the type is declared there rather than matched by spelling.
+        checked(
+            "type Count = { total: int }
+             actor Counter {
+               state: Count
+               in fromTheUser: Input
+               fn init(): Count { Count { total: 0 } }
+               on fromTheUser(state: Count, msg: Input): Count { state }
+               view fn draw(state: Count): Node { text(\"hi\") }
+             }",
+        )
+        .expect("the name is not the protocol");
     }
 }

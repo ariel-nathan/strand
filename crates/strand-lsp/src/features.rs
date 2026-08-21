@@ -173,7 +173,8 @@ impl<'src> Document<'src> {
                 self.symbol(&decl.name, None, kind, decl.span, decl.name_span, children)
             }
             ast::Item::Actor(decl) => {
-                let mut children = vec![self.fn_symbol(&decl.init), self.fn_symbol(&decl.receive)];
+                let mut children = vec![self.fn_symbol(&decl.init)];
+                children.extend(decl.handlers.iter().map(|handler| self.fn_symbol(handler)));
                 children.extend(decl.view.as_ref().map(|view| self.fn_symbol(view)));
                 self.symbol(
                     &decl.name,
@@ -184,6 +185,16 @@ impl<'src> Document<'src> {
                     children,
                 )
             }
+            // The wiring is a list of names that all point at things already
+            // in the outline; a second entry for each would be noise.
+            ast::Item::App(decl) => self.symbol(
+                &decl.name,
+                Some("app".to_string()),
+                SymbolKind::NAMESPACE,
+                decl.span,
+                decl.name_span,
+                Vec::new(),
+            ),
         }
     }
 

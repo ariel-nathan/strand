@@ -32,12 +32,13 @@ type Count = { total: int, seen: int }
 
 actor Viewer {
   state: Count
+  in words: string
 
   fn init(): Count {
     Count { total: 0, seen: 0 }
   }
 
-  fn receive(state: Count, msg: string): Count {
+  on words(state: Count, msg: string): Count {
     state
   }
 
@@ -195,22 +196,22 @@ fn describe(notes: List<Note>, draft: string): string {
 }
 
 // 9d. `Input`, the platform's message type (input.rs). It exists only in a
-//     module that asks for it by writing `message: Input` — outside an actor
-//     that does, `Input` is an unknown type and `Click` an unknown name. The
-//     grammar colours them unconditionally anyway: a regex cannot see the
+//     module that asks for it by naming `Input` as a port's type — outside an
+//     actor that does, `Input` is an unknown type and `Click` an unknown name.
+//     The grammar colours them unconditionally anyway: a regex cannot see the
 //     actor declaration, and it is the same trade `view` takes.
 
 type Model = { tab: int, draft: string }
 
 actor Editor {
   state: Model
-  message: Input
+  in input: Input
 
   fn init(): Model {
     Model { tab: 0, draft: "" }
   }
 
-  fn receive(state: Model, msg: Input): Model {
+  on input(state: Model, msg: Input): Model {
     match msg {
       Click(id) => Model { tab: id, draft: state.draft },
       Typed(ch) => Model { tab: state.tab, draft: state.draft + char(ch) },

@@ -22,8 +22,8 @@
     (call $log (i32.const 64) (i32.const 14))
     (call $sleep (i64.const 300))
     (call $log (i32.const 128) (i32.const 32))
-    (call $send (i32.const 1) (i32.const 192) (i32.const 4)))
+    (call $send (i32.const 0) (i32.const 192) (i32.const 4)))
 
-  (func (export "strand_on_message") (param $ptr i32) (param $len i32)
+  (func (export "strand_on_message") (param $port i32) (param $ptr i32) (param $len i32)
     (call $log (local.get $ptr) (local.get $len)))
 )

@@ -187,19 +187,33 @@ impl Parser {
             self.advance();
         }
         while !self.at(&Tok::Eof) {
-            if matches!(self.peek(), Tok::Fn | Tok::View | Tok::Type | Tok::Actor) {
+            if matches!(self.peek(), Tok::Fn | Tok::View | Tok::Type | Tok::Actor) || self.at_app()
+            {
                 return;
             }
             self.advance();
         }
     }
 
+    /// `app Name {` — contextual, so `app` stays an ordinary name everywhere
+    /// else. Three tokens is enough to be sure, and nothing else in the
+    /// language reads that way at item level.
+    fn at_app(&self) -> bool {
+        matches!((self.peek(), self.peek_at(1), self.peek_at(2)),
+            (Tok::Ident(word), Tok::Ident(_), Tok::LBrace) if word == "app")
+    }
+
     fn item(&mut self) -> PResult<Item> {
+        if self.at_app() {
+            return Ok(Item::App(self.app_decl()?));
+        }
         match self.peek() {
             Tok::Fn | Tok::View => Ok(Item::Fn(self.fn_decl()?)),
             Tok::Type => Ok(Item::Type(self.type_decl()?)),
             Tok::Actor => Ok(Item::Actor(self.actor_decl()?)),
-            other => self.error(format!("expected `fn`, `type` or `actor`, found {other}")),
+            other => {
+                self.error(format!("expected `fn`, `type`, `actor` or `app`, found {other}"))
+            }
         }
     }
 
@@ -229,18 +243,7 @@ impl Parser {
         }
         let (name, name_span) = self.expect_ident()?;
 
-        self.expect(Tok::LParen)?;
-        let mut params = Vec::new();
-        while !self.at(&Tok::RParen) {
-            let (pname, pspan) = self.expect_ident()?;
-            self.expect(Tok::Colon)?;
-            let ty = self.type_expr()?;
-            params.push(Param { name: pname, span: Self::join(pspan, ty.span()), ty });
-            if !self.eat(&Tok::Comma) {
-                break;
-            }
-        }
-        self.expect(Tok::RParen)?;
+        let params = self.params()?;
 
         // `: T` per §4.5; `-> T` also accepted since §6.2 writes views that way.
         let ret = if self.eat(&Tok::Colon) || self.eat(&Tok::Arrow) {
@@ -261,6 +264,43 @@ impl Parser {
         })
     }
 
+    /// `(a: int, b: string)` — shared by `fn` and by an `on` handler, which
+    /// differ in how they are reached rather than in how they are written.
+    fn params(&mut self) -> PResult<Vec<Param>> {
+        self.expect(Tok::LParen)?;
+        let mut params = Vec::new();
+        while !self.at(&Tok::RParen) {
+            let (name, span) = self.expect_ident()?;
+            self.expect(Tok::Colon)?;
+            let ty = self.type_expr()?;
+            params.push(Param { name, span: Self::join(span, ty.span()), ty });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(params)
+    }
+
+    /// `on <port>(state, msg): State` — the handler for an `in` port.
+    ///
+    /// Contextual like `state` and `in`: `on` is only a keyword directly in
+    /// front of `name(`, so it stays an ordinary identifier everywhere else.
+    fn at_handler(&self) -> bool {
+        matches!((self.peek(), self.peek_at(1), self.peek_at(2)),
+            (Tok::Ident(word), Tok::Ident(_), Tok::LParen) if word == "on")
+    }
+
+    /// `in name: T` / `out name: T`.
+    fn port_decl(&mut self) -> PResult<Port> {
+        let start = self.span();
+        self.advance();
+        let (name, name_span) = self.expect_ident()?;
+        self.expect(Tok::Colon)?;
+        let ty = self.type_expr()?;
+        Ok(Port { name, name_span, ty, span: Self::join(start, self.prev_span()) })
+    }
+
     fn actor_decl(&mut self) -> PResult<ActorDecl> {
         let start = self.expect(Tok::Actor)?;
         let (name, name_span) = self.expect_ident()?;
@@ -276,20 +316,45 @@ impl Parser {
         self.expect(Tok::Colon)?;
         let state = self.type_expr()?;
 
-        // Optional `message: T`; without it the channel carries strings.
-        let mut message = None;
-        if let (Tok::Ident(word), Tok::Colon) = (self.peek(), self.peek_at(1)) {
-            if word == "message" {
-                self.advance();
-                self.advance();
-                message = Some(self.type_expr()?);
+        // Then the channels, in either order and any number: `in` is what this
+        // actor can be told, `out` is what it can say.
+        let mut inbox = Vec::new();
+        let mut outbox = Vec::new();
+        loop {
+            if self.at(&Tok::In) {
+                inbox.push(self.port_decl()?);
+                continue;
             }
+            let is_out = matches!((self.peek(), self.peek_at(1)),
+                (Tok::Ident(word), Tok::Ident(_)) if word == "out");
+            if is_out {
+                outbox.push(self.port_decl()?);
+                continue;
+            }
+            break;
         }
 
         let mut init = None;
-        let mut receive = None;
+        let mut handlers: Vec<FnDecl> = Vec::new();
         let mut view = None;
-        while self.at(&Tok::Fn) || self.at(&Tok::View) {
+        while self.at(&Tok::Fn) || self.at(&Tok::View) || self.at_handler() {
+            if self.at_handler() {
+                let decl = self.handler_decl()?;
+                if handlers.iter().any(|h| h.name == decl.name) {
+                    let port = decl.name.clone();
+                    return Err(Diagnostic::new(
+                        decl.span,
+                        format!("port `{port}` is already handled"),
+                    )
+                    .with_label("a second handler for one port")
+                    .with_help(format!(
+                        "a port is one channel, so it has one handler — fold this into \
+                         the other `on {port}`",
+                    )));
+                }
+                handlers.push(decl);
+                continue;
+            }
             let decl = self.fn_decl()?;
             // A `view fn` is the actor's view whatever it is called: the
             // keyword already says what it is, so the name is free to say what
@@ -303,7 +368,8 @@ impl Parser {
                     )
                     .with_label("a second view")
                     .with_help(
-                        "an actor has one view; break the rest out as `view fn` items \n                         outside the actor and call them as children",
+                        "an actor has one view; break the rest out as `view fn` items \
+                         outside the actor and call them as children",
                     ));
                 }
                 view = Some(decl);
@@ -311,33 +377,107 @@ impl Parser {
             }
             match decl.name.as_str() {
                 "init" => init = Some(decl),
-                "receive" => receive = Some(decl),
                 other => {
                     return Err(Diagnostic::new(decl.span, format!("unexpected function `{other}`"))
                         .with_label("not part of an actor")
                         .with_help(
-                            "an actor declares `init` and `receive`, and optionally a \n                             `view fn` to draw itself",
+                            "an actor declares `fn init()`, an `on <port>` handler for each \
+                             `in` port, and optionally a `view fn` to draw itself",
                         ));
                 }
             }
         }
         let end = self.expect(Tok::RBrace)?;
 
-        let (Some(init), Some(receive)) = (init, receive) else {
-            return Err(Diagnostic::new(Self::join(start, end), format!("actor `{name}` is incomplete"))
-                .with_label("missing `init` or `receive`")
-                .with_help("an actor needs `fn init()` for its starting state and `fn receive(state, msg)` for each message"));
+        let Some(init) = init else {
+            return Err(Diagnostic::new(
+                Self::join(start, end),
+                format!("actor `{name}` has no `init`"),
+            )
+            .with_label("no starting state")
+            .with_help("an actor needs `fn init()` returning the state it starts with"));
         };
 
         Ok(ActorDecl {
             name,
             name_span,
             state,
-            message,
+            inbox,
+            outbox,
             init,
-            receive,
+            handlers,
             view,
             span: Self::join(start, end),
+        })
+    }
+
+    /// The body of `on name(...)`, which is a `fn` in every way except how it
+    /// is reached: nothing calls a handler, the mailbox does.
+    fn handler_decl(&mut self) -> PResult<FnDecl> {
+        let start = self.span();
+        self.advance();
+        let (name, name_span) = self.expect_ident()?;
+        let params = self.params()?;
+        let ret = if self.eat(&Tok::Colon) || self.eat(&Tok::Arrow) {
+            Some(self.type_expr()?)
+        } else {
+            None
+        };
+        let body = self.block()?;
+        Ok(FnDecl {
+            name,
+            name_span,
+            params,
+            ret,
+            body,
+            is_view: false,
+            span: Self::join(start, self.prev_span()),
+        })
+    }
+
+    /// `app Name { ui = TodoUi ... ui.out -> stats.in }`.
+    fn app_decl(&mut self) -> PResult<AppDecl> {
+        let start = self.span();
+        self.advance();
+        let (name, name_span) = self.expect_ident()?;
+        self.expect(Tok::LBrace)?;
+
+        let mut instances = Vec::new();
+        let mut wires = Vec::new();
+        while !self.at(&Tok::RBrace) {
+            let (first, first_span) = self.expect_ident()?;
+            if self.eat(&Tok::Eq) {
+                let (actor, actor_span) = self.expect_ident()?;
+                instances.push(Instance {
+                    name: first,
+                    name_span: first_span,
+                    actor,
+                    actor_span,
+                    span: Self::join(first_span, actor_span),
+                });
+                continue;
+            }
+            let from = self.port_ref(first, first_span)?;
+            self.expect(Tok::Arrow)?;
+            let (to_instance, to_span) = self.expect_ident()?;
+            let to = self.port_ref(to_instance, to_span)?;
+            wires.push(WireDecl { span: Self::join(from.span, to.span), from, to });
+        }
+        let end = self.expect(Tok::RBrace)?;
+
+        Ok(AppDecl { name, name_span, instances, wires, span: Self::join(start, end) })
+    }
+
+    /// The `ui.stats` half of a wire, given the instance name already read.
+    fn port_ref(&mut self, instance: String, instance_span: Span) -> PResult<PortRef> {
+        self.expect(Tok::Dot)?;
+        let (port, port_span) = self.expect_ident()?;
+        Ok(PortRef {
+            instance,
+            instance_span,
+            port,
+            port_span,
+            span: Self::join(instance_span, port_span),
         })
     }
 

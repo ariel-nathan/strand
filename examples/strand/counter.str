@@ -11,11 +11,13 @@ type Count = { total: int, seen: int }
 actor Counter {
   state: Count
 
+  in bumps: string
+
   fn init(): Count {
     Count { total: 0, seen: 0 }
   }
 
-  fn receive(state: Count, msg: string): Count {
+  on bumps(state: Count, msg: string): Count {
     match msg {
       "inc"   => Count { total: state.total + 1, seen: state.seen + 1 },
       "dec"   => Count { total: state.total - 1, seen: state.seen + 1 },

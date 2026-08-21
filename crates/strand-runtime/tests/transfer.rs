@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use strand_runtime::sim::{self, SimOptions};
-use strand_runtime::{engine, spawn_supervised, Event, Message, Policy, Registry};
+use strand_runtime::{engine, spawn_supervised, Event, Message, Policy, Registry, Wiring};
 
 const SENDER: u32 = 0;
 const RECEIVER: u32 = 1;
@@ -35,6 +35,10 @@ fn run(seed: u64) -> (Vec<Event>, String) {
 
     let trace = sim::run(SimOptions::new(seed), move |registry: Registry| async move {
         let engine = engine()?;
+        // The receiver answers on its out port 0, and this is what says where
+        // that leads. Its reply is what makes the sender touch the handle it
+        // already gave away, which is the trap this scenario is about.
+        registry.route_out(RECEIVER, vec![Some(Wiring { to: SENDER, port: 0 })]);
         // Start the receiver first and let it register: the sender transfers
         // during its own startup, and you cannot send to an actor that has no
         // mailbox yet.

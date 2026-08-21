@@ -164,7 +164,7 @@ fn heading(state: Model): string {
 
 actor TodoApp {
   state: Model
-  message: Input
+  in input: Input
 
   fn init(): Model {
     Model {
@@ -182,7 +182,7 @@ actor TodoApp {
     }
   }
 
-  fn receive(state: Model, msg: Input): Model {
+  on input(state: Model, msg: Input): Model {
     match msg {
       Typed(ch) => withDraft(state, state.draft + char(ch)),
       Backspace => withDraft(state, dropLast(state.draft)),

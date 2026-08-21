@@ -28,7 +28,7 @@
     (call $bsend (i32.const 1) (global.get $handle))
     (call $log (i32.const 128) (i32.const 30)))
 
-  (func (export "strand_on_message") (param $ptr i32) (param $len i32)
+  (func (export "strand_on_message") (param $port i32) (param $ptr i32) (param $len i32)
     (call $log (i32.const 192) (i32.const 25))
     ;; The handle is stale: ownership moved to actor 1. This traps.
     (drop (call $blen (global.get $handle))))

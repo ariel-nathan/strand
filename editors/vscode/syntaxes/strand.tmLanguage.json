@@ -11,6 +11,7 @@
     { "include": "#function-declaration" },
     { "include": "#type-declaration" },
     { "include": "#actor-declaration" },
+    { "include": "#port-declaration" },
     { "include": "#keyword" },
     { "include": "#builtin-type" },
     { "include": "#builtin-function" },
@@ -94,11 +95,31 @@
     },
 
     "actor-declaration": {
-      "match": "\\b(actor)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "match": "\\b(actor|app)\\s+([A-Za-z_][A-Za-z0-9_]*)",
       "captures": {
         "1": { "name": "keyword.declaration.actor.strand" },
         "2": { "name": "entity.name.type.actor.strand" }
       }
+    },
+
+    "port-declaration": {
+      "comment": "check.rs -- `in name: T` and `out name: T` declare an actor's channels; `on name(` handles one. All three are contextual in the parser, so all three are anchored here rather than listed as keywords.",
+      "patterns": [
+        {
+          "match": "^\\s*(in|out)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=:)",
+          "captures": {
+            "1": { "name": "keyword.declaration.port.strand" },
+            "2": { "name": "entity.name.function.port.strand" }
+          }
+        },
+        {
+          "match": "^\\s*(on)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "keyword.declaration.strand" },
+            "2": { "name": "entity.name.function.strand" }
+          }
+        }
+      ]
     },
 
     "keyword": {
@@ -115,6 +136,11 @@
         {
           "match": "\\b(fn|let|var|type|actor)\\b",
           "name": "keyword.declaration.strand"
+        },
+        {
+          "comment": "check.rs -- `send` names one of the actor's own out ports. A host call rather than a function, and not shadowable.",
+          "match": "\\b(send)\\b(?=\\s*\\()",
+          "name": "support.function.builtin.strand"
         },
         {
           "match": "\\b(true|false)\\b",

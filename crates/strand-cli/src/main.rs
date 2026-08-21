@@ -135,13 +135,12 @@ fn run(path: &Path) -> Result<()> {
 /// without a screen.
 fn view(path: &Path, viewport: Option<(f32, f32)>) -> Result<()> {
     let (hir, _) = front_end(path)?;
-    let wasm = strandc::codegen::emit(&hir).map_err(|e| anyhow::anyhow!("{e}"))?;
     match viewport {
         Some(viewport) => {
-            print!("{}", strand_cli::view::inspect(&hir, &wasm, viewport)?);
+            print!("{}", strand_cli::view::inspect(&hir, viewport)?);
             Ok(())
         }
-        None => strand_cli::view::run(&hir, &wasm),
+        None => strand_cli::view::run(&hir),
     }
 }
 

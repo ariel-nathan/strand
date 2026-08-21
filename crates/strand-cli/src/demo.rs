@@ -5,13 +5,23 @@ use std::time::Duration;
 
 use anyhow::Result;
 use strand_render::inspect::StatsHandle;
-use strand_runtime::{engine, spawn_actor, spawn_supervised, Message, Policy, Registry, HOST};
+use strand_runtime::{
+    engine, spawn_actor, spawn_supervised, Message, Policy, Registry, Wiring, HOST,
+};
 
 const ACTORS: [(u32, &str, &str); 3] = [
     (0, "ping", "wasm/ping.wat"),
     (1, "pong", "wasm/pong.wat"),
     (2, "ticker", "wasm/ticker.wat"),
 ];
+
+/// Who each actor's out port 0 leads to.
+///
+/// The fixtures name a port of their own and nothing else; that a `send` from
+/// ping arrives at pong is decided here, by the host, exactly as an `app`
+/// block decides it for compiled Strand. Written out because these two are
+/// hand-written WAT and have no `app` block to be read from.
+const WIRES: [(u32, u32); 2] = [(0, 1), (1, 0)];
 
 pub fn run(windowed: bool) -> Result<()> {
     run_with(windowed, false)
@@ -54,6 +64,9 @@ async fn run_actors(traced: bool, stats: Option<StatsHandle>) -> Result<()> {
     }
 
     println!("--- strand M0: 3 actors, 1 worker thread ---");
+    for (from, to) in WIRES {
+        registry.route_out(from, vec![Some(Wiring { to, port: 0 })]);
+    }
     let mut handles = Vec::new();
     for (id, name, path) in ACTORS {
         let wat = crate::examples::read(path)?;
@@ -148,7 +161,7 @@ async fn run_crash(traced: bool, forever: bool, stats: Option<StatsHandle>) -> R
 
     let beat = Duration::from_millis(120);
     let poke = |bytes: &[u8]| {
-        let _ = registry.send(CRASHER, Message::Blob { from: HOST, bytes: bytes.to_vec() });
+        let _ = registry.send(CRASHER, Message::Blob { from: HOST, port: 0, bytes: bytes.to_vec() });
     };
 
     loop {

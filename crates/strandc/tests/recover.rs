@@ -17,6 +17,7 @@ fn item_names(program: &strandc::ast::Program) -> Vec<String> {
             Item::Fn(f) => f.name.clone(),
             Item::Type(t) => t.name.clone(),
             Item::Actor(a) => a.name.clone(),
+            Item::App(a) => a.name.clone(),
         })
         .collect()
 }
@@ -98,8 +99,9 @@ fn bad(: int { 1 }
 type Colour = | Red | Green
 actor Counter {
   state: Colour
+  in inbox: string
   fn init(): Colour { Red }
-  fn receive(state: Colour, msg: string): Colour { state }
+  on inbox(state: Colour, msg: string): Colour { state }
 }
 ";
     let (program, errors) = parse_recovering(src);

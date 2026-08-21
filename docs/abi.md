@@ -34,10 +34,19 @@ the actor's lifetime. §4.3 routes *every* fallible call through `Result`, and
 per-actor arena sizes. Boxing every `Result` would leak on each fallible call
 and make the leak visible in the very overlay meant to demonstrate isolation.
 
-## 3. User sum types: boxed
+## 3. User sum types: boxed, and uniformly sized
 
 `type AddError = | EmptyTitle | TooLong(max: int)` becomes a pointer to
 `{ i32 tag, fields... }`. An all-niladic enum degrades to a bare `i32` tag.
+
+Every variant of a sum takes the same room: one word for the tag, then one per
+field of the **widest** variant. The narrow ones leave a few bytes unused, and
+in exchange the size of a value is a property of its type rather than of its
+tag. That is what lets §7's `send` put a constant length on the wire instead of
+computing one from the tag at run time — a whole small subsystem that does not
+need to exist. It also removes a hazard: an exact-fit block sitting at the end
+of the arena, read at the width of the widest variant, would read past the end
+of linear memory.
 
 These are constructed on error paths, so allocation there is acceptable at POC
 scale. Revisit if measurement (M5) says otherwise.
@@ -99,13 +108,14 @@ never touches the host stays standalone and can be instantiated with no imports
 at all. Because imports occupy the lowest function indices, every defined
 function shifts past them — that offset is applied once, in the emitter.
 
-Callable from Strand today: `log(msg: string)`. It takes a Strand string and
-unpacks §5's header into the `(ptr, len)` pair the host expects.
+Callable from Strand today: `log(msg: string)` and `send(port, value)`. Both
+unpack their argument into the `(ptr, len)` pair the host expects — `log` from
+§5's string header, `send` per §7.
 
 Imports:
 
     strand.log(ptr: i32, len: i32)
-    strand.send(to: i32, ptr: i32, len: i32)
+    strand.send(port: i32, ptr: i32, len: i32)
     strand.sleep_ms(ms: i64)            // async host call: suspends the fiber
 
 Exports:
@@ -113,17 +123,42 @@ Exports:
     memory
     strand_alloc(size: i32) -> i32      // bump allocator in the guest arena
     strand_main()                       // optional
-    strand_on_message(ptr: i32, len: i32)   // optional
+    strand_on_message(port: i32, ptr: i32, len: i32)   // optional
 
-## 7. Channel messages: the wire format is the memory format
+An actor's own functions — `init`, its handlers, its view — are **not**
+exported. They are reached through the entry points above, and two actors in
+one file both declaring `init` is the ordinary case rather than a clash.
 
-A message type is declared on the actor:
+Import signatures are interned before the type section is written. Doing it
+where the import section is built instead means an import whose type is new at
+that point names an index the module does not contain; it went unnoticed while
+`log`'s `(i32, i32)` happened to match the old two-argument
+`strand_on_message`.
 
-    actor Counter {
-      state: Count
-      message: Msg      // defaults to `string` when omitted
+## 7. Channels are ports, and the wire format is the memory format
+
+An actor declares its channels by name and type, and nothing else:
+
+    actor Meter {
+      state: Reading
+      in  samples: Sample     // what it can be told
+      out totals:  Total      // what it can say
       ...
     }
+
+Each `in` port has a handler named after it — `on samples(state, msg): State` —
+and `send(totals, value)` puts a value on an out port. **The index is the
+protocol**: the checker resolves a port name to its position in the actor's
+`inbox` or `outbox`, and that number is what crosses the boundary. A name never
+does.
+
+**There is no actor address.** Nothing in the language can name another actor,
+so an actor can only reach the peers it was wired to. The wiring lives in an
+`app` block (§10), the registry holds it, and the guest holds none of it. Two
+things fall out for free: location transparency (design doc §9.5), since a port
+whose far end is on another machine changes only the `app` block; and the
+beginnings of §9.2's capability model, reached by having no addresses rather
+than by checking them.
 
 **Message types must be flat.** A variant's fields may be `int`, `float` or
 `bool` — nothing that holds a pointer. The checker enforces this and says why:
@@ -134,14 +169,14 @@ That restriction buys the property `docs/inspiration-canon.md` takes from
 Cap'n Proto: **the wire format is the memory format.** The bytes on the channel
 are exactly §3's boxed-variant layout, so once the runtime has copied them into
 the receiving arena with `strand_alloc`, the pointer it already has *is* a
-valid value. `strand_on_message` hands it straight to `receive`. There is no
-decode step, and adding one would be the bug.
+valid value. `strand_on_message` hands it straight to the port's handler. There
+is no decode step, and adding one would be the bug.
 
 Encoding, matching §3:
 
 | message type | bytes on the wire |
 |---|---|
-| sum with any payload-carrying variant | `i32 tag` in the first 8-byte slot, then one 8-byte slot per field |
+| sum with any payload-carrying variant | `i32 tag` in the first 8-byte slot, then one 8-byte slot per field of the widest variant (§3) |
 | all-niladic sum | bare `i32` tag |
 | `int` / `float` | the 8-byte value |
 | `bool` | `i32` 0 or 1 |
@@ -150,11 +185,16 @@ Encoding, matching §3:
 `string` is the one relocated case, and it is safe only because codegen knows
 that layout and rebuilds the header in the receiving arena.
 
-**Not yet done.** Sending from Strand code needs a `send` builtin, which needs
-host imports in emitted modules — the function-index space shifts once imports
-exist, so it is a real change rather than an addition. Today the sending half
-is exercised by a host encoder that reads layout from the same `Hir`, so both
-ends still agree by construction.
+Sending is the same layout read the other way. A boxed variant is already laid
+out as the wire wants it, so `send` hands over the pointer it has and a length
+that is a constant of the type (§3). An immediate — an `int`, a `bool`, a bare
+tag — has no address, so codegen reserves one word of static scratch and writes
+it there; the host copies before the call returns, so one slot serves every
+send in the module.
+
+The host encoder used by the CLI reads layout from the same `Hir`, so the two
+sending paths agree with the receiving one by construction rather than by
+being kept in step.
 
 ## 8. The frame: how a view crosses into the host
 
@@ -275,9 +315,14 @@ exhaustive over it, and a typo is a compile error.
 
 **Why it is opt-in.** Registering the type also registers `Click`, `Enter` and
 the rest as constructors, and those are ordinary names a UI program might want.
-So it appears only in a module that writes `message: Input`, and a module that
-declares its own `type Input` keeps its own. A file that never mentions it
-reserves nothing.
+So it appears only in a module that names `Input` as a port's type, and a
+module that declares its own `type Input` keeps its own. A file that never
+mentions it reserves nothing.
+
+The platform finds the port by **type, not by name**: whichever `in` port
+carries `Input` is where clicks are delivered, so calling it `input` is a
+convention and carrying `Input` is the fact. Matching on the name would be the
+protocol-held-together-by-spelling this section exists to avoid.
 
 `crates/strandc/src/input.rs` is the single table, read by the checker and by
 the host's translation from `InputEvent` — the same discipline `ui.rs` imposes
@@ -293,3 +338,36 @@ down.
 `crates/strandc/src/ui.rs` is the single table describing all of this. The
 parser, the checker, codegen and the host's decoder all read it, so the two
 ends of the boundary cannot disagree about a byte.
+
+## 10. The app block: the supervision tree, written down
+
+    app Pipeline {
+      meter    = Meter
+      reporter = Reporter
+
+      meter.totals -> reporter.totals
+    }
+
+An instance is an actor that runs, with the name the wires call it by. A wire
+joins one actor's out port to another's in port, and the checker requires that
+both ends exist and that their types match exactly.
+
+Every out port must be wired. An unwired one is a `send` that vanishes, and
+"your messages went nowhere" discovered at run time is the opposite of what
+design doc §8.2 asks a diagnostic to be.
+
+The block is in the source rather than in a config file because the wiring is
+typed and the compiler is the only thing that can check it — §8.1 asks for zero
+config files, and a wiring the compiler cannot see is a wiring that fails
+later, somewhere else.
+
+**One module per actor.** A module carries one actor's ABI: the state global,
+`strand_main` and `strand_on_message` are singular by construction. A file
+holding several actors is compiled once per actor, which is also what gives
+each of them its own arena — the file is a unit of source, and §5.1's unit of
+isolation is the instance. The emitted modules are near-identical apart from
+which functions the entry points call, and that cost is paid in bytes rather
+than in isolation.
+
+A file with one actor and no `app` block is an app of one actor with no wires,
+so there is one path rather than a general one and a special case.

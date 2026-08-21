@@ -15,13 +15,13 @@ type Msg =
 
 actor Counter {
   state: Count
-  message: Msg
+  in counts: Msg
 
   fn init(): Count {
     Count { total: 0, seen: 0 }
   }
 
-  fn receive(state: Count, msg: Msg): Count {
+  on counts(state: Count, msg: Msg): Count {
     match msg {
       Inc    => Count { total: state.total + 1, seen: state.seen + 1 },
       Dec    => Count { total: state.total - 1, seen: state.seen + 1 },

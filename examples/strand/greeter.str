@@ -12,14 +12,14 @@ type Greeting =
 
 actor Greeter {
   state: Seen
-  message: Greeting
+  in greetings: Greeting
 
   fn init(): Seen {
     log("greeter: ready")
     Seen { count: 0 }
   }
 
-  fn receive(state: Seen, msg: Greeting): Seen {
+  on greetings(state: Seen, msg: Greeting): Seen {
     match msg {
       Hello => {
         log("greeter: hello")

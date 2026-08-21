@@ -6,6 +6,7 @@ pub mod demo;
 pub mod encode;
 pub mod examples;
 pub mod frame;
+pub mod plan;
 pub mod run;
 pub mod stats;
 pub mod todo;

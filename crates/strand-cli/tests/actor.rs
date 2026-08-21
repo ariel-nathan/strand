@@ -63,11 +63,15 @@ impl Driver {
         let memory = self.instance.get_memory(&mut self.store, "memory").expect("no memory");
         memory.write(&mut self.store, ptr as usize, bytes).expect("write failed");
 
+        // Port 0: these actors declare one `in` port, and the port number is
+        // what the host would have resolved from the app's wiring.
         let on_message = self
             .instance
-            .get_typed_func::<(i32, i32), ()>(&mut self.store, "strand_on_message")
+            .get_typed_func::<(i32, i32, i32), ()>(&mut self.store, "strand_on_message")
             .expect("no strand_on_message export");
-        on_message.call(&mut self.store, (ptr, bytes.len() as i32)).expect("receive trapped");
+        on_message
+            .call(&mut self.store, (0, ptr, bytes.len() as i32))
+            .expect("receive trapped");
     }
 
     /// Reads `{ total, seen }` out of the exported state pointer.
@@ -119,7 +123,7 @@ fn receive_folds_the_state_across_messages() {
 #[test]
 fn the_module_declares_its_actor() {
     let (hir, _) = compile("counter.str");
-    let actor = hir.actor.expect("counter.str declares an actor");
+    let actor = hir.lone_actor().expect("counter.str declares an actor").clone();
     assert_eq!(actor.name, "Counter");
 }
 
@@ -137,7 +141,7 @@ fn the_runtime_hosts_a_strand_actor() {
         tokio::time::sleep(Duration::from_millis(20)).await;
         for text in ["inc", "inc", "reset"] {
             let _ =
-                registry.send(0, Message::Blob { from: HOST, bytes: text.as_bytes().to_vec() });
+                registry.send(0, Message::Blob { from: HOST, port: 0, bytes: text.as_bytes().to_vec() });
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
@@ -175,7 +179,7 @@ fn the_runtime_hosts_a_strand_actor() {
 /// Sends a typed message the way a host would: encode against the declared
 /// message type, then deliver the bytes unchanged.
 fn send_typed(driver: &mut Driver, hir: &Hir, spec: &str) {
-    let message_ty = hir.actor.as_ref().expect("an actor").message.clone();
+    let message_ty = hir.lone_actor().expect("an actor").inbox[0].ty.clone();
     let bytes = strand_cli::encode::encode(hir, &message_ty, spec)
         .unwrap_or_else(|e| panic!("encoding {spec:?}: {e}"));
     driver.send_bytes(&bytes);
@@ -204,7 +208,7 @@ fn a_typed_channel_carries_a_declared_sum() {
 #[test]
 fn the_encoder_rejects_a_variant_that_does_not_exist() {
     let (hir, _) = compile("typed_counter.str");
-    let message_ty = hir.actor.as_ref().unwrap().message.clone();
+    let message_ty = hir.lone_actor().unwrap().inbox[0].ty.clone();
     let error = strand_cli::encode::encode(&hir, &message_ty, "Nope").unwrap_err().to_string();
     assert!(error.contains("not a variant"), "was: {error}");
     assert!(error.contains("Inc"), "the error should list the real variants, was: {error}");
@@ -213,7 +217,7 @@ fn the_encoder_rejects_a_variant_that_does_not_exist() {
 #[test]
 fn the_encoder_checks_variant_arity() {
     let (hir, _) = compile("typed_counter.str");
-    let message_ty = hir.actor.as_ref().unwrap().message.clone();
+    let message_ty = hir.lone_actor().unwrap().inbox[0].ty.clone();
     let error = strand_cli::encode::encode(&hir, &message_ty, "Add").unwrap_err().to_string();
     assert!(error.contains("takes 1 argument"), "was: {error}");
 }
@@ -226,9 +230,9 @@ fn a_message_type_holding_a_pointer_is_rejected() {
         type Msg = | Named(label: string)
         actor Counter {
           state: Count
-          message: Msg
+          in inbox: Msg
           fn init(): Count { Count { total: 0, seen: 0 } }
-          fn receive(state: Count, msg: Msg): Count { state }
+          on inbox(state: Count, msg: Msg): Count { state }
         }";
     let program = strandc::parser::parse(source).expect("should parse");
     let errors = strandc::check::check(&program).expect_err("should not check");
@@ -243,15 +247,15 @@ fn receive_must_match_the_declared_message_type() {
         type Msg = | Inc
         actor Counter {
           state: Count
-          message: Msg
+          in inbox: Msg
           fn init(): Count { Count { total: 0, seen: 0 } }
-          fn receive(state: Count, msg: string): Count { state }
+          on inbox(state: Count, msg: string): Count { state }
         }";
     let program = strandc::parser::parse(source).expect("should parse");
     let errors = strandc::check::check(&program).expect_err("should not check");
     let text: Vec<String> = errors.iter().map(|e| e.message.clone()).collect();
     assert!(
-        text.join(" | ").contains("takes the message as Msg"),
+        text.join(" | ").contains("`on inbox` receives Msg"),
         "both ends must agree, was: {text:?}"
     );
 }
@@ -259,7 +263,7 @@ fn receive_must_match_the_declared_message_type() {
 #[test]
 fn the_runtime_delivers_typed_messages() {
     let (hir, wasm) = compile("typed_counter.str");
-    let message_ty = hir.actor.as_ref().unwrap().message.clone();
+    let message_ty = hir.lone_actor().unwrap().inbox[0].ty.clone();
     let payloads: Vec<Vec<u8>> = ["Inc", "Add 10", "Inc"]
         .iter()
         .map(|spec| strand_cli::encode::encode(&hir, &message_ty, spec).expect("encode"))
@@ -271,7 +275,7 @@ fn the_runtime_delivers_typed_messages() {
             spawn_supervised(&engine, &registry, 0, "counter", &wasm, Policy::Restart, None);
         tokio::time::sleep(Duration::from_millis(20)).await;
         for bytes in payloads {
-            let _ = registry.send(0, Message::Blob { from: HOST, bytes });
+            let _ = registry.send(0, Message::Blob { from: HOST, port: 0, bytes });
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let _ = registry.send(0, Message::Stop);
@@ -297,7 +301,7 @@ fn a_strand_actor_can_call_the_host() {
     // The module imports `strand.log`, so it can only run under the runtime —
     // which is the point: Strand code reaching the host through the real ABI.
     let (hir, wasm) = compile("greeter.str");
-    let message_ty = hir.actor.as_ref().unwrap().message.clone();
+    let message_ty = hir.lone_actor().unwrap().inbox[0].ty.clone();
     let payloads: Vec<Vec<u8>> = ["Hello", "Bye"]
         .iter()
         .map(|spec| strand_cli::encode::encode(&hir, &message_ty, spec).expect("encode"))
@@ -309,7 +313,7 @@ fn a_strand_actor_can_call_the_host() {
             spawn_supervised(&engine, &registry, 0, "greeter", &wasm, Policy::Restart, None);
         tokio::time::sleep(Duration::from_millis(20)).await;
         for bytes in payloads {
-            let _ = registry.send(0, Message::Blob { from: HOST, bytes });
+            let _ = registry.send(0, Message::Blob { from: HOST, port: 0, bytes });
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let _ = registry.send(0, Message::Stop);

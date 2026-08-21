@@ -81,7 +81,7 @@ fn drive(events: Vec<InputEvent>) -> Vec<Node> {
 
 fn drive_source(src: &str, events: Vec<InputEvent>) -> Vec<Node> {
     let (hir, wasm) = compile(src);
-    let message_ty = hir.actor.as_ref().expect("an actor").message.clone();
+    let message_ty = hir.lone_actor().expect("an actor").inbox[0].ty.clone();
     let captured = Arc::new(Captured::default());
     let sink = captured.clone();
 
@@ -105,7 +105,7 @@ fn drive_source(src: &str, events: Vec<InputEvent>) -> Vec<Node> {
                 let spec = spec_for(event).expect("this test sends deliverable events");
                 let bytes = strand_cli::encode::encode(&hir, &message_ty, &spec)
                     .unwrap_or_else(|e| panic!("encoding {spec}: {e:#}"));
-                registry.send_from(HOST, UI, Message::Blob { from: HOST, bytes })?;
+                registry.send_from(HOST, UI, Message::Blob { from: HOST, port: 0, bytes })?;
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
 
@@ -209,7 +209,7 @@ fn the_actor_is_an_actor_like_any_other() {
             &engine()?,
             &registry,
             UI,
-            &hir.actor.expect("an actor").name,
+            &hir.lone_actor().expect("an actor").name.clone(),
             &wasm,
             Policy::Restart,
             None,
