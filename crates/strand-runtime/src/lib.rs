@@ -210,6 +210,22 @@ pub struct ActorCtx {
     pub id: ActorId,
     pub name: String,
     pub registry: Registry,
+    /// Buffers this actor currently owns (§5.3). Sending one removes it, which
+    /// is what makes the transfer real rather than advisory.
+    buffers: HashMap<u32, Vec<u8>>,
+    next_buffer: u32,
+}
+
+impl ActorCtx {
+    fn new(id: ActorId, name: String, registry: Registry) -> Self {
+        Self { id, name, registry, buffers: HashMap::new(), next_buffer: 1 }
+    }
+
+    /// Takes a buffer out of this actor's hands. Returns `None` if the actor
+    /// never owned it, or has already given it away.
+    fn take_buffer(&mut self, handle: u32) -> Option<Vec<u8>> {
+        self.buffers.remove(&handle)
+    }
 }
 
 impl ActorCtx {
@@ -258,6 +274,53 @@ fn link_host_abi(linker: &mut Linker<ActorCtx>) -> Result<()> {
             ctx.registry
                 .send_from(ctx.id, to as ActorId, Message::Blob { from: ctx.id, bytes })
                 .map_err(wasmtime::Error::from_anyhow)
+        },
+    )?;
+
+    // §5.3 ownership transfer. The sender copies bytes into a host-owned
+    // buffer and gets a handle; sending it moves the allocation out of the
+    // sender's table, so any later use of that handle traps. Data races are
+    // unrepresentable rather than discouraged.
+    linker.func_wrap(
+        "strand",
+        "buffer_create",
+        |mut caller: Caller<'_, ActorCtx>, ptr: i32, len: i32| -> wasmtime::Result<i32> {
+            let bytes = read_guest_bytes(&mut caller, ptr, len)?;
+            let ctx = caller.data_mut();
+            let handle = ctx.next_buffer;
+            ctx.next_buffer += 1;
+            ctx.buffers.insert(handle, bytes);
+            Ok(handle as i32)
+        },
+    )?;
+
+    linker.func_wrap(
+        "strand",
+        "buffer_send",
+        |mut caller: Caller<'_, ActorCtx>, to: i32, handle: i32| -> wasmtime::Result<()> {
+            let ctx = caller.data_mut();
+            let Some(bytes) = ctx.take_buffer(handle as u32) else {
+                wasmtime::bail!(
+                    "buffer {handle} is not owned by this actor — it was already transferred"
+                );
+            };
+            let from = ctx.id;
+            ctx.registry
+                .send_from(from, to as ActorId, Message::Blob { from, bytes })
+                .map_err(wasmtime::Error::from_anyhow)
+        },
+    )?;
+
+    linker.func_wrap(
+        "strand",
+        "buffer_len",
+        |caller: Caller<'_, ActorCtx>, handle: i32| -> wasmtime::Result<i32> {
+            match caller.data().buffers.get(&(handle as u32)) {
+                Some(bytes) => Ok(bytes.len() as i32),
+                None => wasmtime::bail!(
+                    "buffer {handle} is not owned by this actor — it was already transferred"
+                ),
+            }
         },
     )?;
 
@@ -329,9 +392,21 @@ impl std::error::Error for CrashReport {}
 /// wasmtime leads with "error while executing at wasm backtrace:" and puts the
 /// actual trap further down, so the first line is the least informative part.
 fn reason(error: &wasmtime::Error) -> String {
-    // Debug renders the causal chain; Display shows only the top line, which
-    // for a trap is the uninformative half.
-    first_line(&format!("{error:?}"))
+    // Debug renders the causal chain. wasmtime's outer message is always the
+    // uninformative "error while executing at wasm backtrace:", and the part
+    // worth reporting — a trap, or a host function's own message — sits under
+    // "Caused by:".
+    let rendered = format!("{error:?}");
+    if let Some(rest) = rendered.split_once("Caused by:") {
+        if let Some(cause) = rest.1.lines().map(str::trim).find(|line| !line.is_empty()) {
+            // Multi-cause chains number their entries: "0: the real message".
+            let cause = cause.split_once(": ").map_or(cause, |(index, text)| {
+                if index.trim().chars().all(|c| c.is_ascii_digit()) { text } else { cause }
+            });
+            return cause.to_string();
+        }
+    }
+    first_line(&rendered)
 }
 
 fn first_line(text: &str) -> String {
@@ -388,7 +463,7 @@ async fn run_actor_once(
     let mut linker = Linker::new(engine);
     link_host_abi(&mut linker).map_err(|e| died(format!("failed to link host ABI: {e}"), None))?;
 
-    let ctx = ActorCtx { id, name: name.to_string(), registry: registry.clone() };
+    let ctx = ActorCtx::new(id, name.to_string(), registry.clone());
     let mut store = Store::new(engine, ctx);
     // Yield back to the scheduler on an epoch tick rather than trapping.
     store.set_epoch_deadline(1);
