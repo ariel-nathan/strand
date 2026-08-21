@@ -22,7 +22,7 @@ The POC is a **full vertical slice**: a small typed language compiles to a multi
 4. Crash isolation: a panicking actor dies and is reclaimed without affecting the rest of the app.
 5. All of the above working together in a todo app.
 
-**Explicit non-goals for the POC** (noted as future work, §9): backwards compatibility with HTML/CSS/JS, a self-hosted bytecode VM, content-addressed module distribution, the capability security model, networking, persistence, accessibility, and text input beyond the minimum the todo app needs.
+**Explicit non-goals for the POC** (noted as future work, §11): backwards compatibility with HTML/CSS/JS, a self-hosted bytecode VM, content-addressed module distribution, the capability security model, networking, persistence, accessibility, and text input beyond the minimum the todo app needs.
 
 ## 3. Architecture Overview
 
@@ -142,7 +142,8 @@ Each actor has a parent. On panic, the runtime tears down the actor, reclaims it
 No DOM, no HTML, no diffing in userland. UI is a function of state, and the platform owns reconciliation:
 
 - App actors build a lightweight **UI tree** (view functions returning nodes) and submit it to the render actor over a channel.
-- The **render thread** (platform-owned: winit event loop + wgpu) diffs against the retained scene graph, computes layout (flexbox subset via `taffy`), and paints.
+- Layout resolves the tree into a flat, typed **render command array** (rect, text, image, clip-start/end) — an architecture proven by clay (see §13), which is renderer-agnostic, trivially diffable, cheaply serializable over actor channels, and even compilable to HTML (a useful proof-of-concept for the future backwards-compat story, run in reverse). Layout allocates from a per-frame arena that is reset each frame — no GC pressure from UI, following clay's static-arena model (~3.5 MB for 8k elements).
+- The **render thread** (platform-owned: winit event loop + wgpu) diffs command arrays against the retained scene graph and paints. Layout uses `taffy` initially; clay's algorithm is the reference if we replace it.
 - Input events flow back as typed messages to whichever actor owns the hit node.
 
 Because submission is a message, a slow app actor delays *its own* updates only; the compositor keeps running at frame rate. This is the POC's most visible claim, so the demo includes a "spin the CPU" button proving the UI stays responsive while an actor is pegged.
@@ -182,7 +183,8 @@ view fn todoList(todos: List<Todo>, onToggle: fn(Id)) -> Node {
 | `content-box` vs `border-box` (everyone opts into border-box anyway) | Border-box semantics only |
 | Unit zoo: px, em, rem, %, vh, vw, ch, ex… | Logical pixels + fractional weights (`flex: 1`-style) + percent-of-parent. That's it for POC |
 | Media queries target the *viewport*; container queries (what components actually needed) arrived ~20 years late | Responsiveness is container-based by default: a view can branch on its own allotted size |
-| Implicit stacking contexts and z-index wars | Paint order = tree order; overlays via an explicit `overlay { }` layer node. No z-index |
+| Implicit stacking contexts and z-index wars | Paint order = tree order. Tooltips/modals use clay-style **floating elements with attach points** — declare which point of the floating node pins to which point of its anchor (`attach(element: .bottomCenter, anchor: .topCenter)`). No z-index; floats sort by an explicit small layer number only among themselves |
+| Sizing via width/height/min/max/flex-basis/flex-grow/flex-shrink interplay | Clay's four-word sizing vocabulary: `fit(min, max)`, `grow(min, max)`, `fixed(n)`, `percent(p)` — covers the same ground, reads unambiguously |
 | Design tokens reinvented repeatedly (Sass vars → custom properties → Tailwind config) — Tailwind's success is a market signal that developers prefer constrained tokens over the cascade | Typed theme constants (`theme.spacing.md`, `theme.color.accent`) as a platform primitive |
 
 ### 6.4 POC widget set
@@ -216,24 +218,94 @@ root supervisor
 
 **Demo script (what reviewers see):** add/complete/delete todos with validation errors surfaced via `Result` (empty title shows a notice, not a crash); a "crash stats" button panics the Stats actor — its panel shows a failure boundary for a beat, the supervisor restarts it, counts reappear, todos untouched; a "burn CPU" button pegs the Stats actor while typing in the input stays 60fps; a debug overlay shows live per-actor memory (arena sizes) and fiber counts, making isolation visible.
 
-## 8. Milestones
+## 8. Developer Experience & Tooling
+
+DX is treated as architecture, not polish — the POC's audience is developers, and the demos that argue for the *platform* (rather than the todo app) live here.
+
+### 8.1 One binary, zero config
+
+The deepest JS-ecosystem lesson is toolchain sprawl: webpack + babel + eslint + prettier + jest + tsconfig meant five config files before hello world. Cargo, Deno, and Bun all won developer affection by collapsing the toolchain. `strand` is a single binary: `strand run`, `strand fmt`, `strand test` (post-POC), `strand doc` (post-POC). No config files in the POC at all. Formatting follows the gofmt doctrine — one true style, zero options — because gofmt's real achievement was ending formatting arguments, not formatting.
+
+### 8.2 Compiler diagnostics as a product surface
+
+Elm proved error messages are a feature; Rust institutionalized it. Since Strand's core pitch is "types that survive to runtime," the compiler is the first impression and its diagnostics get first-class treatment from M1: source spans, labeled underlines, and a suggested fix where one exists (via the `miette` crate, which provides Rust-quality rendering nearly free). Retrofitting good errors later is miserable; starting with them is cheap.
+
+### 8.3 Hot reload — three tiers on top of supervision
+
+Hot reload is not a separate subsystem: it is a supervisor restart where the replacement actor runs newer code, so §5.4 already built the machinery. Three tiers, in order of difficulty:
+
+**Tier 1 — view reload (in POC).** View functions are pure `state → Node`. On file change: recompile the module, ship it to the UI actor over a channel, re-invoke views against existing state. No state-migration problem exists, so this is sub-second and cheap to build — the file-watch → recompile → swap loop reuses the whole pipeline.
+
+**Tier 2 — actor logic reload (POC stretch goal).** Behavior changed, state shape unchanged: snapshot state, restart the actor on new code, restore the snapshot. Because state records are typed, the runtime *statically verifies* old and new shapes match before attempting the swap — a safety check Erlang's hot code loading cannot make.
+
+**Tier 3 — schema migration (future work).** State shape changed: run an optional `migrate(old) -> new`, else restart fresh. This is where hot reload gets genuinely hard; deferred deliberately.
+
+### 8.4 Debugging — the actor superpower is replay, not breakpoints
+
+A traditional stepping debugger (DWARF emission through wasmtime → lldb / DAP) is a large lift and deferred. The actor model offers something stronger first: since actors interact *only* through typed messages, recording an actor's inbound messages is a complete record of its inputs. Consequences, in POC scope:
+
+- **Message tracing** — a structured, causal log of who sent what to whom, with typed payloads, toggleable per actor. This is Erlang's observer, but typed.
+- **Structured crash reports** — a panic yields {actor, message being processed, state snapshot, wasm backtrace} delivered to the supervisor. The supervisor is a crash reporter by construction; no stack-trace soup.
+- **Debug overlay** — per-actor arena sizes, fiber counts, mailbox depths, rendered by the platform (clay demonstrated inspectors can be injected render commands).
+
+Future work: **deterministic single-actor replay** — feed a recorded message log into a fresh instance for time-travel debugging of one component without whole-program record/replay (no platform has shipped the typed version of this); DAP integration; LSP for editor support (the TS lesson: the language server *is* the daily product).
+
+## 9. Platform Services — Lessons from the App-Platform Web
+
+Mostly future work, recorded now because several lessons impose design constraints on the POC's primitives, and because the biggest wins are places where machinery we already built does double duty.
+
+### 9.1 Storage — one typed API, not five broken ones
+
+The web shipped cookies (4KB, stringly, retrofitted security), synchronous main-thread-blocking localStorage, sessionStorage, IndexedDB (so hostile everyone wraps it — an ecosystem verdict), and AppCache (the canonical API-design disaster). Strand ships **one** storage API: async-only (calls suspend the fiber; colorless concurrency makes this invisible), **typed** (records persist with their language schema — no stringify tax), transactional, with explicit tiers (session-scoped vs durable) and expiry. Storage is a **capability** granted to an actor with a quota — no ambient per-origin access.
+
+### 9.2 Identity — no ambient credentials, ever
+
+Cookies' auto-attachment to every request is ambient authority, and ambient authority is the root cause of the entire CSRF class — patched decades later with SameSite/HttpOnly duct tape. Strand has no cookie equivalent: a session is a capability token an actor explicitly holds and explicitly presents. CSRF becomes unrepresentable, the same way ownership-transfer channels made data races unrepresentable.
+
+### 9.3 Navigation — the URL stays sacred
+
+Deep-linking is the web's superpower, and SPAs spent a decade breaking it (dead back buttons, unlinkable states). A platform that replaces the browser must keep it: **typed routes** as a platform primitive (URLs as typed data — the TanStack Router lesson, not strings to parse), with a declared mapping between an actor's state and its URL so every meaningful state is addressable, linkable, and back-button-safe.
+
+### 9.4 Rendering strategy — resume, don't hydrate
+
+The SSR↔CSR pendulum (server pages → SPAs → SSR + hydration → streaming/islands/RSC/resumability) is twenty years of compensating for two platform gaps: slow cold start, and no way to transfer a running app's state between machines. Strand closes both structurally: content-addressed AOT modules make cold start near-native (removing most of the need to "ship HTML first"), and **the typed state snapshot built for hot reload (§8.3) and crash reports is also the resumability primitive**. A server runs the actor, streams the first render command array (already serializable — §6.1), transfers the snapshot; the client resumes the actor from it. First paint from the server, zero client re-execution, no hydration step, no mismatch bug class. Qwik's resumability, derived from existing primitives instead of heroic closure serialization. POC constraint honored: nothing in the snapshot format may assume same-machine resumption.
+
+### 9.5 Server functions, distribution, and optimistic updates
+
+Next's `"use server"`, TanStack Start, and Remix loaders converge on typed RPC colocated with UI code — but RSC's client/server component split reintroduced **coloring at the component level** (`"use client"` fracturing the tree: the async/await mistake, relearned). The actor model gives the principled version via Erlang's **location transparency**: a "server function" is just an actor running on a server; the typed channel *is* the RPC contract. No directive, no colored components. POC constraint honored: channel semantics never assume shared memory (already true — ownership transfer), so distribution is additive later.
+
+Optimistic updates stop being a library pattern in Elm-style state + `Result` effects: apply predicted state, reconcile on `Ok`, revert on `Err`. The industry's local-first sync engines (Linear, Replicache/Zero, Electric) point at an eventual **synced state record** platform primitive so apps stop hand-rolling reconciliation — future work, named here.
+
+### 9.6 Framework lessons distilled
+
+| Framework scar tissue / insight | Strand decision |
+|---|---|
+| React hooks: state tied to call order (Rules of Hooks = compiler work leaking onto users); `useEffect` dependency arrays = manual cache invalidation, the #1 bug source; `useMemo`/`useCallback` = manual memoization tax | State lives in typed actor records, not call positions. Effects are messages through the mailbox — no dependency arrays. No manual memoization: the re-render unit is bounded (below) |
+| React's keeps | Components as pure functions, unidirectional data flow, composition — all retained |
+| Solid/signals: fine-grained reactivity won (Vue, Preact, Angular, Svelte runes, TC39 proposal) — because React re-renders unbounded subtrees | **The actor is the re-render unit**: one actor's state change re-runs one actor's views into one command array; the blast radius is enforced by the platform, not managed by the developer. Signals *within* an actor (compiling reactive reads to targeted command-array patches, Svelte-style) is the planned future optimization — possible without API break because Strand is compiled |
+| Svelte: the framework can disappear into the compiler | Adopted as direction: reactivity is a compilation target, not a runtime library |
+| Next.js: magic file conventions as API; churn from vendor coupling | No filename-encoded semantics in the platform; routing is declared in code with types. Platform spec stays vendor-neutral (the Flash anti-lesson, again) |
+| React Query / TanStack: server state ≠ UI state (caching, staleness, retry are first-class); typed routing | Typed routes as platform primitive (§9.3); a `resource` abstraction for remote data with staleness semantics is future work, named so apps don't reinvent it |
+
+## 10. Milestones
 
 Ordered so every milestone is independently demoable; estimates assume one focused developer.
 
 1. **M0 — Walking skeleton (1–2 wks):** hand-written WASM module runs in wasmtime under tokio; two host actors exchange a typed message; wgpu window clears a color.
-2. **M1 — Language core (2–3 wks):** lexer→parser→checker→WASM for functions, records, `match`, `Result`/`?`. CLI runs `.str` files. Golden-file test suite.
-3. **M2 — Actor runtime (2 wks):** `actor` declarations, typed channels, buffer transfer, panic→ChildDown→restart. Demo: supervised pair of actors, one crashing on schedule.
+2. **M1 — Language core (2–3 wks):** lexer→parser→checker→WASM for functions, records, `match`, `Result`/`?`. CLI runs `.str` files. Golden-file test suite. Diagnostics are first-class from the start: spans, labels, suggestions (miette).
+3. **M2 — Actor runtime (2 wks):** `actor` declarations, typed channels, buffer transfer, panic→ChildDown→restart, structured crash reports. Demo: supervised pair of actors, one crashing on schedule.
 4. **M3 — Scene graph (2–3 wks):** render thread with taffy layout + widget set + input routing; UI tree submitted from a host-side actor first, then from Strand code.
 5. **M4 — Vertical slice (1–2 wks):** todo app in Strand, full demo script above.
-6. **M5 — Measurement + writeup (1 wk):** input-to-frame latency under load, per-actor memory, actor spawn/kill cost, binary size; honest comparison notes vs an equivalent JS/React todo.
+6. **M5 — DX slice (1–2 wks):** Tier-1 view hot reload (file watch → recompile → live swap while the todo app runs); message tracing with typed payloads; debug overlay wired to real runtime stats. Stretch: Tier-2 actor reload with verified state snapshot. This is the milestone that demos the *platform*, not the app.
+7. **M6 — Measurement + writeup (1 wk):** input-to-frame latency under load, per-actor memory, actor spawn/kill cost, hot-reload round-trip time, binary size; honest comparison notes vs an equivalent JS/React todo.
 
-Total: ~9–13 weeks part-time-realistic; the M0 skeleton is the de-risking gate — if wasmtime-async + tokio + wgpu don't compose pleasantly, we learn it in week one.
+Total: ~10–15 weeks part-time-realistic; the M0 skeleton is the de-risking gate — if wasmtime-async + tokio + wgpu don't compose pleasantly, we learn it in week one.
 
-## 9. Future Work (explicitly out of POC scope)
+## 11. Future Work (explicitly out of POC scope)
 
-**Backwards compatibility** — the strategic linchpin, deliberately deferred. Two paths sketched earlier, in order of likely execution: (a) embed a JS engine as a legacy actor so existing code runs inside the sandbox (the x86-on-Apple-Silicon play); (b) compile a TS subset directly to the Strand VM for incremental file-by-file migration. Also: **capability-based security** (channels become the capability substrate — an actor can only touch what it was handed); **content-addressed modules** (hash-identified, signed, cached once across all apps); **custom bytecode VM** replacing wasmtime once semantics stabilize; **full type inference**; **`grid` layout primitive** and container-size-responsive helpers beyond the basic branch; **JSX-flavored surface syntax** desugaring to the builder DSL; text shaping/i18n/accessibility; networking + persistence host APIs; hot reload (arenas make actor-level reload natural).
+**Backwards compatibility** — the strategic linchpin, deliberately deferred. Two paths sketched earlier, in order of likely execution: (a) embed a JS engine as a legacy actor so existing code runs inside the sandbox (the x86-on-Apple-Silicon play); (b) compile a TS subset directly to the Strand VM for incremental file-by-file migration. Also: **capability-based security** (channels become the capability substrate — an actor can only touch what it was handed); **content-addressed modules** (hash-identified, signed, cached once across all apps); **custom bytecode VM** replacing wasmtime once semantics stabilize; **full type inference**; **`grid` layout primitive** and container-size-responsive helpers beyond the basic branch; **JSX-flavored surface syntax** desugaring to the builder DSL; text shaping/i18n/accessibility; networking + persistence host APIs; **Tier-3 hot reload** (schema migration; Tiers 1–2 moved into POC, §8.3); **deterministic single-actor message replay** (time-travel debugging); **DAP debugger** via DWARF through wasmtime; **LSP**; `strand test` and `strand doc`; **typed capability storage API** (§9.1); **typed routes + URL/state mapping** (§9.3); **server-side actor execution + snapshot resumption** (§9.4); **distributed actors / location-transparent channels** (§9.5); **synced state records** (local-first sync primitive); **`resource` abstraction** for remote data with staleness semantics; **in-actor signals** compiling to targeted command-array patches (§9.6).
 
-## 10. Risks
+## 12. Risks
 
 | Risk | Read | Mitigation |
 |---|---|---|
@@ -242,8 +314,9 @@ Total: ~9–13 weeks part-time-realistic; the M0 skeleton is the de-risking gate
 | Text rendering/input is a tarpit | High | Ruthless scope: one font, Latin-only, basic caret; glyphon does the rest |
 | Compiler eats the schedule | Medium | Subset is fixed (§4.6); anything not needed by the todo app is cut |
 | "Colorless" host-call plumbing (async wasmtime) is fiddly | Medium | This is exactly what M0 exists to prove |
+| Hot reload scope creep (Tier 2/3 pulls in migration machinery) | Medium | Tier 1 only is the M5 bar; Tier 2 is stretch, Tier 3 is banned from POC |
 
-## 11. Decision Log
+## 13. Decision Log
 
 | Decision | Choice | Why |
 |---|---|---|
@@ -260,3 +333,36 @@ Total: ~9–13 weeks part-time-realistic; the M0 skeleton is the de-risking gate
 | Layout | `row`/`column`/`stack` with `mainAxis`/`crossAxis` naming; first-class alignment | Ends the centering meme and the justify/align confusion; grid deferred |
 | Demo | Todo app + crash/CPU-burn buttons | Boring app, visible architecture |
 | Backwards compat | Deferred, documented | POC proves the new model; compat is a later, separable bet |
+| UI pipeline | Layout emits flat render command array (clay model); per-frame arena allocation | Renderer-agnostic, diffable, serializable across channels; zero UI GC pressure |
+| Overlays | Attach-point floating elements (clay model) | Solves "tooltip escapes container" declaratively; strictly better than a bare overlay node |
+| DX philosophy | Tiny hello-world, batteries included, examples-first docs (raylib model) | Adoption follows joy; raylib's 70+ language bindings prove simple stable APIs travel |
+| Toolchain | One `strand` binary: run/fmt/test; zero config; one true format | The anti-webpack/babel/eslint/prettier lesson; gofmt ended arguments, not just formatted code |
+| Diagnostics | First-class from M1 (spans, labels, fixes via miette) | Elm/Rust proved errors are a product surface; cheap early, miserable to retrofit |
+| Hot reload | Tier 1 (views) in POC, Tier 2 stretch, Tier 3 deferred | It's a supervisor restart with newer code — §5.4 already built the machinery; Flutter proved the retention value |
+| Debugging | Message tracing + structured crash reports + overlay in POC; replay/DAP/LSP later | Typed message logs beat breakpoints as the first tool: complete input record per actor |
+| Storage | One typed, async, transactional, capability-scoped API | Cookies/localStorage/IndexedDB/AppCache: five broken APIs because the web never shipped one good one |
+| Credentials | No ambient auth; sessions are explicit capability tokens | Cookie auto-attachment (ambient authority) is the root cause of CSRF |
+| Navigation | Typed routes + actor-state↔URL mapping (future, named) | Deep links are the web's superpower; SPAs breaking the back button is the anti-lesson; TanStack proved routes can be typed |
+| Rendering strategy | Resume, don't hydrate: snapshot transfer replaces SSR+hydration | The state snapshot (hot reload, crash reports) doubles as the resumability primitive; kills the double-render and mismatch bug class |
+| Distribution | Channels designed location-transparent; server actors later | Erlang's answer to "server functions" without RSC's client/server component coloring |
+| Reactivity | Actor = re-render unit now; in-actor signals later | Bounded blast radius by construction beats hooks' manual memoization; signals won the fine-grained argument and compile in cleanly later |
+
+## 14. Prior Art & Inspiration
+
+**clay** (nicbarker/clay) — single-header C layout library with microsecond performance. Directly adopted: the render-command-array output architecture (§6.1), static per-frame arena allocation for layout, the `fit/grow/fixed/percent` sizing vocabulary, attach-point floating elements for overlays, and the idea that a debug inspector can be implemented as injected render commands (our M4 debug overlay). Caveat: clay is explicitly not multi-thread-safe — it informs the layout algorithm and API shape, not the concurrency architecture. Its layout algorithm is the reference implementation if we outgrow `taffy`.
+
+**raylib** (raysan5/raylib) — the DX north star. Zero external dependencies, ~10-line hello world, learned through 140+ examples rather than a spec, and a simple stable C API that earned bindings in 70+ languages. Strand adopts the philosophy: hello world must fit on a slide, the platform is batteries-included, documentation is examples-first plus a cheatsheet, and the host ABI stays boring so other languages can target the VM later. Raylib's `rlgl` (separable GPU abstraction) mirrors our layering.
+
+**The landscape — what already exists, and the gap:**
+
+| Project | What it proves | Why it isn't Strand |
+|---|---|---|
+| Flutter | Full stack works: own language, no DOM, GPU scene graph, huge adoption | Single-threaded isolates without supervision; Dart kept exceptions; an app framework, not a sandboxed platform for third-party code |
+| Lunatic | Erlang-style supervised WASM actors in Rust are buildable (our §5, nearly verbatim) | Server-side only, no language, no UI; development stalled — evidence that runtime-without-platform lacks a market pull |
+| wasmCloud | Actor model + capability security on WASM at production scale | Cloud infrastructure orientation; no UI, no language |
+| Makepad / GPUI (Zed) / Slint / Iced | Rust "own renderer, no DOM" UIs ship real products at 120fps | App frameworks for trusted code; no sandbox, no new language, no supervision |
+| Blazor / Uno / Yew | Non-JS languages in browsers have demand | Still render through the DOM — inherit the exact tax we design out |
+| Dioxus Blitz | HTML/CSS rendering without a full browser engine is feasible | Aims at today's web content; relevant to our backwards-compat future work, not the new model |
+| Flash / Silverlight / applets | "Own VM + renderer inside the browser" can reach mass adoption | Died of proprietary ownership, plugin security, and vendor politics — the anti-lessons: open spec, capability sandbox from day one, no plugin model |
+
+The defensible position is the intersection: **typed language with runtime types + supervised actor isolation + platform-owned scene graph + open sandboxed-platform ambition**. Every row above occupies one or two of those; none occupies all four.

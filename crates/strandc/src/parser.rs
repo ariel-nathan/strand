@@ -3,32 +3,12 @@
 //! Semicolons are optional: §4.5 writes none. A block's last expression is its
 //! tail value unless it is followed by `;`.
 
-use std::fmt;
-
 use crate::ast::*;
+use crate::diag::Diagnostic;
 use crate::lexer::{lex, Span, Tok, Token};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseError {
-    pub message: String,
-    pub line: u32,
-    pub col: u32,
-}
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: {}", self.line, self.col, self.message)
-    }
-}
-
-impl std::error::Error for ParseError {}
-
-pub fn parse(src: &str) -> Result<Program, ParseError> {
-    let tokens = lex(src).map_err(|e| ParseError {
-        message: e.message,
-        line: e.line,
-        col: e.col,
-    })?;
+pub fn parse(src: &str) -> Result<Program, Diagnostic> {
+    let tokens = lex(src)?;
     Parser { tokens, pos: 0 }.program()
 }
 
@@ -37,7 +17,7 @@ struct Parser {
     pos: usize,
 }
 
-type PResult<T> = Result<T, ParseError>;
+type PResult<T> = Result<T, Diagnostic>;
 
 impl Parser {
     fn peek(&self) -> &Tok {
@@ -79,8 +59,7 @@ impl Parser {
     }
 
     fn error<T>(&self, message: impl Into<String>) -> PResult<T> {
-        let span = self.span();
-        Err(ParseError { message: message.into(), line: span.line, col: span.col })
+        Err(Diagnostic::new(self.span(), message).with_label("unexpected"))
     }
 
     fn expect(&mut self, tok: Tok) -> PResult<Span> {
@@ -89,7 +68,10 @@ impl Parser {
             self.advance();
             Ok(span)
         } else {
-            self.error(format!("expected {}, found {}", tok, self.peek()))
+            let found = self.peek().clone();
+            Err(Diagnostic::new(self.span(), format!("expected {tok}, found {found}"))
+                .with_label(format!("expected {tok}"))
+                .with_help(format!("insert {tok} here")))
         }
     }
 
@@ -817,7 +799,7 @@ mod tests {
     #[test]
     fn reports_position_of_syntax_errors() {
         let err = parse("fn f(): int {\n  let = 1\n}").unwrap_err();
-        assert_eq!(err.line, 2);
+        assert_eq!(err.line(), 2);
         assert!(err.message.contains("identifier"), "message was: {}", err.message);
     }
 

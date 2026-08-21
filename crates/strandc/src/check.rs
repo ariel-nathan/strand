@@ -6,28 +6,13 @@
 //! mistake yields a single message.
 
 use std::collections::HashMap;
-use std::fmt;
 
 use crate::ast;
+use crate::diag::Diagnostic;
 use crate::hir::*;
 use crate::lexer::Span;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckError {
-    pub message: String,
-    pub line: u32,
-    pub col: u32,
-}
-
-impl fmt::Display for CheckError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: {}", self.line, self.col, self.message)
-    }
-}
-
-impl std::error::Error for CheckError {}
-
-pub fn check(program: &ast::Program) -> Result<Hir, Vec<CheckError>> {
+pub fn check(program: &ast::Program) -> Result<Hir, Vec<Diagnostic>> {
     let mut cx = Checker::default();
     cx.collect_types(program);
     cx.collect_signatures(program);
@@ -57,7 +42,7 @@ struct Local {
 #[derive(Default)]
 struct Checker {
     hir: Hir,
-    errors: Vec<CheckError>,
+    errors: Vec<Diagnostic>,
     record_ids: HashMap<String, RecordId>,
     sum_ids: HashMap<String, SumId>,
     /// Constructor name -> owning sum and variant index.
@@ -79,11 +64,26 @@ impl Default for Hir {
 
 impl Checker {
     fn error(&mut self, span: Span, message: impl Into<String>) {
-        self.errors.push(CheckError {
-            message: message.into(),
-            line: span.line,
-            col: span.col,
-        });
+        self.errors.push(Diagnostic::new(span, message));
+    }
+
+    /// Reports with a suggested fix. Used only where the fix is unambiguous —
+    /// §8.2 wants suggestions, not guesses.
+    fn error_help(&mut self, span: Span, message: impl Into<String>, help: impl Into<String>) {
+        self.errors.push(Diagnostic::new(span, message).with_help(help));
+    }
+
+    /// Reports with the underline labelled. Preferred wherever the label can
+    /// say something more useful than "here" (§8.2).
+    fn error_labeled(
+        &mut self,
+        span: Span,
+        message: impl Into<String>,
+        label: impl Into<String>,
+        help: impl Into<String>,
+    ) {
+        self.errors
+            .push(Diagnostic::new(span, message).with_label(label).with_help(help));
     }
 
     fn show(&self, ty: &Ty) -> String {
@@ -375,9 +375,11 @@ impl Checker {
                         continue;
                     };
                     if !local.mutable {
-                        self.error(
+                        self.error_labeled(
                             *span,
-                            format!("`{name}` is immutable; declare it with `var` to assign"),
+                            format!("`{name}` is immutable"),
+                            "assignment to a `let` binding",
+                            format!("declare it as `var {name}` to allow assignment"),
                         );
                     }
                     let value = self.check_expr(value, Some(&local.ty));
@@ -464,7 +466,9 @@ impl Checker {
                         kind: ExprKind::MakeVariant { sum, variant: index, fields: Vec::new() },
                     };
                 }
-                self.error(*span, format!("unknown name `{name}`"));
+                self.errors
+                    .push(Diagnostic::new(*span, format!("unknown name `{name}`"))
+                        .with_label("not in scope"));
                 Expr { ty: Ty::Error, kind: ExprKind::Unit }
             }
 
@@ -606,9 +610,11 @@ impl Checker {
         if !poisoned && !lhs.ty.unifies(&rhs.ty) {
             // §4.2: no implicit coercion, ever.
             let (l, r) = (self.show(&lhs.ty), self.show(&rhs.ty));
-            self.error(
+            self.error_labeled(
                 span,
                 format!("`{}` needs matching types, found {l} and {r}", op.as_str()),
+                format!("{l} vs {r}"),
+                "Strand never coerces (§4.2); convert one side explicitly",
             );
             return Expr { ty: Ty::Error, kind: ExprKind::Unit };
         }
@@ -963,7 +969,12 @@ impl Checker {
         }
 
         if let Some(missing) = covered.missing(&scrutinee.ty, &self.hir) {
-            self.error(span, format!("`match` does not cover {missing}"));
+            self.error_labeled(
+                span,
+                format!("`match` does not cover {missing}"),
+                format!("{missing} not handled"),
+                "add the missing arm, or a `_` arm to catch the rest",
+            );
         }
 
         Expr {

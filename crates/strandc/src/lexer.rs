@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::diag::Diagnostic;
+
 /// Byte offsets into the source, plus a line/column for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -141,22 +143,7 @@ pub struct Token {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LexError {
-    pub message: String,
-    pub line: u32,
-    pub col: u32,
-}
-
-impl fmt::Display for LexError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: {}", self.line, self.col, self.message)
-    }
-}
-
-impl std::error::Error for LexError {}
-
-pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
+pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostic> {
     Lexer::new(src).run()
 }
 
@@ -193,22 +180,24 @@ impl<'src> Lexer<'src> {
         Some(b)
     }
 
-    fn error<T>(&self, message: impl Into<String>) -> Result<T, LexError> {
-        Err(LexError { message: message.into(), line: self.line, col: self.col })
+    fn error<T>(&self, message: impl Into<String>) -> Result<T, Diagnostic> {
+        self.error_at(self.pos, self.line, self.col, message)
     }
 
     /// Reports at a saved position. Needed wherever the offending character has
     /// already been consumed, so the caret lands on it rather than past it.
     fn error_at<T>(
         &self,
+        start: usize,
         line: u32,
         col: u32,
         message: impl Into<String>,
-    ) -> Result<T, LexError> {
-        Err(LexError { message: message.into(), line, col })
+    ) -> Result<T, Diagnostic> {
+        let span = Span { start, end: start + 1, line, col };
+        Err(Diagnostic::new(span, message))
     }
 
-    fn run(mut self) -> Result<Vec<Token>, LexError> {
+    fn run(mut self) -> Result<Vec<Token>, Diagnostic> {
         let mut out = Vec::new();
         loop {
             self.skip_trivia();
@@ -278,7 +267,7 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    fn number(&mut self) -> Result<Tok, LexError> {
+    fn number(&mut self) -> Result<Tok, Diagnostic> {
         let start = self.pos;
         while matches!(self.peek(), Some(b) if b.is_ascii_digit() || b == b'_') {
             self.bump();
@@ -309,7 +298,7 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    fn string(&mut self) -> Result<Tok, LexError> {
+    fn string(&mut self) -> Result<Tok, Diagnostic> {
         self.bump(); // opening quote
         let mut out = String::new();
         loop {
@@ -347,7 +336,7 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    fn punctuation(&mut self) -> Result<Tok, LexError> {
+    fn punctuation(&mut self) -> Result<Tok, Diagnostic> {
         let (line, col) = (self.line, self.col);
         let b = self.bump().expect("caller checked there is a byte");
 
@@ -398,7 +387,9 @@ impl<'src> Lexer<'src> {
                     Tok::AmpAmp
                 } else {
                     // §4.2 has no bitwise operators, so a lone `&` is always a typo.
-                    return self.error_at(line, col, "unexpected `&`; did you mean `&&`?");
+                    return self
+                        .error_at(self.pos - 1, line, col, "unexpected `&`")
+                        .map_err(|d| d.with_help("Strand has no bitwise operators; use `&&`"));
                 }
             }
             other => {
@@ -407,7 +398,7 @@ impl<'src> Lexer<'src> {
                 } else {
                     self.text[self.pos - 1..].chars().next().unwrap().to_string()
                 };
-                return self.error_at(line, col, format!("unexpected character `{ch}`"));
+                return self.error_at(self.pos - 1, line, col, format!("unexpected character `{ch}`"));
             }
         })
     }
@@ -512,7 +503,7 @@ mod tests {
     #[test]
     fn reports_position_of_bad_input() {
         let err = lex("let a = 1\nlet b = #").unwrap_err();
-        assert_eq!((err.line, err.col), (2, 9));
+        assert_eq!((err.line(), err.col()), (2, 9));
         assert!(err.message.contains('#'), "message was: {}", err.message);
     }
 

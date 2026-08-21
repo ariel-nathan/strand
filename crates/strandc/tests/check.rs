@@ -1,9 +1,10 @@
 //! Type checker behaviour, driven through the public API.
 
-use strandc::check::{check, CheckError};
+use strandc::check::check;
+use strandc::diag::Diagnostic;
 use strandc::hir::{Expr, ExprKind, Hir, Pattern, Tag, Ty};
 
-fn check_src(src: &str) -> Result<Hir, Vec<CheckError>> {
+fn check_src(src: &str) -> Result<Hir, Vec<Diagnostic>> {
     let program = strandc::parser::parse(src).expect("parse failed");
     check(&program)
 }
