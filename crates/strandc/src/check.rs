@@ -951,8 +951,8 @@ impl Checker {
                 self.check_build(name, *name_span, args, children.as_ref(), *span)
             }
 
-            ast::Expr::RecordLit { name, fields, span } => {
-                self.check_record_lit(name.as_deref(), fields, *span, expected)
+            ast::Expr::RecordLit { name, base, fields, span } => {
+                self.check_record_lit(name.as_deref(), base.as_deref(), fields, *span, expected)
             }
 
             ast::Expr::ListLit { items, span } => self.check_list_lit(items, *span, expected),
@@ -1761,6 +1761,7 @@ impl Checker {
     fn check_record_lit(
         &mut self,
         name: Option<&str>,
+        base: Option<&ast::Expr>,
         fields: &[ast::FieldInit],
         span: Span,
         expected: Option<&Ty>,
@@ -1773,6 +1774,9 @@ impl Checker {
                 _ => {
                     let what = name.unwrap_or("record literal");
                     self.error(span, format!("unknown record type `{what}`"));
+                    if let Some(base) = base {
+                        self.check_expr(base, None);
+                    }
                     for field in fields {
                         if let Some(value) = &field.value {
                             self.check_expr(value, None);
@@ -1785,6 +1789,25 @@ impl Checker {
 
         let def = self.hir.records[id.0 as usize].clone();
         let mut slots: Vec<Option<Expr>> = vec![None; def.fields.len()];
+
+        // `Model { ...state, draft: x }`. The spread is evaluated once into a
+        // local, and every field the literal leaves out becomes an ordinary
+        // read of that local — which is why this needs no new HIR node and no
+        // codegen at all. The result is still a whole new record (§4.2); the
+        // sugar removes the restating, not the copy.
+        let spread = base.map(|base| {
+            let value = self.check_expr(base, Some(&Ty::Record(id)));
+            if !value.ty.unifies(&Ty::Record(id)) {
+                let (found, want) = (self.show(&value.ty), self.show(&Ty::Record(id)));
+                self.error(
+                    base.span(),
+                    format!("`...` here spreads {want}, found {found}"),
+                );
+            }
+            let slot = self.locals.len() as u32;
+            self.locals.push(Ty::Record(id));
+            (slot, value)
+        });
 
         for field in fields {
             let Some(index) = def.fields.iter().position(|(n, _)| *n == field.name) else {
@@ -1824,6 +1847,21 @@ impl Checker {
         for (index, slot) in slots.into_iter().enumerate() {
             match slot {
                 Some(value) => values.push(value),
+                // Unset, and there is a spread to take it from.
+                None if spread.is_some() => {
+                    let (base_slot, _) = spread.as_ref().expect("just checked");
+                    let ty = def.fields[index].1.clone();
+                    values.push(Expr {
+                        ty: ty.clone(),
+                        kind: ExprKind::FieldGet {
+                            base: Box::new(Expr {
+                                ty: Ty::Record(id),
+                                kind: ExprKind::Local(*base_slot),
+                            }),
+                            index: index as u32,
+                        },
+                    });
+                }
                 None => {
                     self.error(
                         span,
@@ -1834,7 +1872,22 @@ impl Checker {
             }
         }
 
-        Expr { ty: Ty::Record(id), kind: ExprKind::MakeRecord { record: id, fields: values } }
+        let made =
+            Expr { ty: Ty::Record(id), kind: ExprKind::MakeRecord { record: id, fields: values } };
+
+        match spread {
+            None => made,
+            // The spread is bound before the record is built, so an expression
+            // with a side effect runs once rather than once per field taken.
+            Some((slot, value)) => Expr {
+                ty: Ty::Record(id),
+                kind: ExprKind::Block(Block {
+                    stmts: vec![Stmt::Let { slot, value }],
+                    tail: Some(Box::new(made)),
+                    ty: Ty::Record(id),
+                }),
+            },
+        }
     }
 
     fn check_try(&mut self, inner: &ast::Expr, span: Span) -> Expr {

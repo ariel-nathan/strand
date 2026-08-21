@@ -303,7 +303,7 @@ impl Parser {
                     )
                     .with_label("a second view")
                     .with_help(
-                        "an actor has one view; break the rest out as `view fn`                          items outside the actor and call them as children",
+                        "an actor has one view; break the rest out as `view fn` items \n                         outside the actor and call them as children",
                     ));
                 }
                 view = Some(decl);
@@ -316,7 +316,7 @@ impl Parser {
                     return Err(Diagnostic::new(decl.span, format!("unexpected function `{other}`"))
                         .with_label("not part of an actor")
                         .with_help(
-                            "an actor declares `init` and `receive`, and optionally a                              `view fn` to draw itself",
+                            "an actor declares `init` and `receive`, and optionally a \n                             `view fn` to draw itself",
                         ));
                 }
             }
@@ -737,9 +737,10 @@ impl Parser {
                 // `Todo { ... }` is a record literal; a bare `{` after an
                 // identifier is never a block in expression position.
                 if !self.no_record_literal && self.at(&Tok::LBrace) && starts_record_literal(self) {
-                    let fields = self.field_inits()?;
+                    let (base, fields) = self.field_inits()?;
                     return Ok(Expr::RecordLit {
                         name: Some(name),
+                        base,
                         fields,
                         span: Self::join(span, self.prev_span()),
                     });
@@ -750,10 +751,34 @@ impl Parser {
         }
     }
 
-    fn field_inits(&mut self) -> PResult<Vec<FieldInit>> {
+    /// The body of a record literal: an optional leading `...base`, then the
+    /// fields that differ from it.
+    ///
+    /// The spread has to come first. Letting it appear anywhere would mean the
+    /// reader has to scan the whole literal to know whether a field they can
+    /// see is the one that wins, and there is no case the freedom buys.
+    fn field_inits(&mut self) -> PResult<(Option<Box<Expr>>, Vec<FieldInit>)> {
         self.expect(Tok::LBrace)?;
+        let mut base = None;
+        if self.at(&Tok::DotDotDot) {
+            self.advance();
+            base = Some(Box::new(self.expr()?));
+            // A spread on its own is a copy, so the comma is only needed when
+            // something follows it.
+            if !self.at(&Tok::RBrace) {
+                self.expect(Tok::Comma)?;
+            }
+        }
         let mut fields = Vec::new();
         while !self.at(&Tok::RBrace) {
+            if self.at(&Tok::DotDotDot) {
+                let span = self.span();
+                return Err(Diagnostic::new(span, "`...` has to come first")
+                    .with_label("a spread after a field")
+                    .with_help(
+                        "put the spread first: `Model { ...state, draft: x }`, so the \n                         fields that differ are the ones you can see",
+                    ));
+            }
             let (name, span) = self.expect_ident()?;
             // Shorthand `Todo { title }` reuses the binding of the same name.
             let value = if self.eat(&Tok::Colon) { Some(self.expr()?) } else { None };
@@ -764,7 +789,7 @@ impl Parser {
             }
         }
         self.expect(Tok::RBrace)?;
-        Ok(fields)
+        Ok((base, fields))
     }
 
     fn if_expr(&mut self) -> PResult<Expr> {
@@ -879,6 +904,9 @@ impl Parser {
 fn starts_record_literal(p: &Parser) -> bool {
     match (p.peek_at(1), p.peek_at(2)) {
         (Tok::RBrace, _) => true,
+        // `Model { ...state, ... }`. Nothing else in the language opens a
+        // brace with a spread, so one token is enough to tell.
+        (Tok::DotDotDot, _) => true,
         (Tok::Ident(_), Tok::Colon | Tok::Comma | Tok::RBrace) => true,
         _ => false,
     }

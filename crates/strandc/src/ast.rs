@@ -228,8 +228,18 @@ pub enum Expr {
     /// `t.title`, and the receiver half of `list.push(x)`.
     Field { base: Box<Expr>, name: String, span: Span },
 
-    /// `Todo { id: ..., title: ... }`
-    RecordLit { name: Option<String>, fields: Vec<FieldInit>, span: Span },
+    /// `Todo { id: ..., title: ... }`, and `Todo { ...t, done: true }`.
+    ///
+    /// `base` is the spread: every field the literal does not set is taken
+    /// from it. §4.2 makes records immutable, so an update *is* a whole new
+    /// record — the sugar says which fields differ instead of restating the
+    /// ones that do not.
+    RecordLit {
+        name: Option<String>,
+        base: Option<Box<Expr>>,
+        fields: Vec<FieldInit>,
+        span: Span,
+    },
 
     /// `[a, b, c]`. An empty one takes its element type from context.
     ListLit { items: Vec<Expr>, span: Span },

@@ -57,37 +57,37 @@ fn accept(title: string): Result<string, AddError> {
 
 // ---- state transitions ----------------------------------------------------
 //
-// Every one of these returns a whole new record. Strand has no update syntax
-// yet — `Model { ...state, draft: x }` would halve this file — so the fields
-// are spelled out. Verbose, but the immutability it spells out is the point.
+// Every one of these returns a whole new record: §4.2 makes data immutable, so
+// a transition *is* a new value rather than an edit to an old one. What the
+// spread removes is the restating, not the copy — each of these now says only
+// what the transition changes, which is what the transition is.
 
 fn withDraft(state: Model, draft: string): Model {
-  Model { todos: state.todos, draft: draft, focus: state.focus, scroll: state.scroll, nextId: state.nextId, notice: "" }
+  Model { ...state, draft: draft, notice: "" }
 }
 
 fn withFocus(state: Model, focus: int): Model {
-  Model { todos: state.todos, draft: state.draft, focus: focus, scroll: state.scroll, nextId: state.nextId, notice: state.notice }
+  Model { ...state, focus: focus }
 }
 
 fn withScroll(state: Model, scroll: float): Model {
-  Model { todos: state.todos, draft: state.draft, focus: state.focus, scroll: scroll, nextId: state.nextId, notice: state.notice }
+  Model { ...state, scroll: scroll }
 }
 
 fn withTodos(state: Model, todos: List<Todo>): Model {
-  Model { todos: todos, draft: state.draft, focus: state.focus, scroll: state.scroll, nextId: state.nextId, notice: "" }
+  Model { ...state, todos: todos, notice: "" }
 }
 
 fn noticed(state: Model, notice: string): Model {
-  Model { todos: state.todos, draft: state.draft, focus: state.focus, scroll: state.scroll, nextId: state.nextId, notice: notice }
+  Model { ...state, notice: notice }
 }
 
 fn commit(state: Model): Model {
   match accept(state.draft) {
     Ok(clean) => Model {
+      ...state,
       todos: push(state.todos, Todo { id: state.nextId, title: clean, done: false }),
       draft: "",
-      focus: state.focus,
-      scroll: state.scroll,
       nextId: state.nextId + 1,
       notice: "",
     },
@@ -103,7 +103,7 @@ fn toggle(state: Model, id: int): Model {
   var out: List<Todo> = []
   for todo in state.todos {
     if todo.id == id {
-      out = push(out, Todo { id: todo.id, title: todo.title, done: !todo.done })
+      out = push(out, Todo { ...todo, done: !todo.done })
     } else {
       out = push(out, todo)
     }

@@ -141,6 +141,31 @@ fn record_fields_read_from_their_own_offsets() {
 }
 
 #[test]
+fn a_record_update_keeps_the_fields_it_does_not_name() {
+    let src = "type Three = { a: int, b: int, c: int }
+        fn changed(x: int, unused: int): int {
+            let t = Three { a: 1, b: 2, c: 3 }
+            let u = Three { ...t, b: x }
+            u.a * 100 + u.b * 10 + u.c
+        }
+        fn copy(x: int, unused: int): int {
+            let t = Three { a: x, b: 2, c: 3 }
+            let u = Three { ...t }
+            u.a * 100 + u.b * 10 + u.c
+        }
+        fn all(x: int, unused: int): int {
+            // A spread every field overrides is still legal, and still copies
+            // nothing from the base.
+            let t = Three { a: 9, b: 9, c: 9 }
+            let u = Three { ...t, a: 1, b: 2, c: x }
+            u.a * 100 + u.b * 10 + u.c
+        }";
+    assert_eq!(call_int(src, "changed", (7, 0)), 173);
+    assert_eq!(call_int(src, "copy", (5, 0)), 523);
+    assert_eq!(call_int(src, "all", (3, 0)), 123);
+}
+
+#[test]
 fn result_returns_the_multi_value_pair() {
     // docs/abi.md §2: tag 0 = Ok, tag 1 = Err, payload in the second slot.
     let src = "type E = | Bad

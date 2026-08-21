@@ -55,6 +55,9 @@ pub enum Tok {
     Colon,
     Semi,
     Dot,
+    /// `...` — the spread in a record update. Its own token rather than
+    /// three `Dot`s so `Model { ..state }` can say what is wrong with it.
+    DotDotDot,
     Arrow,
     FatArrow,
     Question,
@@ -112,6 +115,7 @@ impl fmt::Display for Tok {
             Tok::Colon => ":",
             Tok::Semi => ";",
             Tok::Dot => ".",
+            Tok::DotDotDot => "...",
             Tok::Arrow => "->",
             Tok::FatArrow => "=>",
             Tok::Question => "?",
@@ -414,7 +418,15 @@ impl<'src> Lexer<'src> {
             b',' => Tok::Comma,
             b':' => Tok::Colon,
             b';' => Tok::Semi,
-            b'.' => Tok::Dot,
+            b'.' => {
+                if self.peek() == Some(b'.') && self.peek_at(1) == Some(b'.') {
+                    self.bump();
+                    self.bump();
+                    Tok::DotDotDot
+                } else {
+                    Tok::Dot
+                }
+            }
             b'?' => Tok::Question,
             b'+' => Tok::Plus,
             b'*' => Tok::Star,

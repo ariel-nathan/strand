@@ -2,7 +2,7 @@
 
 use strandc::check::check;
 use strandc::diag::Diagnostic;
-use strandc::hir::{Expr, ExprKind, Hir, Pattern, Tag, Ty};
+use strandc::hir::{Expr, ExprKind, Hir, Pattern, Stmt, Tag, Ty};
 
 fn check_src(src: &str) -> Result<Hir, Vec<Diagnostic>> {
     let program = strandc::parser::parse(src).expect("parse failed");
@@ -33,6 +33,48 @@ fn checks_arithmetic_and_locals() {
     assert_eq!(f.ret, Ty::Int);
     assert_eq!(f.param_count, 2);
     assert!(matches!(f.body.tail.as_deref(), Some(Expr { ty: Ty::Int, .. })));
+}
+
+#[test]
+fn a_record_update_binds_its_base_once_and_reads_the_rest_from_it() {
+    // The shape is the guarantee: one `let` for the spread, and every field
+    // the literal left out is an ordinary read of that local. Built any other
+    // way, a spread whose base is a call would evaluate it once per field.
+    let hir = expect_ok(
+        "type Three = { a: int, b: int, c: int }
+         fn base(): Three { Three { a: 1, b: 2, c: 3 } }
+         fn f(): Three { Three { ...base(), b: 9 } }",
+    );
+    let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+    let Some(Expr { kind: ExprKind::Block(block), .. }) = f.body.tail.as_deref() else {
+        panic!("a spread should bind its base first, found {:?}", f.body.tail);
+    };
+    assert_eq!(block.stmts.len(), 1, "exactly one binding for the base");
+    let Stmt::Let { slot, .. } = &block.stmts[0] else { panic!("expected a let") };
+
+    let Some(Expr { kind: ExprKind::MakeRecord { fields, .. }, .. }) = block.tail.as_deref()
+    else {
+        panic!("expected a record to be built")
+    };
+    // `a` and `c` come from the base; `b` is the one that was written.
+    for (index, field) in [(0u32, &fields[0]), (2, &fields[2])] {
+        let ExprKind::FieldGet { base, index: got } = &field.kind else {
+            panic!("field {index} should be read from the base, found {:?}", field.kind)
+        };
+        assert_eq!(*got, index);
+        assert!(matches!(base.kind, ExprKind::Local(s) if s == *slot), "reads the bound base");
+    }
+    assert!(matches!(fields[1].kind, ExprKind::Int(9)), "the named field wins");
+}
+
+#[test]
+fn a_record_update_spread_must_be_the_same_record() {
+    let message = expect_error(
+        "type A = { x: int }
+         type B = { x: int }
+         fn f(b: B): A { A { ...b } }",
+    );
+    assert!(message.contains("spreads A, found B"), "{message}");
 }
 
 #[test]

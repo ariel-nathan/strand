@@ -48,6 +48,16 @@ Pointer to a flat struct in linear memory; fields at statically-known offsets,
 8-byte slots for uniformity. Immutable by default (§4.2), so updates allocate
 a new record — the same leak caveat applies, and the same M5 revisit.
 
+`Model { ...state, draft: x }` is sugar and adds no representation. The checker
+binds the spread to a local and turns every field the literal leaves out into
+an ordinary field read of it, so the emitter sees the same `MakeRecord` it
+always saw — there is no update instruction, and there is no in-place write to
+be tempted by later. The binding is the part that matters: without it, a spread
+whose base is a call would evaluate that call once per field it filled.
+
+The spread has to come first. Anywhere else and a reader has to scan the whole
+literal before knowing whether a field they can see is the one that wins.
+
 ## 5. Strings
 
 Pointer to `{ i32 len, bytes... }`, UTF-8, immutable. No interning in the POC.
