@@ -13,6 +13,7 @@ use anyhow::{anyhow, Result};
 use wasmtime::error::Context as _;
 use strand_render::scene::Node;
 use strand_render::widgets::Theme;
+use strand_runtime::{Snapshot, Snapshots};
 use strandc::hir::Hir;
 use wasmtime::{Engine, Instance, Linker, Store, Val};
 
@@ -184,6 +185,58 @@ impl View {
         frame::decode(theme, memory.data(&self.store), base, count)
     }
 
+    /// Hands one encoded message to the actor, the way the runtime would.
+    ///
+    /// A view is a function of state (§6.5), so the only way to draw anything
+    /// but the initial frame is to move the state on first. This is what lets
+    /// a view — and a snapshot of the state behind it — be checked without a
+    /// window, a scheduler or a wiring table.
+    pub fn deliver(&mut self, port: u32, bytes: &[u8]) -> Result<()> {
+        let Entry::Actor = self.entry else {
+            return Err(anyhow!("this module has a view but no actor to send to"));
+        };
+        let alloc = self
+            .instance
+            .get_typed_func::<i32, i32>(&mut self.store, "strand_alloc")
+            .context("the module exports no `strand_alloc`")?;
+        let ptr = alloc.call(&mut self.store, bytes.len() as i32)?;
+        let memory = self
+            .instance
+            .get_memory(&mut self.store, "memory")
+            .ok_or_else(|| anyhow!("the module exports no memory"))?;
+        memory.write(&mut self.store, ptr as usize, bytes)?;
+
+        let handler = self
+            .instance
+            .get_typed_func::<(i32, i32, i32), ()>(&mut self.store, "strand_on_message")
+            .context("the module exports no `strand_on_message`")?;
+        handler
+            .call(&mut self.store, (port as i32, ptr, bytes.len() as i32))
+            .context("trap while handling the message")?;
+        Ok(())
+    }
+
+    /// The actor's state, as the snapshot walker wants it: the arena, and the
+    /// global every value in it is reachable from (§9.3).
+    pub fn snapshot(&mut self, codec: &dyn Snapshots) -> Result<Snapshot> {
+        let root = self
+            .instance
+            .get_global(&mut self.store, "strand_state")
+            .ok_or_else(|| anyhow!("the module exports no `strand_state`"))?
+            .get(&mut self.store);
+        let memory = self
+            .instance
+            .get_memory(&mut self.store, "memory")
+            .ok_or_else(|| anyhow!("the module exports no memory"))?;
+        codec.capture(memory.data(&self.store), root)
+    }
+
+    /// Puts a state captured elsewhere into this instance, in place of the one
+    /// its own `init` built.
+    pub fn restore(&mut self, snapshot: &Snapshot) -> Result<()> {
+        strand_runtime::snapshot::restore(snapshot, &mut self.store, &self.instance)
+    }
+
     fn global(&mut self, name: &str) -> Result<u32> {
         let global = self
             .instance
@@ -225,9 +278,15 @@ fn emit(hir: &Hir) -> Result<Vec<u8>> {
 /// delivered as messages, and a redraw after each one. A bare `view fn` has no
 /// state to change, so it is drawn once and left alone — which is the honest
 /// behaviour rather than a limitation to apologise for.
-pub fn run(hir: &Hir) -> Result<()> {
+pub fn run(hir: &Hir, watch: Option<&std::path::Path>) -> Result<()> {
     if hir.actors.iter().any(|actor| actor.view.is_some()) {
-        return crate::app::run(hir);
+        return crate::app::run_watching(hir, watch);
+    }
+    if watch.is_some() {
+        // Nothing to reload into: a module with a view and no actor is drawn
+        // once and left alone, so a swap would have no state to carry and no
+        // supervisor to do it.
+        println!("nothing to watch: this file has a view but no actor to hold state");
     }
 
     let wasm = emit(hir)?;

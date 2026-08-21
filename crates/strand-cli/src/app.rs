@@ -15,6 +15,7 @@
 //! like any other; frames come out through `Frames`, which hands the host the
 //! bytes the actor left in its own arena and nothing else.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +33,7 @@ use strandc::input;
 
 use crate::frame;
 use crate::plan::{self, Plan};
+use crate::snapshot::Codec;
 
 /// Turns the frames an actor draws into trees the compositor can paint.
 ///
@@ -120,6 +122,12 @@ fn check_receives_input(hir: &Hir, plan: &Plan) -> Result<()> {
 
 /// Runs a Strand app: every actor in its own arena, wired as the file says.
 pub fn run(hir: &Hir) -> Result<()> {
+    run_watching(hir, None)
+}
+
+/// The same, and with `watch` set, recompiling the file into the running
+/// actors whenever it changes (§9.3).
+pub fn run_watching(hir: &Hir, watch: Option<&Path>) -> Result<()> {
     let plan = plan::plan(hir)?;
     check_receives_input(hir, &plan)?;
     let ui = plan.ui.expect("checked just above");
@@ -148,6 +156,12 @@ pub fn run(hir: &Hir) -> Result<()> {
     for spawn in &plan.spawns {
         registry.route_out(spawn.id, spawn.out.clone());
         registry.route_watchers(spawn.id, spawn.watchers.clone());
+        // How to read this actor's state (§9.3). It is what puts a snapshot in
+        // its crash report and what lets newer code inherit what it knew.
+        registry.route_state(
+            spawn.id,
+            Arc::new(Codec::new(hir, &hir.actors[spawn.actor].state)),
+        );
         // Every mailbox exists before any actor does, so an actor that sends
         // during its own startup does not depend on which task started first.
         registry.reserve(spawn.id);
@@ -157,6 +171,9 @@ pub fn run(hir: &Hir) -> Result<()> {
     let _guard = runtime.enter();
     let feeding = registry.clone();
     runtime.spawn(crate::stats::publish(registry.clone(), published));
+    if let Some(path) = watch {
+        runtime.spawn(crate::watch::watch(path.to_path_buf(), hir.clone(), registry.clone()));
+    }
     runtime.spawn(async move {
         let mut handles = Vec::new();
         for spawn in &plan.spawns {

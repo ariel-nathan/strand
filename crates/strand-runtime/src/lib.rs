@@ -34,6 +34,9 @@ use wasmtime::error::Context as _;
 use wasmtime::{Caller, Config, Engine, Extern, Instance, Linker, Module, Store};
 
 pub mod sim;
+pub mod snapshot;
+
+pub use snapshot::{Root, Snapshot, Snapshots};
 
 pub type ActorId = u32;
 
@@ -54,6 +57,19 @@ pub enum Message {
     Blob { from: ActorId, port: u32, bytes: Vec<u8> },
     /// Asks the actor to shut down cleanly after draining.
     Stop,
+    /// Newer code for this actor (§9.3), and how to read the state that goes
+    /// with it. The current life ends, the replacement starts on these bytes,
+    /// and the state travels across when the two shapes agree.
+    ///
+    /// A supervisor restart with a newer module is all hot reload is. The only
+    /// thing this adds to §5.4 is which bytes to come back on.
+    ///
+    /// The reader travels *with* the bytes rather than being installed
+    /// separately, because the two belong to each other: installing it early
+    /// would read the old arena as the new type, and installing it late would
+    /// read the new arena as the old one. Arriving together, it cannot be
+    /// either.
+    Reload { bytes: Vec<u8>, state: Arc<dyn Snapshots> },
     /// §5.4: delivered to the parent when a child dies. Host-side supervisors
     /// act on it today; a Strand actor will receive it once M2's `actor`
     /// declarations land.
@@ -72,6 +88,9 @@ pub enum Event {
     /// Only the first line of the trap is kept, so traces stay comparable.
     Crashed { id: ActorId, reason: String },
     Restarted { id: ActorId, generation: u32 },
+    /// A life that ended because newer code arrived. `carried` says whether
+    /// the state came with it or the replacement started from `init`.
+    Reloaded { id: ActorId, generation: u32, carried: bool },
 }
 
 /// A causal log of what every actor did, in the order it happened.
@@ -108,6 +127,10 @@ impl Trace {
                 Event::Crashed { id, reason } => format!("CRASH   {id}: {reason}"),
                 Event::Restarted { id, generation } => {
                     format!("restart {id} (generation {generation})")
+                }
+                Event::Reloaded { id, generation, carried } => {
+                    let state = if *carried { "state carried" } else { "fresh state" };
+                    format!("reload  {id} (generation {generation}, {state})")
                 }
             })
             .collect::<Vec<_>>()
@@ -351,6 +374,10 @@ pub struct Registry {
     /// Who to tell when a given actor dies or is replaced. Keyed by the actor
     /// being watched, because that is what the supervisor has in hand.
     watchers: Arc<Mutex<HashMap<ActorId, Vec<Watch>>>>,
+    /// How to read each actor's state (§9.3). Here for the same reason
+    /// `frames` is: it is a per-actor capability the supervisor needs and the
+    /// actor itself never sees.
+    states: Arc<Mutex<HashMap<ActorId, Arc<dyn Snapshots>>>>,
     /// Mailboxes created before their actor runs, waiting to be picked up.
     ///
     /// Without these, "can I send to you yet" depends on which task the
@@ -375,6 +402,7 @@ impl Registry {
             frames: Arc::new(Mutex::new(HashMap::new())),
             outbound: Arc::new(Mutex::new(HashMap::new())),
             watchers: Arc::new(Mutex::new(HashMap::new())),
+            states: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             config,
         }
@@ -421,6 +449,31 @@ impl Registry {
     /// Says who to tell when actor `id` dies or is replaced (§5.4).
     pub fn route_watchers(&self, id: ActorId, watchers: Vec<Watch>) {
         self.watchers.lock().unwrap().insert(id, watchers);
+    }
+
+    /// Says how to read actor `id`'s state (§9.3).
+    ///
+    /// Without one, the actor still runs: it crashes without a snapshot in its
+    /// report, and a reload starts it from `init`. Hot reload is a thing the
+    /// host offers an actor, not a thing the actor has to know about.
+    pub fn route_state(&self, id: ActorId, codec: Arc<dyn Snapshots>) {
+        self.states.lock().unwrap().insert(id, codec);
+    }
+
+    fn state_for(&self, id: ActorId) -> Option<Arc<dyn Snapshots>> {
+        self.states.lock().unwrap().get(&id).cloned()
+    }
+
+    /// Puts messages back into a fresh mailbox after a reload.
+    ///
+    /// Deliberately not traced: each of these was recorded as sent when it was
+    /// sent, and recording it a second time would make the causal log describe
+    /// a message nobody produced.
+    fn requeue(&self, to: ActorId, msg: Message) {
+        let tx = self.inner.lock().unwrap().get(&to).cloned();
+        if let Some(tx) = tx {
+            let _ = tx.send(msg);
+        }
     }
 
     /// Tells everyone watching `id` that it just went down, or came back.
@@ -704,6 +757,20 @@ pub struct CrashReport {
     pub generation: u32,
     pub reason: String,
     pub handling: Option<String>,
+    /// What the actor believed when it died (§9.4).
+    ///
+    /// The state global still holds the last state a handler returned — a
+    /// handler that trapped never got to store its result — so this is the
+    /// actor as it was going into the message that killed it, not a
+    /// half-written one. `None` when nothing told the runtime how to read it.
+    pub state: Option<Snapshot>,
+}
+
+impl CrashReport {
+    fn with_state(mut self, state: Option<Snapshot>) -> Self {
+        self.state = state;
+        self
+    }
 }
 
 impl fmt::Display for CrashReport {
@@ -714,6 +781,9 @@ impl fmt::Display for CrashReport {
         }
         if self.generation > 0 {
             write!(f, " [generation {}]", self.generation)?;
+        }
+        if let Some(state) = &self.state {
+            write!(f, " · carrying its state ({} bytes)", state.bytes.len())?;
         }
         Ok(())
     }
@@ -773,10 +843,32 @@ fn describe(bytes: &[u8], from: ActorId) -> String {
     }
 }
 
+/// Why a life ended, when it ended on its own terms.
+enum Exit {
+    /// Told to stop. Nothing takes its place.
+    Stopped,
+    /// Newer code arrived (§9.3), with whatever the actor's state was at that
+    /// moment and whatever was still queued behind the reload.
+    Reload {
+        bytes: Vec<u8>,
+        /// How to read the *replacement's* state, once it is running.
+        reader: Arc<dyn Snapshots>,
+        /// What this life was holding when the reload arrived.
+        state: Option<Snapshot>,
+        pending: Vec<Message>,
+    },
+}
+
+// A `CrashReport` is large, because §9.4 asks it to carry a state snapshot.
+// Boxing it would save a copy on the one path that runs when an actor dies,
+// and cost a `Box` at every call site that reads one.
+#[allow(clippy::result_large_err)]
 /// Runs one life of an actor: build the Store, run it, report why it ended.
 ///
 /// Everything the actor owns is created here, so calling this again yields a
-/// genuinely fresh arena — that is all "restart" means (§5.1).
+/// genuinely fresh arena — that is all "restart" means (§5.1). `restore` is
+/// what makes it a *reload* rather than a restart: the arena is still new, and
+/// the state that goes into it came from the one before.
 async fn run_actor_once(
     engine: &Engine,
     registry: &Registry,
@@ -784,16 +876,45 @@ async fn run_actor_once(
     name: &str,
     module_bytes: &[u8],
     generation: u32,
-) -> Result<(), CrashReport> {
+    restore: Option<&Snapshot>,
+) -> Result<Exit, CrashReport> {
     // Bracketed rather than sprinkled through the body: `run_life` fails out of
     // a dozen places, and every one of them ends a life.
     let stats = registry.stat_cell(id, name);
     stats.begin(generation);
-    let outcome = run_life(engine, registry, id, name, module_bytes, generation, &stats).await;
+    let outcome =
+        run_life(engine, registry, id, name, module_bytes, generation, &stats, restore).await;
     stats.end();
     outcome
 }
 
+/// Reads the actor's state, if anyone told the runtime how (§9.3).
+///
+/// Called on the way out of a life, whether that life ended in a trap or in a
+/// reload — the state global holds the last state a handler returned either
+/// way, because a handler that traps never stores its result.
+fn capture_state(
+    codec: Option<&Arc<dyn Snapshots>>,
+    name: &str,
+    store: &mut Store<ActorCtx>,
+    instance: &Instance,
+    memory: Option<&wasmtime::Memory>,
+) -> Option<Snapshot> {
+    let codec = codec?;
+    let memory = memory?;
+    let root = instance.get_global(&mut *store, "strand_state")?.get(&mut *store);
+    match codec.capture(memory.data(&*store), root) {
+        Ok(snapshot) => Some(snapshot),
+        // Not fatal: the actor is already ending, and a report without a
+        // snapshot beats a report that never arrives.
+        Err(error) => {
+            eprintln!("!! could not read `{name}`'s state: {error:#}");
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn run_life(
     engine: &Engine,
     registry: &Registry,
@@ -802,14 +923,17 @@ async fn run_life(
     module_bytes: &[u8],
     generation: u32,
     stats: &StatCell,
-) -> Result<(), CrashReport> {
+    restore: Option<&Snapshot>,
+) -> Result<Exit, CrashReport> {
     let died = |reason: String, handling: Option<String>| CrashReport {
         actor: id,
         name: name.to_string(),
         generation,
         reason,
         handling,
+        state: None,
     };
+    let codec = registry.state_for(id);
 
     let module = Module::new(engine, module_bytes)
         .map_err(|e| died(format!("failed to compile: {}", reason(&e)), None))?;
@@ -849,22 +973,35 @@ async fn run_life(
         Some(Painter { sink, draw, base, count })
     });
 
-    if let Ok(main) = instance.get_typed_func::<(), ()>(&mut store, "strand_main") {
-        stats.fibers.store(1, Ordering::Relaxed);
-        let started = main.call_async(&mut store, ()).await;
-        stats.fibers.store(0, Ordering::Relaxed);
-        sample_arena(stats, memory.as_ref(), &store);
-        started.map_err(|e| died(reason(&e), Some("startup".to_string())))?;
+    match restore {
+        // A reload: the state came from the life before, so `init` would
+        // overwrite the very thing being carried across. §9.3's check has
+        // already said this image belongs to this module's state type.
+        Some(snapshot) => {
+            snapshot::restore_async(snapshot, &mut store, &instance).await.map_err(|e| {
+                died(format!("could not restore the state: {e:#}"), Some("reload".to_string()))
+            })?;
+        }
+        None => {
+            if let Ok(main) = instance.get_typed_func::<(), ()>(&mut store, "strand_main") {
+                stats.fibers.store(1, Ordering::Relaxed);
+                let started = main.call_async(&mut store, ()).await;
+                stats.fibers.store(0, Ordering::Relaxed);
+                sample_arena(stats, memory.as_ref(), &store);
+                started.map_err(|e| died(reason(&e), Some("startup".to_string())))?;
+            }
+        }
     }
     sample_arena(stats, memory.as_ref(), &store);
 
     // The first frame, so a window has something to show before anyone touches
     // it.
     if let Some(painter) = &painter {
-        painter
-            .paint(&mut store, memory.as_ref())
-            .await
-            .map_err(|e| died(reason(&e), Some("first frame".to_string())))?;
+        if let Err(e) = painter.paint(&mut store, memory.as_ref()).await {
+            let state =
+                capture_state(codec.as_ref(), name, &mut store, &instance, memory.as_ref());
+            return Err(died(reason(&e), Some("first frame".to_string())).with_state(state));
+        }
     }
 
     let on_message =
@@ -876,6 +1013,18 @@ async fn run_life(
             Message::Stop => break,
             // A host-side supervisor handles this today; guests ignore it.
             Message::ChildDown { .. } => continue,
+            // Newer code. Read the state before the arena holding it goes, and
+            // take everything still queued along, so a reload costs no message
+            // that was already on its way.
+            Message::Reload { bytes, state: reader } => {
+                let state =
+                    capture_state(codec.as_ref(), name, &mut store, &instance, memory.as_ref());
+                let mut pending = Vec::new();
+                while let Ok(queued) = mailbox.try_recv() {
+                    pending.push(queued);
+                }
+                return Ok(Exit::Reload { bytes, reader, state, pending });
+            }
             Message::Blob { from, port, bytes } => {
                 if config.chaos {
                     // Seeded jitter: a different interleaving per seed, but the
@@ -887,9 +1036,15 @@ async fn run_life(
 
                 let Ok(handler) = &on_message else { continue };
                 let summary = describe(&bytes, from);
-                let ptr = write_into_guest(&mut store, &instance, &bytes, from)
-                    .await
-                    .map_err(|e| died(e.to_string(), Some(summary.clone())))?;
+                let ptr = match write_into_guest(&mut store, &instance, &bytes, from).await {
+                    Ok(ptr) => ptr,
+                    Err(e) => {
+                        let state = capture_state(
+                            codec.as_ref(), name, &mut store, &instance, memory.as_ref(),
+                        );
+                        return Err(died(e.to_string(), Some(summary)).with_state(state));
+                    }
+                };
 
                 stats.fibers.store(1, Ordering::Relaxed);
                 let handled =
@@ -899,14 +1054,24 @@ async fn run_life(
                 // is more useful next to the arena size that produced it.
                 sample_arena(stats, memory.as_ref(), &store);
                 stats.handled.fetch_add(1, Ordering::Relaxed);
-                handled.map_err(|e| died(reason(&e), Some(summary.clone())))?;
+                // §9.4's crash report, with the state the actor held going
+                // into the message that killed it. The handler never stored
+                // its result, so what is in the arena is the last good one.
+                if let Err(e) = handled {
+                    let state = capture_state(
+                        codec.as_ref(), name, &mut store, &instance, memory.as_ref(),
+                    );
+                    return Err(died(reason(&e), Some(summary)).with_state(state));
+                }
 
                 // State has moved on, so the view has too.
                 if let Some(painter) = &painter {
-                    painter
-                        .paint(&mut store, memory.as_ref())
-                        .await
-                        .map_err(|e| died(reason(&e), Some(summary)))?;
+                    if let Err(e) = painter.paint(&mut store, memory.as_ref()).await {
+                        let state = capture_state(
+                            codec.as_ref(), name, &mut store, &instance, memory.as_ref(),
+                        );
+                        return Err(died(reason(&e), Some(summary)).with_state(state));
+                    }
                     sample_arena(stats, memory.as_ref(), &store);
                 }
             }
@@ -914,7 +1079,7 @@ async fn run_life(
     }
 
     trace.record(Event::Stopped { id });
-    Ok(())
+    Ok(Exit::Stopped)
 }
 
 /// Spawns one unsupervised actor. A crash ends the task.
@@ -932,9 +1097,9 @@ pub async fn spawn_actor(
     let engine = engine.clone();
     let registry = registry.clone();
     let (name, bytes) = (name.to_string(), module_bytes.to_vec());
-    Ok(tokio::spawn(
-        async move { run_actor_once(&engine, &registry, id, &name, &bytes, 0).await },
-    ))
+    Ok(tokio::spawn(async move {
+        run_actor_once(&engine, &registry, id, &name, &bytes, 0, None).await.map(|_| ())
+    }))
 }
 
 /// Spawns an actor under supervision (§5.4).
@@ -953,14 +1118,45 @@ pub fn spawn_supervised(
 ) -> tokio::task::JoinHandle<Result<(), CrashReport>> {
     let engine = engine.clone();
     let registry = registry.clone();
-    let (name, bytes) = (name.to_string(), module_bytes.to_vec());
+    let (name, mut bytes) = (name.to_string(), module_bytes.to_vec());
 
     tokio::spawn(async move {
         let mut generation = 0;
+        // What the next life starts from: `None` is `init`, `Some` is the
+        // state the life before it was holding (§9.3).
+        let mut restore: Option<Snapshot> = None;
         registry.reserve_once(id);
         loop {
-            match run_actor_once(&engine, &registry, id, &name, &bytes, generation).await {
-                Ok(()) => return Ok(()),
+            let outcome =
+                run_actor_once(&engine, &registry, id, &name, &bytes, generation, restore.as_ref())
+                    .await;
+            restore = None;
+            match outcome {
+                Ok(Exit::Stopped) => return Ok(()),
+                // Hot reload is a supervisor restart with newer code, which is
+                // why it lands here rather than in a machine of its own.
+                Ok(Exit::Reload { bytes: next, reader, state, pending }) => {
+                    // The one check §9.3 turns on: the image is a value of the
+                    // state type the *old* module had, and it may only be read
+                    // as the new one's if those are the same shape. When they
+                    // are not, `init` is the honest answer — reinterpreting
+                    // the bytes would be the bug.
+                    let carried = state.as_ref().is_some_and(|state| state.fits(reader.shape()));
+                    restore = if carried { state } else { None };
+                    // Now, and not before: until this point the actor was
+                    // still the old one, and its state still had the old
+                    // shape.
+                    registry.route_state(id, reader);
+                    bytes = next;
+                    generation += 1;
+                    registry.trace.record(Event::Reloaded { id, generation, carried });
+                    // A fresh mailbox, then everything that was queued behind
+                    // the reload put back into it: new code, same conversation.
+                    registry.reserve(id);
+                    for message in pending {
+                        registry.requeue(id, message);
+                    }
+                }
                 Err(report) => {
                     registry.trace.record(Event::Crashed { id, reason: report.reason.clone() });
                     // §8.4: the supervisor is a crash reporter by construction.

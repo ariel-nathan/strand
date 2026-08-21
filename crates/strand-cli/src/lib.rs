@@ -8,6 +8,8 @@ pub mod examples;
 pub mod frame;
 pub mod plan;
 pub mod run;
+pub mod snapshot;
 pub mod stats;
 pub mod todo;
 pub mod view;
+pub mod watch;

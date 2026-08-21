@@ -17,6 +17,7 @@ compiling and running Strand:
   strand build <file.str> [-o out] compile to a .wasm module
   strand view <file.str>           draw a Strand view in a window (§6.2);
                                    an actor with a `view fn` is interactive
+  strand view <file.str> --watch   the same, reloaded whenever you save (§9.3)
   strand view <file.str> <w> <h>   print its laid-out tree instead
 
 windows to look at:
@@ -57,9 +58,12 @@ fn main() -> ExitCode {
         ["demo", "--window"] => strand_cli::demo::run(true),
         ["demo", "--trace"] => strand_cli::demo::run_with(false, true),
         ["todo"] => strand_cli::todo::run(),
-        ["view", file] => view(Path::new(file), None),
+        ["view", file] => view(Path::new(file), None, None),
+        ["view", file, "--watch"] | ["--watch", file] => {
+            view(Path::new(file), None, Some(Path::new(file)))
+        }
         ["view", file, w, h] => match (w.parse::<f32>(), h.parse::<f32>()) {
-            (Ok(w), Ok(h)) => view(Path::new(file), Some((w, h))),
+            (Ok(w), Ok(h)) => view(Path::new(file), Some((w, h)), None),
             _ => Err(anyhow::anyhow!("view takes a width and height in pixels")),
         },
         ["inspect"] => {
@@ -133,14 +137,14 @@ fn run(path: &Path) -> Result<()> {
 /// Runs a `view fn` written in Strand (§6.2). With a viewport it prints the
 /// laid-out tree instead of opening a window, which is how a view is checked
 /// without a screen.
-fn view(path: &Path, viewport: Option<(f32, f32)>) -> Result<()> {
+fn view(path: &Path, viewport: Option<(f32, f32)>, watch: Option<&Path>) -> Result<()> {
     let (hir, _) = front_end(path)?;
     match viewport {
         Some(viewport) => {
             print!("{}", strand_cli::view::inspect(&hir, viewport)?);
             Ok(())
         }
-        None => strand_cli::view::run(&hir),
+        None => strand_cli::view::run(&hir, watch),
     }
 }
 
