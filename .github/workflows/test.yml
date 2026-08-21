@@ -1,0 +1,50 @@
+name: test
+
+# Every push and every pull request. There is one check and it is the one the
+# README claims: `cargo test --workspace` green.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace costs nothing until something fails, and when something fails
+  # on a machine you cannot open, it is the whole of what you get.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Both finish. One platform failing is a fact worth having, not a reason
+      # to stop finding out about the other.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Keyed on the lockfile: wasmtime and wgpu are most of the build, and
+      # neither moves unless a dependency does.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      # The pixel tests need a GPU adapter and skip where there is none, so a
+      # runner without one still tests everything above the renderer.
+      - name: Test
+        run: cargo test --workspace
+
+      # Not `-D warnings`: the workspace carries a handful of long-standing
+      # lints, and a check that has always been red teaches nobody anything.
+      # This reports them without failing the build.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets

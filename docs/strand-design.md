@@ -1079,9 +1079,17 @@ The position with a defense is the intersection of four properties: a typed lang
 - **Shared state with many readers** (§10.7). A theme or the current user has many readers and one writer. Explicit fan-out wires become verbose at scale. Candidates: a broadcast port kind in the `app` block, or read-only snapshots that the platform serves. The selection needs a design pass, with the no-address rule (§6.8) kept intact.
 - **The manifest signature lifecycle:** key rotation, domain transfer, and whether an application manifest joins a transparency log as a package does. The direction is yes (§11.4).
 
-## Appendix A — Screenshots
+## Appendix A — What a screenshot found
 
-M3 color-space and root-fill corrections:
+At M3, 130 tests that passed said that the renderer was correct. One look at the window said the opposite. The four defects are in commit `4a8d198`:
 
-- `screenshots/m3-before-srgb-and-root-fill.png`
-- `screenshots/m3-after-fixes.png`
+1. **The colors were washed out.** The surface format is sRGB. Thus the GPU converts linear to sRGB as it writes, and the shader must get linear values. A color is written the way a designer reads it. Thus 0.05 arrived on screen as 0.25.
+2. **The root did not fill the window.** `Sizing::Grow` sets `flex_grow`, which applies to a flex item only. The root has no parent. Thus it took the size of its content and left most of the window unpainted.
+3. **Growth used the incorrect axis.** `flex_grow` came from the direction of the node itself. Growth is relative to the axis of the *parent*: along that axis a node flexes, and across it a node stretches. Thus `width: Grow` in a column meant "become taller".
+4. **The title of the window said "Strand — M0",** two milestones late.
+
+Each of the first three was correct as data and incorrect on screen. Thus no test above a command array could find one. The fourth was correct in each place except the one place that a person looks.
+
+`crates/strand-render/tests/pixels.rs` came out of that day. It renders with no window and examines the pixels. It gives a name to each coordinate that it asserts, because a golden image breaks on each driver that rounds differently.
+
+The lesson applies to more than a renderer. Where a layer changes data into a different form, one look at the last form finds what each test above it cannot.
