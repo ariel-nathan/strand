@@ -43,7 +43,20 @@ struct Parser {
 }
 
 /// Deeper than any real Strand expression, shallow enough to unwind safely.
-const MAX_DEPTH: u32 = 128;
+///
+/// The bound counts frames, but what actually has to fit is bytes, and the two
+/// drift apart: a level of descent costs several frames holding an `ast::Expr`
+/// or a `PResult<Expr>`, and in an unoptimised build a `match` arm's locals get
+/// their own stack slots — so *adding an arm to `primary`* makes every level
+/// more expensive without touching this number.
+///
+/// That is not hypothetical. At 128 the guard stopped firing before the stack
+/// ran out on a 2 MB test thread, once `primary` grew the arms for list
+/// literals and `for`: measured, the real ceiling had fallen to somewhere
+/// between 100 and 120 levels. 64 leaves roughly double the headroom, and is
+/// still far past anything a person writes — the deepest expression in this
+/// repository nests four.
+const MAX_DEPTH: u32 = 64;
 
 type PResult<T> = Result<T, Diagnostic>;
 
@@ -1075,5 +1088,25 @@ mod tests {
     fn rejects_a_stray_top_level_expression() {
         let err = parse("1 + 1").unwrap_err();
         assert!(err.message.contains("`fn`"), "message was: {}", err.message);
+    }
+
+    #[test]
+    fn nesting_reports_rather_than_overflowing_on_both_sides_of_the_limit() {
+        // The guard has to fire *before* the stack does, so this walks from
+        // well inside the bound to well past it rather than testing one depth.
+        // A run that overflows takes the process down instead of failing, so
+        // the useful signal is this finishing at all.
+        for depth in [1usize, 32, 63, 64, 65, 256, 5000] {
+            let src = format!("fn deep(): int {{ {}1{} }}", "(".repeat(depth), ")".repeat(depth));
+            let (_, errors) = parse_recovering(&src);
+            if depth < MAX_DEPTH as usize {
+                assert!(errors.is_empty(), "depth {depth} should still parse: {errors:?}");
+            } else {
+                assert!(
+                    errors.iter().any(|e| e.message.contains("too deeply")),
+                    "depth {depth} should report rather than overflow: {errors:?}"
+                );
+            }
+        }
     }
 }
