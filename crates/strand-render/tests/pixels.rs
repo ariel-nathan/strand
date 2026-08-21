@@ -13,7 +13,7 @@
 //! since a machine without one has not told us anything about the renderer.
 
 use strand_render::inspect::{ActorStat, Inspector};
-use strand_render::paint::Painter;
+use strand_render::paint::{Layer, Painter};
 use strand_render::scene::{Color, Frame, HitId, Layouter, Node, Sizing, Style};
 
 const SIZE: u32 = 256;
@@ -77,7 +77,9 @@ impl Headless {
                 })],
                 ..Default::default()
             });
-            self.painter.draw(&mut pass, count);
+            // Both layers, in the order the compositor uses them.
+            self.painter.draw(&mut pass, count, Layer::App);
+            self.painter.draw(&mut pass, count, Layer::Overlay);
         }
 
         // 256 px * 4 bytes is already a multiple of the 256-byte row alignment.

@@ -271,6 +271,16 @@ pub struct Frame {
     pub hits: Vec<HitRegion>,
     /// Scrollable regions, in paint order.
     pub scrolls: Vec<ScrollExtent>,
+    /// Where the debug overlay's commands begin, if it drew any.
+    ///
+    /// The renderer paints rectangles and text in two passes, so within one
+    /// layer a label always sits above the surfaces it belongs to. That is
+    /// right for an application and wrong for something laid *over* one: with
+    /// a single pair of passes, any app label draws on top of the overlay no
+    /// matter where its commands sit in this array. Splitting here lets each
+    /// layer have its own pair, so the overlay is above the app entirely
+    /// rather than above only its rectangles.
+    pub overlay_from: Option<usize>,
 }
 
 impl Frame {
@@ -280,6 +290,20 @@ impl Frame {
         self.commands.clear();
         self.hits.clear();
         self.scrolls.clear();
+        self.overlay_from = None;
+    }
+
+    /// The half of the command array that belongs to the application.
+    pub fn app_commands(&self) -> &[Command] {
+        &self.commands[..self.overlay_from.unwrap_or(self.commands.len())]
+    }
+
+    /// The half the debug overlay injected, which is empty when it is off.
+    pub fn overlay_commands(&self) -> &[Command] {
+        match self.overlay_from {
+            Some(start) => &self.commands[start..],
+            None => &[],
+        }
     }
 
     /// The innermost scrollable region under a point, or `None`.

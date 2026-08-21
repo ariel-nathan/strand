@@ -15,6 +15,7 @@ use glyphon::{
     TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 
+use crate::paint::Layer;
 use crate::scene::{Command, Frame, Measure};
 
 /// Measures with the same font stack that renders, so layout and painting
@@ -58,7 +59,11 @@ pub struct TextPainter {
     swash_cache: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
+    /// One renderer per layer. glyphon draws everything a renderer prepared in
+    /// a single call, so two layers need two of them; they share the atlas, so
+    /// a glyph cached for one is cached for both.
     renderer: TextRenderer,
+    overlay_renderer: TextRenderer,
     /// One shaped buffer per text command in the current frame. Kept between
     /// frames so the allocation is reused, in the same spirit as the layouter.
     buffers: Vec<Buffer>,
@@ -76,6 +81,33 @@ struct Placement {
     bounds: TextBounds,
 }
 
+/// How many text runs in `frame` belong to the application rather than to the
+/// debug overlay laid over it.
+///
+/// Pulled out of `prepare` because it is the whole of the layering decision and
+/// the rest of `prepare` needs a GPU to run.
+fn app_runs(frame: &Frame) -> usize {
+    frame
+        .app_commands()
+        .iter()
+        .filter(|command| matches!(command, Command::Text { .. }))
+        .count()
+}
+
+/// Where one shaped run goes. A free function rather than a closure so that
+/// the borrow of the buffer outlives the iterator built from it.
+fn area<'a>((placement, buffer): (&Placement, &'a Buffer)) -> TextArea<'a> {
+    TextArea {
+        buffer,
+        left: placement.left,
+        top: placement.top,
+        scale: 1.0,
+        bounds: placement.bounds,
+        default_color: placement.color,
+        custom_glyphs: &[],
+    }
+}
+
 /// sRGB bytes, which is what glyphon expects.
 fn to_srgb8(channel: f32) -> u8 {
     (channel.clamp(0.0, 1.0) * 255.0).round() as u8
@@ -88,12 +120,15 @@ impl TextPainter {
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
         let renderer =
             TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
+        let overlay_renderer =
+            TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
 
         Self {
             swash_cache: SwashCache::new(),
             viewport,
             atlas,
             renderer,
+            overlay_renderer,
             buffers: Vec::new(),
             placements: Vec::new(),
         }
@@ -115,9 +150,21 @@ impl TextPainter {
 
         // Split the borrow so the buffers can be read while the renderer and
         // atlas are written.
-        let Self { swash_cache, atlas, renderer, buffers, placements, viewport: vp } = self;
+        let Self {
+            swash_cache,
+            atlas,
+            renderer,
+            overlay_renderer,
+            buffers,
+            placements,
+            viewport: vp,
+        } = self;
 
         placements.clear();
+        // How many of the runs about to be shaped belong to the application.
+        // Counted rather than split into two vectors, because the buffers are
+        // indexed by position and reused between frames.
+        let split = app_runs(frame);
         let mut index = 0;
         let whole = TextBounds {
             left: 0,
@@ -191,29 +238,32 @@ impl TextPainter {
             return;
         }
 
-        let areas = placements.iter().zip(buffers.iter()).map(|(placement, buffer)| TextArea {
-            buffer,
-            left: placement.left,
-            top: placement.top,
-            scale: 1.0,
-            bounds: placement.bounds,
-            default_color: placement.color,
-            custom_glyphs: &[],
-        });
-
-        if let Err(e) = renderer.prepare(device, queue, font_system, atlas, vp, areas, swash_cache)
-        {
+        // Prepared separately so each layer can be drawn after its own
+        // rectangles rather than after all of them.
+        let app = placements[..split].iter().zip(buffers.iter()).map(area);
+        if let Err(e) = renderer.prepare(device, queue, font_system, atlas, vp, app, swash_cache) {
             eprintln!("text prepare failed: {e}");
+        }
+        let overlay = placements[split..].iter().zip(buffers[split..].iter()).map(area);
+        if let Err(e) =
+            overlay_renderer.prepare(device, queue, font_system, atlas, vp, overlay, swash_cache)
+        {
+            eprintln!("overlay text prepare failed: {e}");
         }
     }
 
-    /// Draws the prepared text. Called after the rectangles, so labels sit on
-    /// top of the surfaces they belong to — paint order is tree order (§6.3).
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+    /// Draws one layer's prepared text. Called after that layer's rectangles,
+    /// so a label sits on top of the surfaces it belongs to — paint order is
+    /// tree order (§7.3) — and an overlay's labels sit on top of everything.
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, layer: Layer) {
         if self.placements.is_empty() {
             return;
         }
-        if let Err(e) = self.renderer.render(&self.atlas, &self.viewport, pass) {
+        let renderer = match layer {
+            Layer::App => &self.renderer,
+            Layer::Overlay => &self.overlay_renderer,
+        };
+        if let Err(e) = renderer.render(&self.atlas, &self.viewport, pass) {
             eprintln!("text render failed: {e}");
         }
     }
@@ -223,6 +273,66 @@ impl TextPainter {
 mod tests {
     use super::*;
     use crate::scene::Approximate;
+
+    use crate::scene::Color;
+
+    fn label(text: &str) -> Command {
+        Command::Text {
+            x: 0.0,
+            y: 0.0,
+            size: 12.0,
+            color: Color::rgb(1.0, 1.0, 1.0),
+            text: text.to_string(),
+        }
+    }
+
+    fn rect() -> Command {
+        Command::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            color: Color::rgb(1.0, 1.0, 1.0),
+        }
+    }
+
+    #[test]
+    fn text_splits_where_the_overlay_begins() {
+        // The bug this rules out: with one prepared set, every label in the
+        // app draws after every rectangle — including the overlay's panel — so
+        // a button caption lands on top of the instrument reporting on it.
+        let frame = Frame {
+            commands: vec![rect(), label("Add"), rect(), label("crash stats"), label("ui")],
+            overlay_from: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(app_runs(&frame), 2, "two app labels precede the overlay");
+    }
+
+    #[test]
+    fn every_run_is_the_app_when_the_overlay_is_off() {
+        // The usual case: F12 has not been pressed, nothing marked a boundary,
+        // and the overlay's prepared set is empty.
+        let frame = Frame {
+            commands: vec![label("Add"), rect(), label("Clear done")],
+            ..Default::default()
+        };
+        assert_eq!(app_runs(&frame), 2);
+        assert!(frame.overlay_commands().is_empty());
+    }
+
+    #[test]
+    fn a_rectangle_between_labels_does_not_shift_the_split() {
+        // `app_runs` counts text runs, and the boundary is an index into all
+        // commands. Counting the wrong thing would put the last app label into
+        // the overlay's set, where it would be drawn twice or not at all.
+        let frame = Frame {
+            commands: vec![rect(), rect(), label("Add"), rect(), label("ui")],
+            overlay_from: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(app_runs(&frame), 1);
+    }
 
     #[test]
     fn the_font_measures_narrower_than_the_approximation() {

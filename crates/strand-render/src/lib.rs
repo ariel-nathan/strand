@@ -17,7 +17,7 @@ pub mod widgets;
 
 use compositor::{InputEvent, InputSender, Key, SceneReceiver};
 use inspect::{ActorStat, Inspector, StatsHandle};
-use paint::Painter;
+use paint::{Layer, Painter};
 use text::{FontMeasure, TextPainter};
 use scene::{Color, Frame, HitId, Layouter, Node, Sizing, Style, TextStyle};
 
@@ -136,9 +136,14 @@ impl Gpu {
                 occlusion_query_set: None,
                 ..Default::default()
             });
-            self.painter.draw(&mut pass, count);
-            // Text last: labels sit above the surfaces they belong to.
-            self.text.draw(&mut pass);
+            // Rectangles then text, once per layer. Text after rectangles is
+            // what puts a label above the surface it belongs to; doing it per
+            // layer is what keeps an app's labels from landing on top of the
+            // instrument laid over the app (`paint::Layer`).
+            self.painter.draw(&mut pass, count, Layer::App);
+            self.text.draw(&mut pass, Layer::App);
+            self.painter.draw(&mut pass, count, Layer::Overlay);
+            self.text.draw(&mut pass, Layer::Overlay);
         }
 
         self.queue.submit(Some(encoder.finish()));

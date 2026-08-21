@@ -81,6 +81,18 @@ fn fs(in: VertexOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Which half of a frame is being drawn.
+///
+/// The renderer paints rectangles and then text, so a label sits above the
+/// surfaces it belongs to. That ordering is right within one layer and wrong
+/// between two: with a single pair of passes, an application label draws over
+/// the instrument laid on top of it. Each layer gets its own pair instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    App,
+    Overlay,
+}
+
 /// One draw call: the instances it covers, and the scissor they are confined
 /// to. A frame with no clips is one batch, so the common case costs exactly
 /// what it did before clipping existed.
@@ -100,6 +112,9 @@ pub struct Painter {
     capacity: usize,
     instances: Vec<Instance>,
     batches: Vec<Batch>,
+    /// Index into `batches` where the debug overlay's rectangles begin.
+    /// `None` when the overlay drew nothing, which is the usual case.
+    overlay_batch: Option<usize>,
     /// Kept from `prepare`, because a scissor is in whole pixels and has to be
     /// clamped to something.
     viewport: (f32, f32),
@@ -238,6 +253,7 @@ impl Painter {
             capacity: INITIAL_CAPACITY,
             instances: Vec::with_capacity(INITIAL_CAPACITY),
             batches: Vec::new(),
+            overlay_batch: None,
             viewport: (1.0, 1.0),
         }
     }
@@ -262,6 +278,7 @@ impl Painter {
         self.viewport = viewport;
         self.instances.clear();
         self.batches.clear();
+        self.overlay_batch = None;
 
         // Clips nest, so the active region is a stack and each entry is already
         // intersected with the one below it. A clip boundary is exactly where
@@ -269,7 +286,14 @@ impl Painter {
         let mut clips: Vec<[f32; 4]> = Vec::new();
         let mut start: u32 = 0;
 
-        for command in &frame.commands {
+        for (index, command) in frame.commands.iter().enumerate() {
+            // A layer boundary ends a draw call the same way a clip boundary
+            // does, so the two halves can be issued separately.
+            if Some(index) == frame.overlay_from {
+                let len = self.instances.len() as u32;
+                close_batch(&mut self.batches, &mut start, len, clips.last().copied());
+                self.overlay_batch = Some(self.batches.len());
+            }
             match command {
                 Command::Rect { x, y, width, height, color } => {
                     self.instances.push(Instance {
@@ -322,12 +346,20 @@ impl Painter {
         self.instances.len() as u32
     }
 
-    /// Draws the frame prepared by the last `prepare` call.
+    /// Draws one layer of the frame prepared by the last `prepare` call.
     ///
-    /// One draw call per clip region. An unclipped frame is a single batch, so
+    /// One draw call per clip region. An unclipped layer is a single batch, so
     /// this is the same single call it always was.
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, count: u32, layer: Layer) {
         if count == 0 {
+            return;
+        }
+        let split = self.overlay_batch.unwrap_or(self.batches.len());
+        let batches = match layer {
+            Layer::App => &self.batches[..split],
+            Layer::Overlay => &self.batches[split..],
+        };
+        if batches.is_empty() {
             return;
         }
         pass.set_pipeline(&self.pipeline);
@@ -335,7 +367,7 @@ impl Painter {
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
 
         let (width, height) = (self.viewport.0.max(1.0) as u32, self.viewport.1.max(1.0) as u32);
-        for batch in &self.batches {
+        for batch in batches {
             match batch.scissor {
                 Some(rect) => match scissor(rect, self.viewport) {
                     Some((x, y, w, h)) => pass.set_scissor_rect(x, y, w, h),

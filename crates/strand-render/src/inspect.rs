@@ -95,6 +95,11 @@ impl Inspector {
             return;
         }
 
+        // Everything appended from here is the overlay's, and the renderer
+        // gives it its own pair of passes so that no app label lands on top of
+        // an instrument laid over the app (`Frame::overlay_from`).
+        frame.overlay_from = Some(frame.commands.len());
+
         // Snapshot first: the outlines being appended must not be outlined.
         //
         // Each box is kept with the clip it was drawn under. The outlines go on
