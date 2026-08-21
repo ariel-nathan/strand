@@ -16,6 +16,7 @@ usage:
   strand run <file.str>            compile and run `main`
   strand build <file.str> [-o out] compile to a .wasm module
   strand demo [--window|--trace]   run the M0 actor skeleton
+  strand crash [--trace]           supervised crash and restart (§5.4)
   strand help                      show this message
 ";
 
@@ -34,6 +35,8 @@ fn main() -> ExitCode {
         ["demo"] => strand_cli::demo::run(false),
         ["demo", "--window"] => strand_cli::demo::run(true),
         ["demo", "--trace"] => strand_cli::demo::run_with(false, true),
+        ["crash"] => strand_cli::demo::crash(false),
+        ["crash", "--trace"] => strand_cli::demo::crash(true),
         _ => {
             eprint!("{USAGE}");
             return ExitCode::FAILURE;

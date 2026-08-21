@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use strand_runtime::{engine, spawn_actor, Message, Registry};
+use strand_runtime::{engine, spawn_actor, spawn_supervised, Message, Policy, Registry, HOST};
 
 const ACTORS: [(u32, &str, &str); 3] = [
     (0, "ping", "examples/wasm/ping.wat"),
@@ -70,6 +70,74 @@ async fn run_actors(traced: bool) -> Result<()> {
         println!("
 --- message trace ---
 {}", registry.trace().render());
+    }
+    Ok(())
+}
+
+/// §5.4's demo: a deliberately-crashable actor that the supervisor restarts
+/// while a sibling keeps running.
+pub fn crash(traced: bool) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    rt.block_on(run_crash(traced))
+}
+
+async fn run_crash(traced: bool) -> Result<()> {
+    const CRASHER: u32 = 0;
+    const TICKER: u32 = 1;
+
+    let engine = engine()?;
+    let registry = Registry::new();
+    println!("--- strand M2: supervision ---");
+
+    let crasher = spawn_supervised(
+        &engine,
+        &registry,
+        CRASHER,
+        "crasher",
+        &std::fs::read_to_string("examples/wasm/crasher.wat")?,
+        Policy::Restart,
+        None,
+    );
+    let ticker = spawn_supervised(
+        &engine,
+        &registry,
+        TICKER,
+        "ticker",
+        &std::fs::read_to_string("examples/wasm/ticker.wat")?,
+        Policy::Restart,
+        None,
+    );
+
+    let beat = Duration::from_millis(120);
+    let poke = |bytes: &[u8]| {
+        let _ = registry.send(CRASHER, Message::Blob { from: HOST, bytes: bytes.to_vec() });
+    };
+
+    tokio::time::sleep(beat).await;
+    poke(b"PING");
+    tokio::time::sleep(beat).await;
+    poke(b"PING");
+    tokio::time::sleep(beat).await;
+
+    println!(">>> sending BOOM to the crasher");
+    poke(b"BOOM");
+    tokio::time::sleep(beat).await;
+
+    println!(">>> pinging the restarted actor (its count should be back at #1)");
+    poke(b"PING");
+    tokio::time::sleep(beat).await;
+
+    let _ = registry.send(CRASHER, Message::Stop);
+    let _ = registry.send(TICKER, Message::Stop);
+    let _ = crasher.await;
+    let _ = ticker.await;
+
+    println!("--- done ---");
+    if traced {
+        println!("\n--- message trace ---\n{}", registry.trace().render());
     }
     Ok(())
 }

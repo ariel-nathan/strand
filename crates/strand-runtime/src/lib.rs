@@ -20,6 +20,7 @@
 //! `anyhow` feature, which is on by default.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,6 +37,9 @@ pub mod sim;
 
 pub type ActorId = u32;
 
+/// Sender id for messages that originate outside any actor.
+pub const HOST: ActorId = u32::MAX;
+
 /// The typed message set. For M0/M1 this is deliberately tiny; §5.3's
 /// buffer-transfer variants land in M2.
 #[derive(Debug, Clone)]
@@ -44,6 +48,10 @@ pub enum Message {
     Blob { from: ActorId, bytes: Vec<u8> },
     /// Asks the actor to shut down cleanly after draining.
     Stop,
+    /// §5.4: delivered to the parent when a child dies. Host-side supervisors
+    /// act on it today; a Strand actor will receive it once M2's `actor`
+    /// declarations land.
+    ChildDown { child: ActorId, report: CrashReport },
 }
 
 /// One scheduling-visible event. Deliberately free of wall-clock time so two
@@ -55,6 +63,9 @@ pub enum Event {
     Delivered { to: ActorId, from: ActorId, len: usize },
     Logged { id: ActorId, text: String },
     Stopped { id: ActorId },
+    /// Only the first line of the trap is kept, so traces stay comparable.
+    Crashed { id: ActorId, reason: String },
+    Restarted { id: ActorId, generation: u32 },
 }
 
 /// A causal log of what every actor did, in the order it happened.
@@ -88,6 +99,10 @@ impl Trace {
                 }
                 Event::Logged { id, text } => format!("log     {id}: {text}"),
                 Event::Stopped { id } => format!("stop    {id}"),
+                Event::Crashed { id, reason } => format!("CRASH   {id}: {reason}"),
+                Event::Restarted { id, generation } => {
+                    format!("restart {id} (generation {generation})")
+                }
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -162,10 +177,10 @@ impl Registry {
     }
 
     pub fn send(&self, to: ActorId, msg: Message) -> Result<()> {
-        self.send_from(u32::MAX, to, msg)
+        self.send_from(HOST, to, msg)
     }
 
-    /// `from` is `u32::MAX` for messages originating outside any actor.
+    /// `from` is [`HOST`] for messages originating outside any actor.
     pub fn send_from(&self, from: ActorId, to: ActorId, msg: Message) -> Result<()> {
         let tx = {
             let map = self.inner.lock().unwrap();
@@ -270,17 +285,108 @@ pub fn engine() -> Result<Engine> {
     Ok(Engine::new(&config).context("failed to build wasmtime engine")?)
 }
 
-/// Spawns one actor: its own Store, its own instance, its own tokio task.
-pub async fn spawn_actor(
+/// What a supervisor does when a child dies (§5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    /// Rebuild the actor from scratch. Its arena is gone, so state is fresh.
+    Restart,
+    /// Let it stay dead and surface the failure to the caller.
+    Stop,
+}
+
+/// A structured account of a death (§8.4) — not stack-trace soup.
+///
+/// Because actors take input only through their mailbox, the message being
+/// handled is a complete description of what triggered the crash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashReport {
+    pub actor: ActorId,
+    pub name: String,
+    /// How many times this actor had already been restarted.
+    pub generation: u32,
+    pub reason: String,
+    pub handling: Option<String>,
+}
+
+impl fmt::Display for CrashReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "actor `{}` ({}) died: {}", self.name, self.actor, self.reason)?;
+        if let Some(handling) = &self.handling {
+            write!(f, " while handling {handling}")?;
+        }
+        if self.generation > 0 {
+            write!(f, " [generation {}]", self.generation)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CrashReport {}
+
+/// Reduces a wasmtime error to one meaningful line, so a crash report says
+/// something useful and a trace stays comparable across runs.
+///
+/// wasmtime leads with "error while executing at wasm backtrace:" and puts the
+/// actual trap further down, so the first line is the least informative part.
+fn reason(error: &wasmtime::Error) -> String {
+    // Debug renders the causal chain; Display shows only the top line, which
+    // for a trap is the uninformative half.
+    first_line(&format!("{error:?}"))
+}
+
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("wasm trap:"))
+        .map(str::to_string)
+        .unwrap_or_else(|| text.lines().next().unwrap_or_default().trim().to_string())
+}
+
+/// Identifies a sender for humans. `HOST` is the sentinel for a message that
+/// did not come from an actor.
+fn sender(from: ActorId) -> String {
+    if from == HOST {
+        "the host".to_string()
+    } else {
+        format!("actor {from}")
+    }
+}
+
+/// Renders a message for a crash report: a printable payload reads better than
+/// a byte count when you are working out what killed an actor.
+fn describe(bytes: &[u8], from: ActorId) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if text.chars().all(|c| !c.is_control()) => {
+            format!("{text:?} from {}", sender(from))
+        }
+        _ => format!("{} bytes from {}", bytes.len(), sender(from)),
+    }
+}
+
+/// Runs one life of an actor: build the Store, run it, report why it ended.
+///
+/// Everything the actor owns is created here, so calling this again yields a
+/// genuinely fresh arena — that is all "restart" means (§5.1).
+async fn run_actor_once(
     engine: &Engine,
     registry: &Registry,
     id: ActorId,
     name: &str,
     wat: &str,
-) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let module = Module::new(engine, wat).with_context(|| format!("compiling actor `{name}`"))?;
+    generation: u32,
+) -> Result<(), CrashReport> {
+    let died = |reason: String, handling: Option<String>| CrashReport {
+        actor: id,
+        name: name.to_string(),
+        generation,
+        reason,
+        handling,
+    };
+
+    let module = Module::new(engine, wat)
+        .map_err(|e| died(format!("failed to compile: {}", reason(&e)), None))?;
     let mut linker = Linker::new(engine);
-    link_host_abi(&mut linker)?;
+    link_host_abi(&mut linker).map_err(|e| died(format!("failed to link host ABI: {e}"), None))?;
 
     let ctx = ActorCtx { id, name: name.to_string(), registry: registry.clone() };
     let mut store = Store::new(engine, ctx);
@@ -289,36 +395,112 @@ pub async fn spawn_actor(
     store.epoch_deadline_async_yield_and_update(1);
 
     let mut mailbox = registry.register(id, name);
-    let instance = linker.instantiate_async(&mut store, &module).await?;
+    let instance = linker.instantiate_async(&mut store, &module).await.map_err(|e| {
+        died(format!("failed to instantiate: {}", reason(&e)), None)
+    })?;
+
     let trace = registry.trace();
     let config = registry.config.clone();
 
-    Ok(tokio::spawn(async move {
-        if let Ok(main) = instance.get_typed_func::<(), ()>(&mut store, "strand_main") {
-            main.call_async(&mut store, ()).await?;
-        }
+    if let Ok(main) = instance.get_typed_func::<(), ()>(&mut store, "strand_main") {
+        main.call_async(&mut store, ())
+            .await
+            .map_err(|e| died(reason(&e), Some("startup".to_string())))?;
+    }
 
-        let on_message = instance.get_typed_func::<(i32, i32), ()>(&mut store, "strand_on_message");
-        while let Some(msg) = mailbox.recv().await {
-            match msg {
-                Message::Stop => break,
-                Message::Blob { from, bytes } => {
-                    if config.chaos {
-                        // Seeded jitter: a different interleaving per seed, but
-                        // the same one every time for a given seed.
-                        let delay = config.next() % 8;
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
+    let on_message = instance.get_typed_func::<(i32, i32), ()>(&mut store, "strand_on_message");
+    while let Some(msg) = mailbox.recv().await {
+        match msg {
+            Message::Stop => break,
+            // A host-side supervisor handles this today; guests ignore it.
+            Message::ChildDown { .. } => continue,
+            Message::Blob { from, bytes } => {
+                if config.chaos {
+                    // Seeded jitter: a different interleaving per seed, but the
+                    // same one every time for a given seed.
+                    let delay = config.next() % 8;
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                trace.record(Event::Delivered { to: id, from, len: bytes.len() });
+
+                let Ok(handler) = &on_message else { continue };
+                let summary = describe(&bytes, from);
+                let ptr = write_into_guest(&mut store, &instance, &bytes, from)
+                    .await
+                    .map_err(|e| died(e.to_string(), Some(summary.clone())))?;
+                handler
+                    .call_async(&mut store, (ptr, bytes.len() as i32))
+                    .await
+                    .map_err(|e| died(reason(&e), Some(summary)))?;
+            }
+        }
+    }
+
+    trace.record(Event::Stopped { id });
+    Ok(())
+}
+
+/// Spawns one unsupervised actor. A crash ends the task.
+pub async fn spawn_actor(
+    engine: &Engine,
+    registry: &Registry,
+    id: ActorId,
+    name: &str,
+    wat: &str,
+) -> Result<tokio::task::JoinHandle<Result<(), CrashReport>>> {
+    let engine = engine.clone();
+    let registry = registry.clone();
+    let (name, wat) = (name.to_string(), wat.to_string());
+    Ok(tokio::spawn(
+        async move { run_actor_once(&engine, &registry, id, &name, &wat, 0).await },
+    ))
+}
+
+/// Spawns an actor under supervision (§5.4).
+///
+/// On a crash the arena is reclaimed by dropping the Store, a `ChildDown` goes
+/// to the parent, and the policy decides whether a fresh instance takes its
+/// place. Siblings are untouched throughout — that is the isolation claim.
+pub fn spawn_supervised(
+    engine: &Engine,
+    registry: &Registry,
+    id: ActorId,
+    name: &str,
+    wat: &str,
+    policy: Policy,
+    parent: Option<ActorId>,
+) -> tokio::task::JoinHandle<Result<(), CrashReport>> {
+    let engine = engine.clone();
+    let registry = registry.clone();
+    let (name, wat) = (name.to_string(), wat.to_string());
+
+    tokio::spawn(async move {
+        let mut generation = 0;
+        loop {
+            match run_actor_once(&engine, &registry, id, &name, &wat, generation).await {
+                Ok(()) => return Ok(()),
+                Err(report) => {
+                    registry.trace.record(Event::Crashed { id, reason: report.reason.clone() });
+                    // §8.4: the supervisor is a crash reporter by construction.
+                    eprintln!("!! {report}");
+
+                    if let Some(parent) = parent {
+                        let _ = registry.send_from(
+                            id,
+                            parent,
+                            Message::ChildDown { child: id, report: report.clone() },
+                        );
                     }
-                    trace.record(Event::Delivered { to: id, from, len: bytes.len() });
-                    let Ok(handler) = &on_message else { continue };
-                    let ptr = write_into_guest(&mut store, &instance, &bytes, from).await?;
-                    handler.call_async(&mut store, (ptr, bytes.len() as i32)).await?;
+
+                    if policy == Policy::Stop {
+                        return Err(report);
+                    }
+                    generation += 1;
+                    registry.trace.record(Event::Restarted { id, generation });
                 }
             }
         }
-        trace.record(Event::Stopped { id });
-        Ok(())
-    }))
+    })
 }
 
 /// Copies an inbound message into the guest's arena via its own allocator.
