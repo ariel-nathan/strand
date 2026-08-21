@@ -433,3 +433,12 @@ fn an_actors_view_takes_only_its_state() {
     );
     assert!(msg.contains("and nothing else"), "message was: {msg}");
 }
+
+#[test]
+fn view_is_a_keyword_and_says_so_when_used_as_a_name() {
+    // The obvious thing to reach for, and the reason the actor's view is named
+    // for what it draws instead.
+    let src = "view fn view(): Node { text(\"hi\") }";
+    let error = strandc::parser::parse(src).expect_err("`view` cannot be a name");
+    assert!(error.message.contains("keyword, not a name"), "message was: {}", error.message);
+}

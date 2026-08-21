@@ -143,6 +143,19 @@ impl Parser {
         } else {
             self.expect(Tok::Fn)?
         };
+
+        // `view fn view(...)` is the obvious thing to reach for and does not
+        // work, because `view` is a keyword now. Saying which name is taken
+        // beats "expected an identifier".
+        if self.at(&Tok::View) {
+            return Err(Diagnostic::new(self.span(), "`view` is a keyword, not a name")
+                .with_label("reserved")
+                .with_help(
+                    "name it for what it draws — `view fn todoList(...)`. Inside \
+                     an actor, the `view fn` is the actor's view whatever it is \
+                     called, so the name is free.",
+                ));
+        }
         let (name, _) = self.expect_ident()?;
 
         self.expect(Tok::LParen)?;
