@@ -1,3 +1,0 @@
-compositor  170 fps | app submitted   5 frames
-compositor  166 fps | app submitted   3 frames
-compositor  166 fps | app submitted   4 frames

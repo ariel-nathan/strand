@@ -1,1 +1,0 @@
---- strand M3: app actor burning CPU; the compositor should not care ---
