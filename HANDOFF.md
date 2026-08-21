@@ -9,13 +9,18 @@ messages carry the reasoning; `git log -S` the line before changing it.
 
 ## State
 
-488 tests, `cargo test --workspace` green. M0–M4 done including §8's demo
+489 tests, `cargo test --workspace` green. M0–M4 done including §8's demo
 sequence. M5 is done bar one item — read §13 rather than trusting this file.
 
 Hot reload landed this session: `strand view <file> --watch` recompiles on
 save, swaps every actor onto the new module, and carries its state across.
 The mechanism is §6.14's typed snapshot, and it has three users — the swap,
 §9.4's crash report, and (later) §10.4's resume.
+
+A reload replaces code and keeps data, so a literal a handler stored in the
+state keeps its old text until that handler runs again. That is correct and
+it reads as a bug the first time; F5 restarts every actor from `init`, and
+`--watch` says so on startup.
 
 Three examples matter: `todo_demo.str` is §8's demo, `pipeline.str` is the
 smallest thing that shows ports, and `--watch` is best seen on the first.
@@ -62,8 +67,11 @@ smallest thing that shows ports, and `--watch` is best seen on the first.
 - **PowerShell has no heredoc.** `git commit -F <file>` — which is also what
   keeps backticks in a message from being substituted.
 - **`strand.exe` is held open** by any running window and by VS Code's
-  language server, which respawns it. Kill it in a loop while cargo builds,
-  or the link step fails with "Access is denied".
+  language server, which respawns it, and the link step then fails with
+  "Access is denied". Do not kill the window — it may be the user's live
+  session. Windows lets a running executable be *renamed*:
+  `Move-Item target\debug\strand.exe target\debug\strand-locked.old -Force`
+  and cargo writes a fresh one while the old process keeps its own handle.
 - **Tests hang under `sim` if an actor never idles.** Virtual time only
   advances when every task is idle, so a self-scheduled loop (the CPU burn)
   stops the clock. `tests/tree.rs::drive_realtime` is the real-clock driver.
