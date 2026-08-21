@@ -112,6 +112,15 @@ fn view(theme: &Theme, state: &State) -> Node {
     screen(theme, children)
 }
 
+/// Prints the todo UI as a laid-out tree (§8.4), without opening a window.
+///
+/// This is the inspector's most useful form for anyone who cannot see the
+/// screen: it reports where every node actually ended up, so a layout can be
+/// checked without a screenshot.
+pub fn inspect(viewport: (f32, f32)) -> String {
+    strand_render::inspect::describe(&view(&Theme::default(), &State::new()), viewport)
+}
+
 /// Runs the todo UI: an actor on the runtime, the compositor on this thread.
 pub fn run() -> Result<()> {
     let (scenes, scene_receiver) = scene_channel();

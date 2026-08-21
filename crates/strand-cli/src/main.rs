@@ -16,6 +16,7 @@ usage:
   strand run <file.str>            compile and run `main`
   strand build <file.str> [-o out] compile to a .wasm module
   strand todo                      the todo UI (§7)
+  strand inspect [w h]             print the todo UI tree (§8.4)
   strand ui [--burn]               compositor demo (§6.1)
   strand demo [--window|--trace]   run the M0 actor skeleton
   strand crash [--trace]           supervised crash and restart (§5.4)
@@ -38,6 +39,17 @@ fn main() -> ExitCode {
         ["demo", "--window"] => strand_cli::demo::run(true),
         ["demo", "--trace"] => strand_cli::demo::run_with(false, true),
         ["todo"] => strand_cli::todo::run(),
+        ["inspect"] => {
+            print!("{}", strand_cli::todo::inspect((800.0, 628.0)));
+            return ExitCode::SUCCESS;
+        }
+        ["inspect", w, h] => match (w.parse::<f32>(), h.parse::<f32>()) {
+            (Ok(w), Ok(h)) => {
+                print!("{}", strand_cli::todo::inspect((w, h)));
+                return ExitCode::SUCCESS;
+            }
+            _ => Err(anyhow::anyhow!("inspect takes a width and height in pixels")),
+        },
         ["ui"] => strand_cli::demo::ui(false),
         ["ui", "--burn"] => strand_cli::demo::ui(true),
         ["crash"] => strand_cli::demo::crash(false),

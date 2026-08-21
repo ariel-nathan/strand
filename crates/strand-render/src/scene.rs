@@ -232,6 +232,12 @@ impl Layouter {
         Self { frame: Frame::default() }
     }
 
+    /// The most recently laid-out frame, for appending overlay commands to
+    /// (§8.4 — the inspector is just more render commands).
+    pub fn frame_mut(&mut self) -> &mut Frame {
+        &mut self.frame
+    }
+
     /// The most recently laid-out frame, for hit-testing input against what
     /// is actually on screen rather than what the app last built.
     pub fn frame(&self) -> &Frame {
@@ -245,22 +251,7 @@ impl Layouter {
         let mut tree: TaffyTree<()> = TaffyTree::new();
         let Ok(node) = build(&mut tree, root, None) else { return &self.frame };
 
-        // The root has no parent to grow inside, so `Grow` there means "fill
-        // the viewport". Without this a root that asks to grow sizes to its
-        // content and leaves the rest of the window unpainted.
-        if let Some(style) = root.style() {
-            if style.width.is_grow() || style.height.is_grow() {
-                if let Ok(mut root_style) = tree.style(node).cloned() {
-                    if style.width.is_grow() {
-                        root_style.size.width = length(viewport.0);
-                    }
-                    if style.height.is_grow() {
-                        root_style.size.height = length(viewport.1);
-                    }
-                    let _ = tree.set_style(node, root_style);
-                }
-            }
-        }
+        fit_root(&mut tree, node, root, viewport);
 
         let space = Size {
             width: AvailableSpace::Definite(viewport.0),
@@ -279,6 +270,68 @@ impl Layouter {
 /// growing means: along the parent's main axis a node flexes, across it a node
 /// stretches. Using the node's own direction here — as this did originally —
 /// makes `width: Grow` inside a column grow the node vertically.
+/// The root has no parent to grow inside, so `Grow` there means "fill the
+/// viewport". Without this a root that asks to grow sizes to its content and
+/// leaves the rest of the window unpainted.
+fn fit_root(tree: &mut TaffyTree<()>, id: NodeId, root: &Node, viewport: (f32, f32)) {
+    let Some(style) = root.style() else { return };
+    if !style.width.is_grow() && !style.height.is_grow() {
+        return;
+    }
+    let Ok(mut root_style) = tree.style(id).cloned() else { return };
+    if style.width.is_grow() {
+        root_style.size.width = length(viewport.0);
+    }
+    if style.height.is_grow() {
+        root_style.size.height = length(viewport.1);
+    }
+    let _ = tree.set_style(id, root_style);
+}
+
+/// Lays the tree out and visits every node with its depth and absolute
+/// geometry. The command array is flat by design, so this is the only place
+/// that can still answer "which node produced this rectangle" — the inspector
+/// runs here, before flattening.
+pub fn walk_laid_out(
+    root: &Node,
+    viewport: (f32, f32),
+    visit: &mut impl FnMut(&Node, usize, f32, f32, f32, f32),
+) {
+    let mut tree: TaffyTree<()> = TaffyTree::new();
+    let Ok(id) = build(&mut tree, root, None) else { return };
+    fit_root(&mut tree, id, root, viewport);
+
+    let space = Size {
+        width: AvailableSpace::Definite(viewport.0),
+        height: AvailableSpace::Definite(viewport.1),
+    };
+    if tree.compute_layout(id, space).is_err() {
+        return;
+    }
+    visit_laid_out(&tree, id, root, 0.0, 0.0, 0, visit);
+}
+
+fn visit_laid_out(
+    tree: &TaffyTree<()>,
+    id: NodeId,
+    node: &Node,
+    x: f32,
+    y: f32,
+    depth: usize,
+    visit: &mut impl FnMut(&Node, usize, f32, f32, f32, f32),
+) {
+    let Ok(layout) = tree.layout(id) else { return };
+    let (x, y) = (x + layout.location.x, y + layout.location.y);
+    visit(node, depth, x, y, layout.size.width, layout.size.height);
+
+    if let Node::Row { children, .. } | Node::Column { children, .. } = node {
+        let ids = tree.children(id).unwrap_or_default();
+        for (child_id, child) in ids.into_iter().zip(children) {
+            visit_laid_out(tree, child_id, child, x, y, depth + 1, visit);
+        }
+    }
+}
+
 fn taffy_style(
     style: &Style,
     direction: FlexDirection,

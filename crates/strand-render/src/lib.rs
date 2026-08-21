@@ -9,12 +9,16 @@
 use std::sync::Arc;
 
 pub mod compositor;
+pub mod inspect;
 pub mod paint;
 pub mod scene;
+pub mod text;
 pub mod widgets;
 
 use compositor::{InputEvent, InputSender, SceneReceiver};
+use inspect::Inspector;
 use paint::Painter;
+use text::TextPainter;
 use scene::{Color, Frame, HitId, Layouter, Node, Sizing, Style, TextStyle};
 
 use anyhow::{anyhow, Result};
@@ -30,6 +34,7 @@ struct Gpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     painter: Painter,
+    text: TextPainter,
 }
 
 impl Gpu {
@@ -68,7 +73,8 @@ impl Gpu {
         surface.configure(&device, &config);
 
         let painter = Painter::new(&device, config.format);
-        Ok(Self { surface, device, queue, config, painter })
+        let text = TextPainter::new(&device, &queue, config.format);
+        Ok(Self { surface, device, queue, config, painter, text })
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -83,6 +89,7 @@ impl Gpu {
     fn render(&mut self, frame: &Frame) -> Result<()> {
         let viewport = (self.config.width as f32, self.config.height as f32);
         let count = self.painter.prepare(&self.device, &self.queue, frame, viewport);
+        self.text.prepare(&self.device, &self.queue, frame, viewport);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -130,6 +137,8 @@ impl Gpu {
                 ..Default::default()
             });
             self.painter.draw(&mut pass, count);
+            // Text last: labels sit above the surfaces they belong to.
+            self.text.draw(&mut pass);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -157,6 +166,8 @@ struct App {
     input: Option<InputSender>,
     cursor: (f32, f32),
     hovered: Option<HitId>,
+    /// §8.4's debug overlay, toggled with F12 like the tool it imitates.
+    inspector: Inspector,
 }
 
 impl ApplicationHandler for App {
@@ -189,6 +200,17 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+
+            WindowEvent::KeyboardInput { event, .. } => {
+                use winit::keyboard::{Key, NamedKey};
+                if event.state.is_pressed() && event.logical_key == Key::Named(NamedKey::F12) {
+                    self.inspector.toggle();
+                    eprintln!(
+                        "inspector {}",
+                        if self.inspector.enabled { "on" } else { "off" }
+                    );
+                }
+            }
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
@@ -247,8 +269,14 @@ impl ApplicationHandler for App {
                         self.last_report = Some(now);
                     }
                     let tree = self.scene.get_or_insert_with(demo_scene);
-                    let frame = self.layouter.layout(tree, viewport);
-                    if let Err(e) = gpu.render(frame) {
+                    self.layouter.layout(tree, viewport);
+
+                    // Injected render commands, not a second rendering path
+                    // (docs/inspiration-canon.md, on clay).
+                    self.inspector.highlight = self.hovered;
+                    self.inspector.overlay(self.layouter.frame_mut());
+
+                    if let Err(e) = gpu.render(self.layouter.frame()) {
                         eprintln!("frame dropped: {e}");
                     }
                 }
