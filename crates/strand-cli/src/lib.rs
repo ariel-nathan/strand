@@ -4,4 +4,5 @@
 pub mod demo;
 pub mod encode;
 pub mod run;
+pub mod stats;
 pub mod todo;

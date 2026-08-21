@@ -19,9 +19,9 @@
 //! API speaks `anyhow::Result`. `?` bridges the two via wasmtime's
 //! `anyhow` feature, which is on by default.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -109,6 +109,106 @@ impl Trace {
     }
 }
 
+/// A live measurement of one actor, for §8.4's debug overlay.
+///
+/// Sampled, not logged. The overlay asks "what is true now", and a number one
+/// message stale is fine — it will be right again in a millisecond. The `Trace`
+/// answers the other question, "what happened", and these deliberately stay
+/// separate: history is a log, liveness is a gauge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorStats {
+    pub id: ActorId,
+    pub name: String,
+    /// Linear-memory bytes wasmtime has committed to this actor's arena. §5.1's
+    /// isolation claim as a number: memory no other actor can reach, and that
+    /// a restart hands back in one deallocation.
+    pub arena_bytes: u64,
+    /// Messages waiting to be handled right now. A depth that climbs is an
+    /// actor falling behind — the thing §6.1 says costs *it* and nobody else.
+    pub mailbox: usize,
+    /// Guest invocations in flight. Exactly one per busy actor today: §4.4's
+    /// structured spawn is not in the language yet, so an actor *is* one fiber.
+    /// The column exists because the number stops being 0-or-1 the day `scope`
+    /// lands, and a gauge nobody wired up is a gauge nobody trusts.
+    pub fibers: u32,
+    /// Messages handled since this generation started. Resets on restart, which
+    /// is the point: a restarted actor is a genuinely fresh one.
+    pub handled: u64,
+    /// How many times this actor has been restarted (§5.4).
+    pub generation: u32,
+    pub alive: bool,
+}
+
+/// The counters an actor bumps as it works.
+///
+/// Atomics rather than a lock, because an actor must never wait on the thing
+/// watching it — the overlay is an observer, and observers do not get to
+/// introduce contention into what they observe.
+#[derive(Debug)]
+struct StatCell {
+    name: String,
+    arena_bytes: AtomicU64,
+    mailbox: AtomicU64,
+    fibers: AtomicU32,
+    handled: AtomicU64,
+    generation: AtomicU32,
+    alive: AtomicBool,
+}
+
+impl StatCell {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            arena_bytes: AtomicU64::new(0),
+            mailbox: AtomicU64::new(0),
+            fibers: AtomicU32::new(0),
+            handled: AtomicU64::new(0),
+            generation: AtomicU32::new(0),
+            alive: AtomicBool::new(false),
+        }
+    }
+
+    /// A new life starts. Everything resets because everything *is* new: the
+    /// arena was dropped, so carrying a byte count across a restart would
+    /// report memory that no longer exists.
+    fn begin(&self, generation: u32) {
+        self.generation.store(generation, Ordering::Relaxed);
+        self.arena_bytes.store(0, Ordering::Relaxed);
+        self.mailbox.store(0, Ordering::Relaxed);
+        self.fibers.store(0, Ordering::Relaxed);
+        self.handled.store(0, Ordering::Relaxed);
+        self.alive.store(true, Ordering::Relaxed);
+    }
+
+    /// The life ended, however it ended. The row stays — a dead actor is
+    /// exactly what someone watching the overlay wants to see.
+    fn end(&self) {
+        self.fibers.store(0, Ordering::Relaxed);
+        self.alive.store(false, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, id: ActorId) -> ActorStats {
+        ActorStats {
+            id,
+            name: self.name.clone(),
+            arena_bytes: self.arena_bytes.load(Ordering::Relaxed),
+            mailbox: self.mailbox.load(Ordering::Relaxed) as usize,
+            fibers: self.fibers.load(Ordering::Relaxed),
+            handled: self.handled.load(Ordering::Relaxed),
+            generation: self.generation.load(Ordering::Relaxed),
+            alive: self.alive.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Reads an actor's arena size. Guest memory only grows while guest code runs,
+/// so sampling after each call is exact rather than approximate.
+fn sample_arena(stats: &StatCell, memory: Option<&wasmtime::Memory>, store: &Store<ActorCtx>) {
+    if let Some(memory) = memory {
+        stats.arena_bytes.store(memory.data_size(store) as u64, Ordering::Relaxed);
+    }
+}
+
 /// Controls how the scheduler behaves. Production leaves `chaos` off; `sim`
 /// turns it on to explore a different — but still reproducible — interleaving.
 #[derive(Debug)]
@@ -148,6 +248,9 @@ pub struct Registry {
     inner: Arc<Mutex<HashMap<ActorId, mpsc::UnboundedSender<Message>>>>,
     start: Instant,
     trace: Trace,
+    /// Keyed by id and ordered, so the overlay's rows keep their places
+    /// between frames instead of dancing.
+    stats: Arc<Mutex<BTreeMap<ActorId, Arc<StatCell>>>>,
     config: Arc<SimConfig>,
 }
 
@@ -161,12 +264,28 @@ impl Registry {
             inner: Arc::new(Mutex::new(HashMap::new())),
             start: Instant::now(),
             trace: Trace::new(),
+            stats: Arc::new(Mutex::new(BTreeMap::new())),
             config,
         }
     }
 
     pub fn trace(&self) -> Trace {
         self.trace.clone()
+    }
+
+    /// The cell an actor reports into. Created on first spawn and reused across
+    /// restarts, so a crashed child's row keeps its place rather than vanishing
+    /// and reappearing — watching the generation tick is the demonstration.
+    fn stat_cell(&self, id: ActorId, name: &str) -> Arc<StatCell> {
+        let mut cells = self.stats.lock().unwrap();
+        cells.entry(id).or_insert_with(|| Arc::new(StatCell::new(name))).clone()
+    }
+
+    /// A snapshot of every actor this registry has ever spawned, live or dead
+    /// (§8.4's debug overlay). Ordered by id.
+    pub fn stats(&self) -> Vec<ActorStats> {
+        let cells = self.stats.lock().unwrap();
+        cells.iter().map(|(id, cell)| cell.snapshot(*id)).collect()
     }
 
     fn register(&self, id: ActorId, name: &str) -> mpsc::UnboundedReceiver<Message> {
@@ -450,6 +569,24 @@ async fn run_actor_once(
     module_bytes: &[u8],
     generation: u32,
 ) -> Result<(), CrashReport> {
+    // Bracketed rather than sprinkled through the body: `run_life` fails out of
+    // a dozen places, and every one of them ends a life.
+    let stats = registry.stat_cell(id, name);
+    stats.begin(generation);
+    let outcome = run_life(engine, registry, id, name, module_bytes, generation, &stats).await;
+    stats.end();
+    outcome
+}
+
+async fn run_life(
+    engine: &Engine,
+    registry: &Registry,
+    id: ActorId,
+    name: &str,
+    module_bytes: &[u8],
+    generation: u32,
+    stats: &StatCell,
+) -> Result<(), CrashReport> {
     let died = |reason: String, handling: Option<String>| CrashReport {
         actor: id,
         name: name.to_string(),
@@ -476,15 +613,23 @@ async fn run_actor_once(
 
     let trace = registry.trace();
     let config = registry.config.clone();
+    // Held for the actor's whole life: this handle is how the overlay learns
+    // the arena's size without reaching into another actor's memory.
+    let memory = instance.get_memory(&mut store, "memory");
 
     if let Ok(main) = instance.get_typed_func::<(), ()>(&mut store, "strand_main") {
-        main.call_async(&mut store, ())
-            .await
-            .map_err(|e| died(reason(&e), Some("startup".to_string())))?;
+        stats.fibers.store(1, Ordering::Relaxed);
+        let started = main.call_async(&mut store, ()).await;
+        stats.fibers.store(0, Ordering::Relaxed);
+        sample_arena(stats, memory.as_ref(), &store);
+        started.map_err(|e| died(reason(&e), Some("startup".to_string())))?;
     }
+    sample_arena(stats, memory.as_ref(), &store);
 
     let on_message = instance.get_typed_func::<(i32, i32), ()>(&mut store, "strand_on_message");
     while let Some(msg) = mailbox.recv().await {
+        // What is still queued behind the message just taken.
+        stats.mailbox.store(mailbox.len() as u64, Ordering::Relaxed);
         match msg {
             Message::Stop => break,
             // A host-side supervisor handles this today; guests ignore it.
@@ -503,10 +648,15 @@ async fn run_actor_once(
                 let ptr = write_into_guest(&mut store, &instance, &bytes, from)
                     .await
                     .map_err(|e| died(e.to_string(), Some(summary.clone())))?;
-                handler
-                    .call_async(&mut store, (ptr, bytes.len() as i32))
-                    .await
-                    .map_err(|e| died(reason(&e), Some(summary)))?;
+
+                stats.fibers.store(1, Ordering::Relaxed);
+                let handled = handler.call_async(&mut store, (ptr, bytes.len() as i32)).await;
+                stats.fibers.store(0, Ordering::Relaxed);
+                // Sampled whether the call returned or trapped: a crash report
+                // is more useful next to the arena size that produced it.
+                sample_arena(stats, memory.as_ref(), &store);
+                stats.handled.fetch_add(1, Ordering::Relaxed);
+                handled.map_err(|e| died(reason(&e), Some(summary)))?;
             }
         }
     }

@@ -19,7 +19,7 @@ usage:
   strand inspect [w h]             print the todo UI tree (§8.4)
   strand ui [--burn]               compositor demo (§6.1)
   strand demo [--window|--trace]   run the M0 actor skeleton
-  strand crash [--trace]           supervised crash and restart (§5.4)
+  strand crash [--trace|--window]  supervised crash and restart (§5.4)
   strand help                      show this message
 ";
 
@@ -54,6 +54,7 @@ fn main() -> ExitCode {
         ["ui", "--burn"] => strand_cli::demo::ui(true),
         ["crash"] => strand_cli::demo::crash(false),
         ["crash", "--trace"] => strand_cli::demo::crash(true),
+        ["crash", "--window"] => strand_cli::demo::crash_windowed(),
         _ => {
             eprint!("{USAGE}");
             return ExitCode::FAILURE;

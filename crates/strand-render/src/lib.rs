@@ -16,7 +16,7 @@ pub mod text;
 pub mod widgets;
 
 use compositor::{InputEvent, InputSender, SceneReceiver};
-use inspect::Inspector;
+use inspect::{ActorStat, Inspector, StatsHandle};
 use paint::Painter;
 use text::{FontMeasure, TextPainter};
 use scene::{Color, Frame, HitId, Layouter, Node, Sizing, Style, TextStyle};
@@ -167,6 +167,12 @@ struct App {
     hovered: Option<HitId>,
     /// §8.4's debug overlay, toggled with F12 like the tool it imitates.
     inspector: Inspector,
+    /// Where the actor runtime publishes what it is doing (§8.4).
+    stats: Option<StatsHandle>,
+    /// The last snapshot read. Kept, rather than re-read, so a frame drawn
+    /// while the runtime is publishing shows slightly old numbers instead of
+    /// waiting for new ones.
+    stat_rows: Vec<ActorStat>,
     /// Shared by layout and rendering, so text is measured by the font that
     /// draws it.
     fonts: glyphon::FontSystem,
@@ -187,6 +193,8 @@ impl Default for App {
             cursor: (0.0, 0.0),
             hovered: None,
             inspector: Inspector::default(),
+            stats: None,
+            stat_rows: Vec::new(),
             // Loads the system font list once, at startup.
             fonts: glyphon::FontSystem::new(),
         }
@@ -301,7 +309,14 @@ impl ApplicationHandler for App {
                     // Injected render commands, not a second rendering path
                     // (docs/inspiration-canon.md, on clay).
                     self.inspector.highlight = self.hovered;
-                    self.inspector.overlay(self.layouter.frame_mut());
+                    if let Some(stats) = &self.stats {
+                        stats.read_into(&mut self.stat_rows);
+                    }
+                    self.inspector.overlay(
+                        self.layouter.frame_mut(),
+                        viewport,
+                        &self.stat_rows,
+                    );
 
                     if let Err(e) = gpu.render(self.layouter.frame(), &mut self.fonts) {
                         eprintln!("frame dropped: {e}");
@@ -389,9 +404,19 @@ pub fn run() -> Result<()> {
 /// stronger guarantee than §6.1 states: app code has no handle to this thread
 /// at all.
 pub fn run_with(scenes: Option<SceneReceiver>, input: Option<InputSender>) -> Result<()> {
+    run_with_stats(scenes, input, None)
+}
+
+/// As `run_with`, plus §8.4's debug overlay: the actor runtime publishes into
+/// `stats`, and F12 draws it over whatever the app submitted.
+pub fn run_with_stats(
+    scenes: Option<SceneReceiver>,
+    input: Option<InputSender>,
+    stats: Option<StatsHandle>,
+) -> Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App { scenes, input, ..Default::default() };
+    let mut app = App { scenes, input, stats, ..Default::default() };
     event_loop.run_app(&mut app)?;
     Ok(())
 }

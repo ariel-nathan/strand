@@ -12,6 +12,7 @@
 //! These need a GPU adapter. Where none exists the tests skip rather than fail,
 //! since a machine without one has not told us anything about the renderer.
 
+use strand_render::inspect::{ActorStat, Inspector};
 use strand_render::paint::Painter;
 use strand_render::scene::{Color, Frame, Layouter, Node, Sizing, Style};
 
@@ -269,4 +270,45 @@ fn later_siblings_paint_over_earlier_ones() {
     let data = headless.render(layouter.layout(&tree, (SIZE as f32, SIZE as f32)));
 
     assert!(close(pixel(&data, 50, 50), (0, 0, 255)), "the child covers the parent");
+}
+
+#[test]
+fn the_debug_overlay_dims_the_app_without_hiding_it() {
+    // §8.4's panel is injected render commands, not a second rendering path,
+    // so it goes through the same blending as everything else. Translucent is
+    // the point: an opaque panel would hide the app it is reporting on.
+    let mut headless = gpu_or_skip!();
+
+    let tree = Node::Box {
+        style: Style {
+            width: Sizing::Grow,
+            height: Sizing::Grow,
+            background: Some(Color::rgb(0.0, 1.0, 0.0)),
+            ..Default::default()
+        },
+    };
+    let mut layouter = Layouter::new();
+    let viewport = (SIZE as f32, SIZE as f32);
+    layouter.layout(&tree, viewport);
+
+    let stats = [ActorStat {
+        name: "counter".into(),
+        arena_bytes: 65_536,
+        mailbox: 0,
+        fibers: 1,
+        handled: 7,
+        generation: 0,
+        alive: true,
+    }];
+    Inspector { enabled: true, highlight: None }.overlay(
+        layouter.frame_mut(),
+        viewport,
+        &stats,
+    );
+    let data = headless.render(layouter.frame());
+
+    let under_panel = pixel(&data, 128, 30);
+    let below_panel = pixel(&data, 128, 200);
+    assert!(under_panel.1 < below_panel.1, "the panel should darken what is behind it");
+    assert!(under_panel.1 > 0, "but not black it out — this is an overlay, not a curtain");
 }

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use strand_render::inspect::StatsHandle;
 use strand_runtime::{engine, spawn_actor, spawn_supervised, Message, Policy, Registry, HOST};
 
 const ACTORS: [(u32, &str, &str); 3] = [
@@ -27,25 +28,31 @@ pub fn run_with(windowed: bool, traced: bool) -> Result<()> {
         .build()?;
 
     if !windowed {
-        return rt.block_on(run_actors(traced));
+        return rt.block_on(run_actors(traced, None));
     }
 
     // Windowed: the actor runtime becomes a guest of the compositor. winit
     // requires the main thread, so the runtime gets a background thread and
     // main() belongs to the renderer for the rest of the process lifetime.
     println!("--- strand M0: actors + compositor ---");
+    println!("press F12 for the debug overlay (§8.4)");
+    let stats = StatsHandle::new();
     let _guard = rt.enter();
+    let published = stats.clone();
     rt.spawn(async move {
-        if let Err(e) = run_actors(traced).await {
+        if let Err(e) = run_actors(traced, Some(published)).await {
             eprintln!("actor runtime failed: {e:#}");
         }
     });
-    strand_render::run()
+    strand_render::run_with_stats(None, None, Some(stats))
 }
 
-async fn run_actors(traced: bool) -> Result<()> {
+async fn run_actors(traced: bool, stats: Option<StatsHandle>) -> Result<()> {
     let engine = engine()?;
     let registry = Registry::new();
+    if let Some(stats) = stats {
+        tokio::spawn(crate::stats::publish(registry.clone(), stats));
+    }
 
     println!("--- strand M0: 3 actors, 1 worker thread ---");
     let mut handles = Vec::new();
@@ -81,15 +88,45 @@ pub fn crash(traced: bool) -> Result<()> {
         .worker_threads(1)
         .enable_all()
         .build()?;
-    rt.block_on(run_crash(traced))
+    rt.block_on(run_crash(traced, false, None))
 }
 
-async fn run_crash(traced: bool) -> Result<()> {
+/// The same script, on a loop, under the compositor — so §7's "isolation
+/// visible" claim is something you watch rather than read.
+///
+/// Press F12: the crasher's row picks up a generation each time round, its
+/// arena size drops back to a fresh module's, and the ticker's row beside it
+/// never so much as pauses.
+pub fn crash_windowed() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+
+    println!("--- strand M2: supervision, under the compositor ---");
+    println!("press F12 for the debug overlay (§8.4)");
+    let stats = StatsHandle::new();
+    let _guard = rt.enter();
+    let published = stats.clone();
+    rt.spawn(async move {
+        if let Err(e) = run_crash(false, true, Some(published)).await {
+            eprintln!("actor runtime failed: {e:#}");
+        }
+    });
+    strand_render::run_with_stats(None, None, Some(stats))
+}
+
+/// `forever` loops the script instead of running it once, for the windowed
+/// version where the point is to keep watching.
+async fn run_crash(traced: bool, forever: bool, stats: Option<StatsHandle>) -> Result<()> {
     const CRASHER: u32 = 0;
     const TICKER: u32 = 1;
 
     let engine = engine()?;
     let registry = Registry::new();
+    if let Some(stats) = stats {
+        tokio::spawn(crate::stats::publish(registry.clone(), stats));
+    }
     println!("--- strand M2: supervision ---");
 
     let crasher = spawn_supervised(
@@ -116,19 +153,27 @@ async fn run_crash(traced: bool) -> Result<()> {
         let _ = registry.send(CRASHER, Message::Blob { from: HOST, bytes: bytes.to_vec() });
     };
 
-    tokio::time::sleep(beat).await;
-    poke(b"PING");
-    tokio::time::sleep(beat).await;
-    poke(b"PING");
-    tokio::time::sleep(beat).await;
+    loop {
+        tokio::time::sleep(beat).await;
+        poke(b"PING");
+        tokio::time::sleep(beat).await;
+        poke(b"PING");
+        tokio::time::sleep(beat).await;
 
-    println!(">>> sending BOOM to the crasher");
-    poke(b"BOOM");
-    tokio::time::sleep(beat).await;
+        println!(">>> sending BOOM to the crasher");
+        poke(b"BOOM");
+        tokio::time::sleep(beat).await;
 
-    println!(">>> pinging the restarted actor (its count should be back at #1)");
-    poke(b"PING");
-    tokio::time::sleep(beat).await;
+        println!(">>> pinging the restarted actor (its count should be back at #1)");
+        poke(b"PING");
+        tokio::time::sleep(beat).await;
+
+        if !forever {
+            break;
+        }
+        // Long enough to read the overlay between rounds.
+        tokio::time::sleep(beat * 8).await;
+    }
 
     let _ = registry.send(CRASHER, Message::Stop);
     let _ = registry.send(TICKER, Message::Stop);
