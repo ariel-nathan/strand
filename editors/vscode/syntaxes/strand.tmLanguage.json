@@ -1,0 +1,232 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Strand",
+  "scopeName": "source.strand",
+  "comment": "Grammar for the Strand language. The token surface mirrors crates/strandc/src/lexer.rs; the widget vocabulary mirrors the BUILDERS table at crates/strandc/src/ui.rs:181. Keep both in sync when the compiler changes.",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#number" },
+    { "include": "#view-modifier" },
+    { "include": "#function-declaration" },
+    { "include": "#type-declaration" },
+    { "include": "#actor-declaration" },
+    { "include": "#keyword" },
+    { "include": "#builtin-type" },
+    { "include": "#builtin-function" },
+    { "include": "#widget" },
+    { "include": "#constructor" },
+    { "include": "#wildcard" },
+    { "include": "#label" },
+    { "include": "#capitalized" },
+    { "include": "#function-call" },
+    { "include": "#operator" },
+    { "include": "#illegal" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comment": {
+      "comment": "lexer.rs:226 -- line comments only; no block comments exist in Strand.",
+      "match": "(//).*$",
+      "name": "comment.line.double-slash.strand",
+      "captures": {
+        "1": { "name": "punctuation.definition.comment.strand" }
+      }
+    },
+
+    "string": {
+      "comment": "lexer.rs:301 -- double quotes only. A newline inside a string is a hard lexer error (lexer.rs:310), so the string ends at the line break as well as at the closing quote.",
+      "name": "string.quoted.double.strand",
+      "begin": "\"",
+      "end": "\"|$",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.string.begin.strand" }
+      },
+      "patterns": [
+        {
+          "comment": "lexer.rs:315-324 -- these five escapes are the complete legal set.",
+          "match": "\\\\[ntr\\\\\"]",
+          "name": "constant.character.escape.strand"
+        },
+        {
+          "comment": "Anything else after a backslash is a compile error, including \\0, \\x41 and \\u{...}.",
+          "match": "\\\\.",
+          "name": "invalid.illegal.unknown-escape.strand"
+        }
+      ]
+    },
+
+    "number": {
+      "patterns": [
+        {
+          "comment": "lexer.rs:277-279 -- a dot only joins the number when a DIGIT follows, so 1.max(2) must lex as int, dot, ident. This rule must precede the integer rule.",
+          "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*",
+          "name": "constant.numeric.float.strand"
+        },
+        {
+          "comment": "Decimal only -- no 0x/0b/0o, no exponent, no suffix. Underscores allowed.",
+          "match": "\\b[0-9][0-9_]*\\b",
+          "name": "constant.numeric.integer.strand"
+        }
+      ]
+    },
+
+    "view-modifier": {
+      "comment": "lexer.rs:261 -- view is unconditionally Tok::View, so it is never a legal identifier. parser.rs rejects 'view fn view(...)' outright: '`view` is a keyword, not a name'. Scope it as a keyword everywhere.",
+      "match": "\\bview\\b",
+      "name": "storage.modifier.view.strand"
+    },
+
+    "function-declaration": {
+      "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.function.strand" },
+        "2": { "name": "entity.name.function.strand" }
+      }
+    },
+
+    "type-declaration": {
+      "match": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.type.strand" },
+        "2": { "name": "entity.name.type.strand" }
+      }
+    },
+
+    "actor-declaration": {
+      "match": "\\b(actor)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.actor.strand" },
+        "2": { "name": "entity.name.type.actor.strand" }
+      }
+    },
+
+    "keyword": {
+      "patterns": [
+        {
+          "match": "\\b(if|else|match|return|for|in)\\b",
+          "name": "keyword.control.strand"
+        },
+        {
+          "comment": "lexer.rs:262-263 -- lexed today, not yet consumed by the parser. Reserved for structured concurrency (design doc 4.4).",
+          "match": "\\b(scope|spawn)\\b",
+          "name": "keyword.other.reserved.strand"
+        },
+        {
+          "match": "\\b(fn|let|var|type|actor)\\b",
+          "name": "keyword.declaration.strand"
+        },
+        {
+          "match": "\\b(true|false)\\b",
+          "name": "constant.language.boolean.strand"
+        }
+      ]
+    },
+
+    "builtin-type": {
+      "patterns": [
+        {
+          "comment": "check.rs:441-476 -- lowercase primitives.",
+          "match": "\\b(int|float|bool|string|unit)\\b",
+          "name": "support.type.primitive.strand"
+        },
+        {
+          "comment": "check.rs:441-476 -- Node plus the generic built-ins.",
+          "match": "\\b(Node|List|Option|Result)\\b",
+          "name": "support.type.strand"
+        }
+      ]
+    },
+
+    "builtin-function": {
+      "comment": "hir.rs:258-261 -- log is the entire Builtin enum.",
+      "match": "\\blog\\b(?=\\s*\\()",
+      "name": "support.function.builtin.strand"
+    },
+
+    "widget": {
+      "comment": "The closed BUILDERS table at ui.rs:181-243. Containers (screen/column/row/panel/scroll) take a trailing block; the rest are leaves. Add new names here when ui.rs gains a widget.",
+      "match": "\\b(screen|column|row|panel|scroll|text|muted|button|checkbox|textInput|spacer)\\b(?=\\s*\\()",
+      "name": "support.function.widget.strand"
+    },
+
+    "constructor": {
+      "comment": "lexer.rs:29-30 -- these are ordinary identifiers to the lexer, resolved as constructors by the checker.",
+      "match": "\\b(Ok|Err|Some|None)\\b",
+      "name": "support.constant.constructor.strand"
+    },
+
+    "wildcard": {
+      "comment": "parser.rs:680 -- _ is a normal identifier everywhere except pattern position.",
+      "match": "(?<![A-Za-z0-9_])_(?![A-Za-z0-9_])",
+      "name": "variable.language.wildcard.strand"
+    },
+
+    "label": {
+      "comment": "parser.rs:520 -- labelled call arguments (gap: 8), record type fields (title: string) and the actor state:/message: clauses are lexically identical. The parser separates them with lookahead; a regex grammar cannot, so all three share one scope deliberately.",
+      "match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=:)",
+      "name": "variable.other.property.strand"
+    },
+
+    "capitalized": {
+      "comment": "parser.rs:700-706 -- capitalised bare names are niladic constructors, lowercase ones bind. Covers user types and sum-type variants alike.",
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b",
+      "name": "entity.name.type.strand"
+    },
+
+    "function-call": {
+      "match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "name": "entity.name.function.call.strand"
+    },
+
+    "operator": {
+      "patterns": [
+        { "match": "=>", "name": "keyword.operator.arrow.match.strand" },
+        { "match": "->", "name": "keyword.operator.arrow.return.strand" },
+        { "match": "==|!=|<=|>=", "name": "keyword.operator.comparison.strand" },
+        { "match": "&&|\\|\\|", "name": "keyword.operator.logical.strand" },
+        {
+          "comment": "parser.rs:258-281 -- | only ever separates sum-type variants. Strand has no bitwise or.",
+          "match": "\\|",
+          "name": "keyword.operator.variant.strand"
+        },
+        {
+          "comment": "Postfix try on expressions, and postfix Option sugar on types (string?), which stacks.",
+          "match": "\\?",
+          "name": "keyword.operator.try.strand"
+        },
+        { "match": "<|>", "name": "keyword.operator.comparison.strand" },
+        { "match": "!", "name": "keyword.operator.logical.strand" },
+        { "match": "[+\\-*/%]", "name": "keyword.operator.arithmetic.strand" },
+        { "match": "=", "name": "keyword.operator.assignment.strand" }
+      ]
+    },
+
+    "illegal": {
+      "patterns": [
+        {
+          "comment": "lexer.rs:389-392 -- a lone & is a hard error: Strand has no bitwise operators. && is already claimed by the logical rule above.",
+          "match": "(?<!&)&(?!&)",
+          "name": "invalid.illegal.ampersand.strand"
+        },
+        {
+          "comment": "No sigils exist in Strand; each of these is an 'unexpected character' lexer error. Single quote included because Strand has no char literals.",
+          "match": "[#@$~^`']",
+          "name": "invalid.illegal.character.strand"
+        }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "match": "[{}]", "name": "punctuation.section.block.strand" },
+        { "match": "[()]", "name": "punctuation.section.parens.strand" },
+        { "match": "[\\[\\]]", "name": "punctuation.section.brackets.strand" },
+        { "match": ",", "name": "punctuation.separator.comma.strand" },
+        { "match": ";", "name": "punctuation.terminator.statement.strand" },
+        { "match": ":", "name": "punctuation.separator.colon.strand" },
+        { "match": "\\.", "name": "punctuation.accessor.strand" }
+      ]
+    }
+  }
+}

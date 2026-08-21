@@ -1,0 +1,48 @@
+// A file with deliberate mistakes, for looking at the language server.
+//
+//   strand run examples/strand/lsp_demo.str   will NOT compile — that is the point.
+//
+// Open it in an editor with the Strand extension installed and you should see
+// a squiggle under each mistake, hover types on the good lines, and F12 on a
+// call jumping to its declaration.
+
+type Todo = { title: string, done: bool }
+
+fn describe(todo: Todo): string {
+  match todo.done {
+    true  => "done",
+    false => "still to do",
+  }
+}
+
+fn good(): int {
+  let tally = 1 + 2
+  tally
+}
+
+// 1. The body disagrees with the signature.
+fn wrong_return(): int {
+  "not an int"
+}
+
+// 2. `let` bindings are immutable — the help text names the fix.
+fn assigns_to_let(): int {
+  let count = 1
+  count = 2
+  count
+}
+
+// 3. An unknown name.
+fn unknown_call(): int {
+  no_such_function()
+}
+
+// 4. A field that does not exist on Todo.
+fn missing_field(todo: Todo): bool {
+  todo.finished
+}
+
+fn main(): string {
+  let item = Todo { title: "write the language server", done: false }
+  describe(item)
+}

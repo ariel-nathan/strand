@@ -1,0 +1,198 @@
+// Highlighting fixture for the VS Code grammar.
+//
+// This file is NOT meant to compile. Everything above the "NOT VALID STRAND"
+// banner is real Strand; below it are constructs the compiler rejects, kept so
+// the keyword and `invalid.illegal` scopes can be eyeballed.
+//
+// Check each case with: Developer: Inspect Editor Tokens and Scopes.
+
+// ---------------------------------------------------------------------------
+// 1. Numbers: the dot rule (lexer.rs:277) — a dot joins a number only when a
+//    digit follows.
+// ---------------------------------------------------------------------------
+
+type Nums = { a: int, b: float }
+
+fn numbers(): float {
+  let int_then_method = 1.max(2)  // `1` int, `.` accessor, `max` a call — NOT a float
+  let real_float      = 1.5       // one float token, all of `1.5`
+  let separated       = 1_000_000 // one int token, underscores included
+  let both            = 0.25 + 2  // float then int
+  real_float
+}
+
+// ---------------------------------------------------------------------------
+// 2. `view` is a reserved word — it is Tok::View in the lexer unconditionally,
+//    so it is NEVER a legal identifier. `view fn view(...)` is a parse error:
+//    "`view` is a keyword, not a name". The actor's view is named for what it
+//    draws, and its name is free.
+// ---------------------------------------------------------------------------
+
+type Count = { total: int, seen: int }
+
+actor Viewer {
+  state: Count
+
+  fn init(): Count {
+    Count { total: 0, seen: 0 }
+  }
+
+  fn receive(state: Count, msg: string): Count {
+    state
+  }
+
+  // Both `view` tokens below colour as the keyword; `counterFace` is the name.
+  view fn counterFace(state: Count): Node {
+    text("counter")
+  }
+}
+
+view fn todoList(): Node {
+  column(gap: 4) {
+    text("a top-level view")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 3. Contextual names are NOT keywords — a user may bind them.
+// ---------------------------------------------------------------------------
+
+fn shadowing(): int {
+  let state = 1     // `state` is an ordinary identifier here
+  let message = 2   // so is `message`
+  let receive = 3
+  state + message + receive
+}
+
+// ---------------------------------------------------------------------------
+// 4. `{` after an identifier: record literal vs. block. The grammar
+//    deliberately does NOT try to tell these apart — both braces get the same
+//    neutral scope. What matters is that neither is mis-scoped as something else.
+// ---------------------------------------------------------------------------
+
+fn braces(a: int, b: int): int {
+  if a > b { a } else { b }        // `b {` is a BLOCK, not a record literal
+}
+
+fn record_literal(): Count {
+  Count { total: 1, seen: 2 }      // this one IS a record literal
+}
+
+// ---------------------------------------------------------------------------
+// 5. Sum types: `|` is a variant separator, never bitwise-or.
+// ---------------------------------------------------------------------------
+
+type Shape =
+  | Dot
+  | Line(len: int)
+  | Rect(w: int, h: int)
+
+// Single-line form.
+type Colour = | Red | Green | Blue
+
+// ---------------------------------------------------------------------------
+// 6. Postfix `?` in both of its unrelated grammars, and `->` return syntax.
+// ---------------------------------------------------------------------------
+
+type Boxed = { maybe: string? }        // `?` as Option sugar on a type
+type Stacked = { deep: string?? }      // it stacks
+
+fn inner(n: int): Result<int, Shape> {
+  if n < 0 { return Err(Dot) }
+  Ok(n * 10)
+}
+
+fn try_chain(n: int) -> Result<int, Shape> {   // `->` instead of `:`
+  let doubled = inner(n)? * 2                  // `?` postfix, binds tighter than `*`
+  Ok(doubled)
+}
+
+// ---------------------------------------------------------------------------
+// 7. Patterns: capitalised = constructor, lowercase = binding, `_` = wildcard.
+// ---------------------------------------------------------------------------
+
+fn area(s: Shape): int {
+  match s {
+    Dot            => 0,
+    Line(len)      => len,
+    Rect(w, h)     => w * h,
+    _              => 0,
+  }
+}
+
+fn options(n: int): Option<int> {
+  match inner(n) {
+    Ok(v)  => Some(v),
+    Err(e) => None,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 8. Strings: the five legal escapes, and non-ASCII content.
+// ---------------------------------------------------------------------------
+
+fn strings(): unit {
+  log("newline \n tab \t return \r backslash \\ quote \" done")
+  log("héllo→ non-ascii is fine")
+  log("")
+}
+
+// ---------------------------------------------------------------------------
+// 9. The widget vocabulary (ui.rs:181) and labelled arguments.
+// ---------------------------------------------------------------------------
+
+view fn widgets(): Node {
+  screen(gap: 12, padding: 16) {
+    row(gap: 8) {
+      textInput(id: 1, value: "", prompt: "what needs doing?")
+      button(id: 2, label: "Add")
+      checkbox(id: 3, checked: true, label: "done")
+      spacer()
+    }
+    panel(gap: 8) {
+      text("a leaf builder")
+      muted("another leaf")
+    }
+    scroll(id: 4, offset: 0.5) {
+      column(gap: 0) {
+        text("nested")
+      }
+    }
+  }
+}
+
+// `text` is only a widget in call position — as a bare name it is an identifier.
+fn not_a_widget(): int {
+  let text = 1
+  let row = 2
+  text + row
+}
+
+// ---------------------------------------------------------------------------
+// NOT VALID STRAND BELOW THIS LINE — everything from here on is deliberately
+// rejected by the compiler. It exists so the keyword and `invalid.illegal.*`
+// scopes can be eyeballed. Do not point `strandc` at this file.
+// ---------------------------------------------------------------------------
+
+// 10. Reserved but not yet parsed: `scope`, `spawn`, `for`, `in`. The lexer
+//     emits keyword tokens for these, so they colour as keywords, but the
+//     parser has no rule for them yet — these two lines are parse errors today.
+fn reserved(): int {
+  scope { let user = spawn fetchUser()? }
+  for t in todos { todoRow(t) }
+  0
+}
+
+// 11. Rejected by the LEXER — each marked character should carry an
+//     `invalid.illegal.*` scope.
+
+fn illegal(): int {
+  let bad_escape = "a \q b"     // \q is not one of the five legal escapes
+  let bitwise    = 1 & 2        // lone & — "Strand has no bitwise operators"
+  let sigil_a    = $x           // $ is an unexpected character
+  let sigil_b    = @x           // so is @
+  let sigil_c    = #x           // so is #
+  let charlit    = 'a'          // no char literals exist
+  let backtick   = `Max ${n}`   // no template strings exist
+  0
+}

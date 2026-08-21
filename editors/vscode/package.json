@@ -1,0 +1,64 @@
+{
+  "name": "strand-lang",
+  "displayName": "Strand",
+  "description": "Language support for Strand (.str): diagnostics, hover, go-to-definition and highlighting.",
+  "version": "0.2.0",
+  "publisher": "strand",
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:strand"
+  ],
+  "scripts": {
+    "build": "bun build src/extension.ts --outfile out/extension.js --target node --format cjs --external vscode",
+    "typecheck": "tsc --noEmit"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "strand",
+    "str"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "strand",
+        "aliases": [
+          "Strand",
+          "strand"
+        ],
+        "extensions": [
+          ".str"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "strand",
+        "scopeName": "source.strand",
+        "path": "./syntaxes/strand.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Strand",
+      "properties": {
+        "strand.server.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `strand` binary. Leave empty to use whatever is on your `PATH`. The extension runs `strand lsp`."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.0"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.91.0",
+    "typescript": "^7.0.2"
+  }
+}

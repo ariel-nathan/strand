@@ -1,0 +1,5 @@
+{
+  // Use this workspace's own build rather than requiring `strand` on PATH.
+  // Build it first with: cargo build -p strand-cli
+  "strand.server.path": "${workspaceFolder}/target/debug/strand.exe"
+}

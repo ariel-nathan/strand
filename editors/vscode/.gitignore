@@ -1,0 +1,3 @@
+node_modules/
+# Build output: regenerate with `bun run build`.
+out/
