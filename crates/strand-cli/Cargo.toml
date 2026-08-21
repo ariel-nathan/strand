@@ -17,6 +17,7 @@ anyhow.workspace = true
 miette = { version = "7.6.0", features = ["fancy"] }
 strand-render = { version = "0.1.0", path = "../strand-render" }
 strand-runtime = { version = "0.1.0", path = "../strand-runtime" }
+strand-lsp = { version = "0.1.0", path = "../strand-lsp" }
 strandc = { version = "0.1.0", path = "../strandc" }
 tokio = { version = "1.53.1", features = ["full"] }
 tracing.workspace = true

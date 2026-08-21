@@ -24,6 +24,9 @@ windows to look at:
   strand demo --window             the M0 actor skeleton
   strand ui [--burn]               a busy actor cannot jank the compositor
 
+editor support:
+  strand lsp                       speak LSP on stdin/stdout (§8.4)
+
 in the terminal:
   strand inspect [w h]             print the todo UI tree (§8.4)
   strand demo [--trace]            actors; --trace prints the causal log
@@ -45,6 +48,10 @@ fn main() -> ExitCode {
         ["run", file] => run(Path::new(file)),
         ["build", file] => build(Path::new(file), None),
         ["build", file, "-o", out] => build(Path::new(file), Some(Path::new(out))),
+        // `--stdio` is what LSP clients conventionally pass to say which
+        // transport they want; stdio is the only one offered, so it is accepted
+        // and ignored rather than being an error.
+        ["lsp"] | ["lsp", "--stdio"] => lsp(),
         ["demo"] => strand_cli::demo::run(false),
         ["demo", "--window"] => strand_cli::demo::run(true),
         ["demo", "--trace"] => strand_cli::demo::run_with(false, true),
@@ -100,6 +107,18 @@ fn front_end(path: &Path) -> Result<(strandc::hir::Hir, String)> {
             Err(anyhow::anyhow!("could not compile {}", path.display()))
         }
     }
+}
+
+/// Speaks the Language Server Protocol on stdin/stdout until the editor
+/// disconnects (§8.4). Editors launch a server this way, and keeping it a
+/// subcommand keeps §8.1's one binary.
+fn lsp() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    rt.block_on(strand_lsp::serve());
+    Ok(())
 }
 
 fn run(path: &Path) -> Result<()> {
