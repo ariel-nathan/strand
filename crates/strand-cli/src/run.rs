@@ -5,7 +5,7 @@
 //! right; if `Ok(2.5)` prints as `Ok(2.5)`, the payload slot round-tripped.
 
 use anyhow::{anyhow, Result};
-use strandc::codegen::wasm_arity;
+use strandc::layout::wasm_arity;
 use strandc::hir::{Hir, Ty};
 // wasmtime 48 has its own error type, so its `Context` is the one that applies
 // here; `?` then converts into `anyhow::Error`.

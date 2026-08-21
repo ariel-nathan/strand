@@ -7,6 +7,7 @@ pub mod codegen;
 pub mod diag;
 pub mod hir;
 pub mod input;
+pub mod layout;
 pub mod lexer;
 pub mod lifecycle;
 pub mod line_index;

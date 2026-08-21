@@ -14,54 +14,16 @@ use wasm_encoder::{
 };
 
 use crate::hir::*;
+// Layout is one table, read here and by every host-side reader of a value
+// (§6.8). Codegen decides nothing about size or offset on its own.
+use crate::layout::{rep, stride, words, LIST_HEADER, WORD};
 use crate::ui::{self, Slot};
-
-/// Every value occupies whole 8-byte slots in memory, so field offsets are
-/// just word counts. Simpler than tight packing and irrelevant at POC scale.
-const WORD: u64 = 8;
 
 /// Static string data starts here; offset 0 stays unused so a null pointer is
 /// never a valid value.
 const DATA_START: u32 = 16;
 
-/// A list is `{ i32 len, <pad>, elements... }`. The header is a whole word so
-/// the elements after it stay 8-byte aligned, which is what lets an element be
-/// loaded by exactly the code that loads a record field.
-const LIST_HEADER: u64 = WORD;
-
-/// Bytes one element of `elem` occupies. Whole words, like a record's fields —
-/// a two-word `Result` takes two.
-fn stride(elem: &Ty) -> u64 {
-    words(elem).max(1) * WORD
-}
-
 type Code = Vec<Instruction<'static>>;
-
-/// The WASM representation of a Strand type (`docs/strand-design.md`).
-fn rep(ty: &Ty) -> Vec<ValType> {
-    match ty {
-        Ty::Int => vec![ValType::I64],
-        Ty::Float => vec![ValType::F64],
-        Ty::Bool => vec![ValType::I32],
-        // Pointers into linear memory, and immediate tags for all-niladic sums.
-        Ty::Str | Ty::List(_) | Ty::Record(_) | Ty::Sum(_) => vec![ValType::I32],
-        // The multi-value pair. This is the whole point of §6.2.
-        Ty::Option(_) | Ty::Result(..) => vec![ValType::I32, ValType::I64],
-        // A node leaves nothing behind: building it *was* the effect. See
-        // `Ty::Node` in the HIR for why that is the point rather than a saving.
-        Ty::Unit | Ty::Never | Ty::Error | Ty::Node => vec![],
-    }
-}
-
-/// How many WASM values a type occupies when returned. The runner needs this
-/// to size a dynamic call, and it must agree with `rep`.
-pub fn wasm_arity(ty: &Ty) -> usize {
-    rep(ty).len()
-}
-
-fn words(ty: &Ty) -> u64 {
-    rep(ty).len() as u64
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmitError {
@@ -663,7 +625,7 @@ impl<'hir> Emitter<'hir> {
                             .any(|v| !v.fields.is_empty()) =>
                     {
                         let def = &self.hir.sums[id.0 as usize];
-                        let bytes = (variant_payload_words(def) + 1) * WORD;
+                        let bytes = crate::layout::boxed_sum_size(def);
                         self.expr(ctx, code, value)?;
                         code.push(Instruction::I32Const(bytes as i32));
                     }
@@ -1006,7 +968,7 @@ impl<'hir> Emitter<'hir> {
                 // value is a property of its type rather than of its tag —
                 // which is what lets `send` put a constant length on the wire
                 // instead of computing one from the tag at run time.
-                let payload = variant_payload_words(def);
+                let payload = crate::layout::payload_words(def);
                 let ptr = ctx.scratch(ValType::I32);
 
                 code.push(Instruction::I32Const(((payload + 1) * WORD) as i32));
@@ -1488,16 +1450,6 @@ fn builtin_signature(builtin: Builtin) -> (Vec<ValType>, Vec<ValType>) {
         // an `unreachable` after the call instead.
         Builtin::Panic => (vec![ValType::I32, ValType::I32], Vec::new()),
     }
-}
-
-/// How many words a sum's payload occupies — the widest variant's, so that
-/// every value of the type is the same size (see `MakeVariant`).
-fn variant_payload_words(def: &SumDef) -> u64 {
-    def.variants
-        .iter()
-        .map(|variant| variant.fields.iter().map(|(_, ty)| words(ty)).sum::<u64>())
-        .max()
-        .unwrap_or(0)
 }
 
 /// The WASM type of an actor's state global.
