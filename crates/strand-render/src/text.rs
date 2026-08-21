@@ -5,21 +5,56 @@
 //! rasterisation — so this is the thin layer that turns `Command::Text` into
 //! something on screen.
 //!
-//! Known mismatch, documented rather than hidden: layout still *measures* text
-//! with the monospace approximation in `scene`, while glyphon *renders* it with
-//! a real font. Where the two disagree, a label can overflow the box laid out
-//! for it. Closing that means measuring through the same `FontSystem` the
-//! renderer uses, which is the next step for text and not this one.
+//! Layout and rendering share one `FontSystem`, so a label is measured by the
+//! font that draws it. The alternative — approximating during layout — means
+//! every box is sized from a number the renderer disagrees with, and the error
+//! compounds through nested layouts.
 
 use glyphon::{
     Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea,
     TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 
-use crate::scene::{Command, Frame};
+use crate::scene::{Command, Frame, Measure};
+
+/// Measures with the same font stack that renders, so layout and painting
+/// agree. Holds one scratch buffer rather than allocating per string.
+pub struct FontMeasure<'a> {
+    fonts: &'a mut FontSystem,
+    scratch: Buffer,
+}
+
+impl<'a> FontMeasure<'a> {
+    pub fn new(fonts: &'a mut FontSystem) -> Self {
+        let scratch = Buffer::new(fonts, Metrics::new(16.0, 20.0));
+        Self { fonts, scratch }
+    }
+}
+
+impl Measure for FontMeasure<'_> {
+    fn measure(&mut self, text: &str, size: f32) -> (f32, f32) {
+        let line_height = size * 1.25;
+        self.scratch.set_metrics(Metrics::new(size, line_height));
+        self.scratch.set_size(None, None);
+        self.scratch.set_text(
+            text,
+            &Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+            None,
+        );
+        self.scratch.shape_until_scroll(self.fonts, false);
+
+        let mut width: f32 = 0.0;
+        let mut lines: f32 = 0.0;
+        for run in self.scratch.layout_runs() {
+            width = width.max(run.line_w);
+            lines += 1.0;
+        }
+        (width.ceil(), (lines.max(1.0) * line_height).ceil())
+    }
+}
 
 pub struct TextPainter {
-    font_system: FontSystem,
     swash_cache: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
@@ -51,7 +86,6 @@ impl TextPainter {
             TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
 
         Self {
-            font_system: FontSystem::new(),
             swash_cache: SwashCache::new(),
             viewport,
             atlas,
@@ -66,6 +100,7 @@ impl TextPainter {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        font_system: &mut FontSystem,
         frame: &Frame,
         viewport: (f32, f32),
     ) {
@@ -76,8 +111,7 @@ impl TextPainter {
 
         // Split the borrow so the buffers can be read while the renderer and
         // atlas are written.
-        let Self { font_system, swash_cache, atlas, renderer, buffers, placements, viewport: vp } =
-            self;
+        let Self { swash_cache, atlas, renderer, buffers, placements, viewport: vp } = self;
 
         placements.clear();
         let mut index = 0;
@@ -147,5 +181,40 @@ impl TextPainter {
         if let Err(e) = self.renderer.render(&self.atlas, &self.viewport, pass) {
             eprintln!("text render failed: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::Approximate;
+
+    #[test]
+    fn the_font_measures_narrower_than_the_approximation() {
+        // The stub errs wide on purpose. If a real font ever measured wider,
+        // labels would overflow the boxes laid out for them — so this is the
+        // direction of the error, asserted rather than assumed.
+        let mut fonts = FontSystem::new();
+        let mut real = FontMeasure::new(&mut fonts);
+
+        for sample in ["write the compiler", "Clear done", "todo — 2/3 done", "x"] {
+            let (measured, height) = real.measure(sample, 16.0);
+            let (approximated, _) = Approximate.measure(sample, 16.0);
+            assert!(measured > 0.0, "{sample:?} measured as nothing");
+            assert!(height > 0.0, "{sample:?} has no height");
+            assert!(
+                measured <= approximated,
+                "{sample:?}: font {measured} exceeded approximation {approximated}"
+            );
+        }
+    }
+
+    #[test]
+    fn measuring_is_proportional_to_the_font_size() {
+        let mut fonts = FontSystem::new();
+        let mut real = FontMeasure::new(&mut fonts);
+        let (small, _) = real.measure("hello", 12.0);
+        let (large, _) = real.measure("hello", 24.0);
+        assert!(large > small * 1.5, "24pt should be far wider than 12pt: {small} vs {large}");
     }
 }

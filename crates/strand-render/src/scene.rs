@@ -207,13 +207,29 @@ impl Frame {
     }
 }
 
-/// Text measurement. One monospace-ish approximation until glyphon lands —
-/// §12 calls text a tarpit, and pretending otherwise here would hide that.
+/// How text is measured during layout.
+///
+/// Layout has to know how big a string will be *before* anything is rendered,
+/// and the only honest answer comes from the font that will render it. This is
+/// a trait so `scene` need not depend on the text stack, and so tests can lay
+/// out without loading fonts.
+pub trait Measure {
+    /// Returns the width and height a run of text will occupy.
+    fn measure(&mut self, text: &str, size: f32) -> (f32, f32);
+}
+
+/// A monospace approximation, for tests and for anything laying out without a
+/// font stack. Deliberately errs wide: a label that fits with room to spare
+/// looks worse than one that fits exactly, and better than one that overflows.
+pub struct Approximate;
+
 const ADVANCE: f32 = 0.55;
 const LINE_HEIGHT: f32 = 1.25;
 
-fn measure_text(text: &str, size: f32) -> (f32, f32) {
-    (text.chars().count() as f32 * size * ADVANCE, size * LINE_HEIGHT)
+impl Measure for Approximate {
+    fn measure(&mut self, text: &str, size: f32) -> (f32, f32) {
+        (text.chars().count() as f32 * size * ADVANCE, size * LINE_HEIGHT)
+    }
 }
 
 /// Turns UI trees into command arrays, reusing its allocations between frames.
@@ -244,12 +260,22 @@ impl Layouter {
         &self.frame
     }
 
-    /// Lays `root` out in a `viewport` and returns the commands to paint it.
+    /// Lays `root` out using the approximate measurer.
     pub fn layout(&mut self, root: &Node, viewport: (f32, f32)) -> &Frame {
+        self.layout_with(root, viewport, &mut Approximate)
+    }
+
+    /// Lays `root` out, measuring text with `measure`.
+    pub fn layout_with(
+        &mut self,
+        root: &Node,
+        viewport: (f32, f32),
+        measure: &mut dyn Measure,
+    ) -> &Frame {
         self.frame.clear();
 
         let mut tree: TaffyTree<()> = TaffyTree::new();
-        let Ok(node) = build(&mut tree, root, None) else { return &self.frame };
+        let Ok(node) = build(&mut tree, root, None, measure) else { return &self.frame };
 
         fit_root(&mut tree, node, root, viewport);
 
@@ -297,8 +323,18 @@ pub fn walk_laid_out(
     viewport: (f32, f32),
     visit: &mut impl FnMut(&Node, usize, f32, f32, f32, f32),
 ) {
+    walk_laid_out_with(root, viewport, &mut Approximate, visit)
+}
+
+/// As `walk_laid_out`, measuring text with `measure`.
+pub fn walk_laid_out_with(
+    root: &Node,
+    viewport: (f32, f32),
+    measure: &mut dyn Measure,
+    visit: &mut impl FnMut(&Node, usize, f32, f32, f32, f32),
+) {
     let mut tree: TaffyTree<()> = TaffyTree::new();
-    let Ok(id) = build(&mut tree, root, None) else { return };
+    let Ok(id) = build(&mut tree, root, None, measure) else { return };
     fit_root(&mut tree, id, root, viewport);
 
     let space = Size {
@@ -378,6 +414,7 @@ fn build(
     tree: &mut TaffyTree<()>,
     node: &Node,
     parent: Option<FlexDirection>,
+    measure: &mut dyn Measure,
 ) -> Result<NodeId, taffy::TaffyError> {
     match node {
         Node::Row { style, children } | Node::Column { style, children } => {
@@ -386,12 +423,12 @@ fn build(
                 _ => FlexDirection::Column,
             };
             let ids: Result<Vec<NodeId>, _> =
-                children.iter().map(|child| build(tree, child, Some(direction))).collect();
+                children.iter().map(|child| build(tree, child, Some(direction), measure)).collect();
             tree.new_with_children(taffy_style(style, direction, parent), &ids?)
         }
         Node::Box { style } => tree.new_leaf(taffy_style(style, FlexDirection::Row, parent)),
         Node::Text { text, style } => {
-            let (width, height) = measure_text(text, style.size);
+            let (width, height) = measure.measure(text, style.size);
             tree.new_leaf(taffy::Style {
                 size: Size { width: length(width), height: length(height) },
                 ..Default::default()

@@ -18,7 +18,7 @@ pub mod widgets;
 use compositor::{InputEvent, InputSender, SceneReceiver};
 use inspect::Inspector;
 use paint::Painter;
-use text::TextPainter;
+use text::{FontMeasure, TextPainter};
 use scene::{Color, Frame, HitId, Layouter, Node, Sizing, Style, TextStyle};
 
 use anyhow::{anyhow, Result};
@@ -86,10 +86,10 @@ impl Gpu {
     }
 
     /// Paints one frame's command array (§6.1).
-    fn render(&mut self, frame: &Frame) -> Result<()> {
+    fn render(&mut self, frame: &Frame, fonts: &mut glyphon::FontSystem) -> Result<()> {
         let viewport = (self.config.width as f32, self.config.height as f32);
         let count = self.painter.prepare(&self.device, &self.queue, frame, viewport);
-        self.text.prepare(&self.device, &self.queue, frame, viewport);
+        self.text.prepare(&self.device, &self.queue, fonts, frame, viewport);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -147,7 +147,6 @@ impl Gpu {
     }
 }
 
-#[derive(Default)]
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
@@ -168,6 +167,30 @@ struct App {
     hovered: Option<HitId>,
     /// §8.4's debug overlay, toggled with F12 like the tool it imitates.
     inspector: Inspector,
+    /// Shared by layout and rendering, so text is measured by the font that
+    /// draws it.
+    fonts: glyphon::FontSystem,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            window: None,
+            gpu: None,
+            layouter: Layouter::new(),
+            scene: None,
+            scenes: None,
+            frames: 0,
+            updates: 0,
+            last_report: None,
+            input: None,
+            cursor: (0.0, 0.0),
+            hovered: None,
+            inspector: Inspector::default(),
+            // Loads the system font list once, at startup.
+            fonts: glyphon::FontSystem::new(),
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -269,14 +292,18 @@ impl ApplicationHandler for App {
                         self.last_report = Some(now);
                     }
                     let tree = self.scene.get_or_insert_with(demo_scene);
-                    self.layouter.layout(tree, viewport);
+                    self.layouter.layout_with(
+                        tree,
+                        viewport,
+                        &mut FontMeasure::new(&mut self.fonts),
+                    );
 
                     // Injected render commands, not a second rendering path
                     // (docs/inspiration-canon.md, on clay).
                     self.inspector.highlight = self.hovered;
                     self.inspector.overlay(self.layouter.frame_mut());
 
-                    if let Err(e) = gpu.render(self.layouter.frame()) {
+                    if let Err(e) = gpu.render(self.layouter.frame(), &mut self.fonts) {
                         eprintln!("frame dropped: {e}");
                     }
                 }

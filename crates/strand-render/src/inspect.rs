@@ -77,9 +77,26 @@ fn outline(frame: &mut Frame, x: f32, y: f32, width: f32, height: f32, weight: f
 /// Geometry comes from a real layout pass, so this reports where things
 /// actually ended up rather than what the tree asked for.
 pub fn describe(root: &Node, viewport: (f32, f32)) -> String {
+    describe_with(root, viewport, &mut crate::scene::Approximate)
+}
+
+/// As `describe`, but measuring text with the real font stack, so the geometry
+/// reported is the geometry the renderer would produce. Loading the system
+/// fonts costs enough to be worth doing once, which is why the caller owns it.
+pub fn describe_with_fonts(root: &Node, viewport: (f32, f32)) -> String {
+    let mut fonts = glyphon::FontSystem::new();
+    let mut measure = crate::text::FontMeasure::new(&mut fonts);
+    describe_with(root, viewport, &mut measure)
+}
+
+pub fn describe_with(
+    root: &Node,
+    viewport: (f32, f32),
+    measure: &mut dyn crate::scene::Measure,
+) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "viewport {:.0}x{:.0}", viewport.0, viewport.1);
-    crate::scene::walk_laid_out(root, viewport, &mut |node, depth, x, y, width, height| {
+    crate::scene::walk_laid_out_with(root, viewport, measure, &mut |node, depth, x, y, width, height| {
         let indent = "  ".repeat(depth + 1);
         let _ = write!(out, "{indent}{}", kind(node));
         if let Some(id) = node.style().and_then(|style| style.id) {

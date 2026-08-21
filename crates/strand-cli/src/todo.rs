@@ -118,7 +118,7 @@ fn view(theme: &Theme, state: &State) -> Node {
 /// screen: it reports where every node actually ended up, so a layout can be
 /// checked without a screenshot.
 pub fn inspect(viewport: (f32, f32)) -> String {
-    strand_render::inspect::describe(&view(&Theme::default(), &State::new()), viewport)
+    strand_render::inspect::describe_with_fonts(&view(&Theme::default(), &State::new()), viewport)
 }
 
 /// Runs the todo UI: an actor on the runtime, the compositor on this thread.
