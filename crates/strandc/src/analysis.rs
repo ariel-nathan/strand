@@ -20,6 +20,12 @@ pub struct Analysis {
     pub types: Vec<(Span, Ty)>,
     /// Each name's use site paired with the span of its declaration.
     pub definitions: Vec<(Span, Span)>,
+    /// A description that reads better than the expression's type.
+    ///
+    /// Builder calls are the case that needs it: `column(gap: 4)` has type
+    /// `Node`, which is true and says nothing about what `column` takes — and
+    /// unlike a function, there is no declaration to go to and read.
+    pub descriptions: Vec<(Span, String)>,
 }
 
 fn contains(span: Span, offset: usize) -> bool {
@@ -82,6 +88,15 @@ impl Analysis {
         out
     }
 
+    /// The description covering `offset`, if anything there has one.
+    pub fn description_at(&self, offset: usize) -> Option<&str> {
+        self.descriptions
+            .iter()
+            .filter(|(span, _)| contains(*span, offset))
+            .min_by_key(|(span, _)| width(*span))
+            .map(|(_, text)| text.as_str())
+    }
+
     /// Renders the type at `offset` the way it is written in source.
     pub fn type_label_at(&self, offset: usize, hir: &Hir) -> Option<String> {
         self.type_at(offset).map(|ty| hir.ty(ty))
@@ -100,7 +115,7 @@ mod tests {
     fn the_innermost_expression_wins() {
         let analysis = Analysis {
             types: vec![(span(0, 10), Ty::Int), (span(0, 1), Ty::Bool)],
-            definitions: vec![],
+            ..Default::default()
         };
         assert_eq!(analysis.type_at(0), Some(&Ty::Bool), "the narrower span");
         assert_eq!(analysis.type_at(5), Some(&Ty::Int), "only the wider one covers this");
@@ -109,7 +124,7 @@ mod tests {
     #[test]
     fn a_cursor_just_past_a_name_still_counts() {
         let analysis =
-            Analysis { types: vec![(span(4, 7), Ty::Str)], definitions: vec![] };
+            Analysis { types: vec![(span(4, 7), Ty::Str)], ..Default::default() };
         assert_eq!(analysis.type_at(7), Some(&Ty::Str));
         assert_eq!(analysis.type_at(8), None);
     }
@@ -117,8 +132,8 @@ mod tests {
     #[test]
     fn definitions_resolve_from_a_use() {
         let analysis = Analysis {
-            types: vec![],
             definitions: vec![(span(20, 21), span(4, 5)), (span(30, 31), span(4, 5))],
+            ..Default::default()
         };
         assert_eq!(analysis.definition_at(20), Some(span(4, 5)));
         assert_eq!(analysis.definition_at(30), Some(span(4, 5)));
@@ -128,8 +143,8 @@ mod tests {
     #[test]
     fn references_are_found_from_a_use_site() {
         let analysis = Analysis {
-            types: vec![],
             definitions: vec![(span(20, 21), span(4, 5)), (span(30, 31), span(4, 5))],
+            ..Default::default()
         };
         let refs = analysis.references_at(20);
         assert_eq!(refs, vec![span(4, 5), span(20, 21), span(30, 31)]);
@@ -138,8 +153,8 @@ mod tests {
     #[test]
     fn references_are_found_from_the_declaration_too() {
         let analysis = Analysis {
-            types: vec![],
             definitions: vec![(span(20, 21), span(4, 5)), (span(30, 31), span(4, 5))],
+            ..Default::default()
         };
         assert_eq!(analysis.references_at(4), analysis.references_at(20));
     }
@@ -147,8 +162,8 @@ mod tests {
     #[test]
     fn unrelated_declarations_do_not_bleed_together() {
         let analysis = Analysis {
-            types: vec![],
             definitions: vec![(span(20, 21), span(4, 5)), (span(30, 31), span(9, 10))],
+            ..Default::default()
         };
         assert_eq!(analysis.references_at(20), vec![span(4, 5), span(20, 21)]);
         assert_eq!(analysis.references_at(30), vec![span(9, 10), span(30, 31)]);

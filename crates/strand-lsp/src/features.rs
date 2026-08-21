@@ -91,10 +91,18 @@ impl<'src> Document<'src> {
         out
     }
 
-    /// The type under the cursor, rendered as it would be written in source.
+    /// What is under the cursor, rendered as it would be written in source.
+    ///
+    /// A description wins over a type where there is one. Every builder call
+    /// has type `Node`, so the type alone would answer "what is this" with the
+    /// one fact that is the same everywhere — and a builder has no declaration
+    /// to go and read instead.
     pub fn hover(&self, position: Position) -> Option<Hover> {
         let offset = self.offset(position);
-        let label = self.analysis.type_label_at(offset, &self.hir)?;
+        let label = match self.analysis.description_at(offset) {
+            Some(description) => description.to_string(),
+            None => self.analysis.type_label_at(offset, &self.hir)?,
+        };
         Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,

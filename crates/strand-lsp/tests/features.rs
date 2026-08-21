@@ -284,3 +284,54 @@ fn a_broken_item_does_not_hide_its_neighbours_from_the_outline() {
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["before", "after"]);
 }
+
+#[test]
+fn hover_on_a_builder_says_what_it_takes() {
+    // Every builder call has type `Node`, so the type alone answers "what is
+    // this" with the one fact that is the same everywhere. A builder also has
+    // no declaration to go and read, which makes hover the only way to find
+    // out what it takes.
+    let src = "\
+view fn main(): Node {
+  column(gap: 4) {
+    button(id: 1, label: \"Add\")
+  }
+}
+";
+    let document = Document::new(src);
+
+    let column = hover_text(&document, position_of(src, "column", 0)).expect("should hover");
+    assert!(column.contains("gap: int = 0"), "props and their defaults: {column}");
+    assert!(column.contains("padding: int = 0"), "got: {column}");
+    assert!(column.contains("{ … }"), "a container says it takes children: {column}");
+
+    let button = hover_text(&document, position_of(src, "button", 0)).expect("should hover");
+    assert!(button.contains("id: int"), "got: {button}");
+    assert!(button.contains("label: string"), "got: {button}");
+    assert!(!button.contains("{ … }"), "a leaf takes no children: {button}");
+}
+
+#[test]
+fn hover_inside_a_builder_still_reports_the_type_there() {
+    // The description covers the builder's name, not its whole call, so an
+    // argument inside it hovers as itself.
+    let src = "\
+view fn main(): Node {
+  column(gap: 4) {
+    text(\"hello\")
+  }
+}
+";
+    let document = Document::new(src);
+    let text = hover_text(&document, position_of(src, "hello", 0)).expect("should hover");
+    assert!(text.contains("string"), "got: {text}");
+}
+
+#[test]
+fn a_view_hovers_as_a_node() {
+    let src = "view fn main(): Node {\n  spacer()\n}\n";
+    let document = Document::new(src);
+    let text = hover_text(&document, position_of(src, "spacer", 0)).expect("should hover");
+    assert!(text.contains("spacer()"), "got: {text}");
+    assert!(text.contains("-> Node"), "got: {text}");
+}

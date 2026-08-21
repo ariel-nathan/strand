@@ -583,9 +583,9 @@ impl Parser {
                     // this parser already knows is a builder, which is what
                     // keeps `foo()` followed by a block unambiguous without a
                     // no-block-here restriction of the kind `if` needs.
-                    if let Expr::Ident { name, .. } = &expr {
+                    if let Expr::Ident { name, span: name_span } = &expr {
                         if is_builder(name) {
-                            let name = name.clone();
+                            let (name, name_span) = (name.clone(), *name_span);
                             let children = if takes_children(&name) && self.at(&Tok::LBrace) {
                                 Some(self.block()?)
                             } else {
@@ -595,6 +595,7 @@ impl Parser {
                             expr = Expr::Build {
                                 span: Self::join(expr.span(), end),
                                 name,
+                                name_span,
                                 args,
                                 children,
                             };

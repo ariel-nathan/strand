@@ -216,7 +216,15 @@ pub enum Expr {
     /// A separate node rather than a `Call` with a block argument, because the
     /// children are not an argument: they are a scope whose contents become
     /// this node's children in the order they are written.
-    Build { name: String, args: Vec<Arg>, children: Option<Block>, span: Span },
+    Build {
+        name: String,
+        /// Where the builder's name was written. A builder has no declaration
+        /// to point at, so this is what hover attaches its signature to.
+        name_span: Span,
+        args: Vec<Arg>,
+        children: Option<Block>,
+        span: Span,
+    },
     /// `t.title`, and the receiver half of `list.push(x)`.
     Field { base: Box<Expr>, name: String, span: Span },
 

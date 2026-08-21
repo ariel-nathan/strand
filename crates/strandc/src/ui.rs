@@ -145,6 +145,26 @@ pub struct Prop {
     pub default: Option<f32>,
 }
 
+impl Prop {
+    /// `gap: int = 0`, the way it would be written as a parameter.
+    pub fn render(&self) -> String {
+        let ty = match self.ty {
+            PropTy::Int => "int",
+            PropTy::Float => "float",
+            PropTy::Bool => "bool",
+            PropTy::Str => "string",
+        };
+        match (self.default, self.ty) {
+            (None, _) => format!("{}: {ty}", self.name),
+            (Some(default), PropTy::Int) => format!("{}: {ty} = {}", self.name, default as i64),
+            (Some(default), PropTy::Bool) => {
+                format!("{}: {ty} = {}", self.name, default != 0.0)
+            }
+            (Some(default), _) => format!("{}: {ty} = {default:?}", self.name),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Builder {
     pub name: &'static str,
@@ -152,6 +172,25 @@ pub struct Builder {
     pub props: &'static [Prop],
     /// Whether this builder takes a trailing block of children.
     pub container: bool,
+}
+
+impl Builder {
+    /// How the builder reads as a declaration.
+    ///
+    /// A builder has no declaration in the file to go to, so this is the only
+    /// way to find out what it takes — which makes it the answer for hover, and
+    /// for the two diagnostics that have to say what was expected. One
+    /// renderer, so an editor and the compiler cannot describe the same builder
+    /// differently.
+    pub fn signature(&self) -> String {
+        let props: Vec<String> = self.props.iter().map(Prop::render).collect();
+        format!(
+            "{}({}){} -> Node",
+            self.name,
+            props.join(", "),
+            if self.container { " { … }" } else { "" }
+        )
+    }
 }
 
 const fn required(name: &'static str, ty: PropTy, slot: Slot) -> Prop {
@@ -307,6 +346,18 @@ mod tests {
         }
         const { assert!(CHILD_COUNT_OFFSET + 4 <= NODE_SIZE) };
         const { assert!(KIND_OFFSET == 0) };
+    }
+
+    #[test]
+    fn a_signature_reads_as_a_declaration() {
+        let signature = lookup("column").expect("column exists").signature();
+        assert_eq!(signature, "column(gap: int = 0, padding: int = 0) { … } -> Node");
+
+        let leaf = lookup("button").expect("button exists").signature();
+        assert_eq!(leaf, "button(id: int, label: string) -> Node", "a leaf opens no block");
+
+        let scroll = lookup("scroll").expect("scroll exists").signature();
+        assert!(scroll.contains("offset: float = 0.0"), "{scroll}");
     }
 
     #[test]

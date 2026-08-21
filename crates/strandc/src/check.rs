@@ -77,19 +77,6 @@ fn prop_ty(ty: PropTy) -> Ty {
     }
 }
 
-/// A builder's props, for the "you can write these" half of a diagnostic.
-fn prop_list(builder: &ui::Builder) -> String {
-    if builder.props.is_empty() {
-        return "no props".to_string();
-    }
-    builder
-        .props
-        .iter()
-        .map(|prop| format!("`{}`", prop.name))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn number_default(builder: &ui::Builder, slot: Slot) -> f32 {
     builder
         .props
@@ -878,8 +865,8 @@ impl Checker {
 
             ast::Expr::Call { callee, args, span } => self.check_call(callee, args, *span, expected),
 
-            ast::Expr::Build { name, args, children, span } => {
-                self.check_build(name, args, children.as_ref(), *span)
+            ast::Expr::Build { name, name_span, args, children, span } => {
+                self.check_build(name, *name_span, args, children.as_ref(), *span)
             }
 
             ast::Expr::RecordLit { name, fields, span } => {
@@ -1031,6 +1018,7 @@ impl Checker {
     fn check_build(
         &mut self,
         name: &str,
+        name_span: Span,
         args: &[ast::Arg],
         children: Option<&ast::Block>,
         span: Span,
@@ -1039,6 +1027,10 @@ impl Checker {
             self.error(span, format!("unknown builder `{name}`"));
             return Expr { ty: Ty::Error, kind: ExprKind::Unit };
         };
+
+        // There is no declaration to send go-to-definition at, so the signature
+        // is the only way to find out what a builder takes.
+        self.analysis.descriptions.push((name_span, builder.signature()));
 
         if !self.in_view {
             self.error_labeled(
@@ -1064,7 +1056,7 @@ impl Checker {
                         arg.span,
                         format!("`{name}` has no prop `{label}`"),
                         "unknown prop",
-                        format!("`{name}` takes {}", prop_list(builder)),
+                        builder.signature(),
                     ),
                     None => self.error(
                         arg.span,
@@ -1100,7 +1092,7 @@ impl Checker {
                     span,
                     format!("`{name}` needs `{}`", prop.name),
                     "missing prop",
-                    format!("`{name}` takes {}", prop_list(builder)),
+                    builder.signature(),
                 );
             }
         }
