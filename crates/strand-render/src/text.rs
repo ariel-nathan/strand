@@ -335,18 +335,28 @@ mod tests {
     }
 
     #[test]
-    fn the_font_measures_about_as_wide_as_the_approximation() {
-        // The stub errs wide on purpose, so a label laid out without a font
-        // stack is given room rather than clipped.
+    fn the_approximation_is_the_same_order_as_a_real_font() {
+        // This test used to assert that the approximation is never narrower
+        // than the font — that it "errs wide", so a label laid out without a
+        // font stack is given room rather than clipped. CI showed that is not
+        // a property of the code. It was a property of this machine's fonts.
         //
-        // "Wide enough" is the most that can be asserted, not "always wider".
-        // `FontSystem::new()` takes what the host provides, and the host is not
-        // ours to choose: DejaVu Sans, the usual default on a bare Linux
-        // machine, comes out 0.8% over the estimate on one of these samples,
-        // where Segoe UI comes in under it. CI found that; a single machine
-        // never would. The margin is what the approximation is worth across
-        // hosts, and §14's one bundled font is what would remove the question.
-        const MARGIN: f32 = 1.05;
+        // `FontSystem::new()` takes whatever the host provides. Measured at
+        // 16px, font ÷ approximation came out:
+        //
+        //     Segoe UI (Windows)     0.81  0.88  0.93  0.91
+        //     DejaVu Sans (Linux)          1.01        1.14
+        //
+        // So it errs wide on one host and narrow on the other, and worst of
+        // all on one glyph — an average advance per character cannot bound a
+        // single character, where one wide letter is the whole string.
+        //
+        // What is left is a sanity check, and it is worth keeping as one: it
+        // catches a measurer that returns nothing, or that has the units
+        // wrong, which is the failure that would actually happen. The exact
+        // property wants §14's one bundled font, which would make layout
+        // reproducible across machines rather than merely close.
+        const SPREAD: f32 = 1.3;
 
         let mut fonts = FontSystem::new();
         let mut real = FontMeasure::new(&mut fonts);
@@ -357,9 +367,9 @@ mod tests {
             assert!(measured > 0.0, "{sample:?} measured as nothing");
             assert!(height > 0.0, "{sample:?} has no height");
             assert!(
-                measured <= approximated * MARGIN,
-                "{sample:?}: font {measured} exceeded approximation {approximated} \
-                 by more than the margin"
+                measured <= approximated * SPREAD && measured >= approximated / SPREAD,
+                "{sample:?}: font {measured} and approximation {approximated} are \
+                 not the same size of number"
             );
         }
     }
