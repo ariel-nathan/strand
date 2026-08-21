@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/strand-runtime", "crates/strand-render", "crates/strand-cli"]
+members = ["crates/strandc", "crates/strand-runtime", "crates/strand-render", "crates/strand-cli"]
 
 [workspace.package]
 version = "0.1.0"
