@@ -174,6 +174,16 @@ impl Parser {
         self.expect(Tok::Colon)?;
         let state = self.type_expr()?;
 
+        // Optional `message: T`; without it the channel carries strings.
+        let mut message = None;
+        if let (Tok::Ident(word), Tok::Colon) = (self.peek(), self.peek_at(1)) {
+            if word == "message" {
+                self.advance();
+                self.advance();
+                message = Some(self.type_expr()?);
+            }
+        }
+
         let mut init = None;
         let mut receive = None;
         while self.at(&Tok::Fn) {
@@ -196,7 +206,7 @@ impl Parser {
                 .with_help("an actor needs `fn init()` for its starting state and `fn receive(state, msg)` for each message"));
         };
 
-        Ok(ActorDecl { name, state, init, receive, span: Self::join(start, end) })
+        Ok(ActorDecl { name, state, message, init, receive, span: Self::join(start, end) })
     }
 
     fn type_decl(&mut self) -> PResult<TypeDecl> {

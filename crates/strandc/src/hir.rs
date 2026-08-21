@@ -122,6 +122,8 @@ pub struct Hir {
 pub struct ActorInfo {
     pub name: String,
     pub state: Ty,
+    /// The channel's payload type, checked against `receive` (§5.3).
+    pub message: Ty,
     pub init: FuncId,
     pub receive: FuncId,
 }

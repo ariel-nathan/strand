@@ -1,0 +1,32 @@
+// A typed channel (§5.3): the message is a declared sum type, not a blob.
+//
+// The checker requires message types to be flat — no strings, records or
+// lists inside — because a message arrives in a different arena, where any
+// pointer it carried would mean nothing. That restriction is what lets the
+// wire format *be* the memory format: the receiver does no parsing.
+
+type Count = { total: int, seen: int }
+
+type Msg =
+  | Inc
+  | Dec
+  | Add(n: int)
+  | Reset
+
+actor Counter {
+  state: Count
+  message: Msg
+
+  fn init(): Count {
+    Count { total: 0, seen: 0 }
+  }
+
+  fn receive(state: Count, msg: Msg): Count {
+    match msg {
+      Inc    => Count { total: state.total + 1, seen: state.seen + 1 },
+      Dec    => Count { total: state.total - 1, seen: state.seen + 1 },
+      Add(n) => Count { total: state.total + n, seen: state.seen + 1 },
+      Reset  => Count { total: 0, seen: state.seen + 1 },
+    }
+  }
+}

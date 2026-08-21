@@ -32,6 +32,8 @@ pub enum Item {
 pub struct ActorDecl {
     pub name: String,
     pub state: TypeExpr,
+    /// `message: T` declares the channel's payload type. Defaults to `string`.
+    pub message: Option<TypeExpr>,
     pub init: FnDecl,
     pub receive: FnDecl,
     pub span: Span,

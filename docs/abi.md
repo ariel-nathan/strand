@@ -69,3 +69,44 @@ Exports:
     strand_alloc(size: i32) -> i32      // bump allocator in the guest arena
     strand_main()                       // optional
     strand_on_message(ptr: i32, len: i32)   // optional
+
+## 7. Channel messages: the wire format is the memory format
+
+A message type is declared on the actor:
+
+    actor Counter {
+      state: Count
+      message: Msg      // defaults to `string` when omitted
+      ...
+    }
+
+**Message types must be flat.** A variant's fields may be `int`, `float` or
+`bool` — nothing that holds a pointer. The checker enforces this and says why:
+a message is copied into a *different* arena, and a pointer from the sender's
+arena means nothing there.
+
+That restriction buys the property `docs/inspiration-canon.md` takes from
+Cap'n Proto: **the wire format is the memory format.** The bytes on the channel
+are exactly §3's boxed-variant layout, so once the runtime has copied them into
+the receiving arena with `strand_alloc`, the pointer it already has *is* a
+valid value. `strand_on_message` hands it straight to `receive`. There is no
+decode step, and adding one would be the bug.
+
+Encoding, matching §3:
+
+| message type | bytes on the wire |
+|---|---|
+| sum with any payload-carrying variant | `i32 tag` in the first 8-byte slot, then one 8-byte slot per field |
+| all-niladic sum | bare `i32` tag |
+| `int` / `float` | the 8-byte value |
+| `bool` | `i32` 0 or 1 |
+| `string` | raw UTF-8 bytes; codegen adds §5's length header on arrival |
+
+`string` is the one relocated case, and it is safe only because codegen knows
+that layout and rebuilds the header in the receiving arena.
+
+**Not yet done.** Sending from Strand code needs a `send` builtin, which needs
+host imports in emitted modules — the function-index space shifts once imports
+exist, so it is a real change rather than an addition. Today the sending half
+is exercised by a host encoder that reads layout from the same `Hir`, so both
+ends still agree by construction.

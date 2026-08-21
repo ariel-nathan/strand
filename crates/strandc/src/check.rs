@@ -203,6 +203,36 @@ impl Checker {
         }
     }
 
+    /// A message crosses into another arena, where any pointer it carries
+    /// would be meaningless. Flat payloads let the wire format *be* the memory
+    /// format — the Cap'n Proto lesson in `docs/inspiration-canon.md` — so the
+    /// receiver never parses anything. Anything needing relocation is rejected.
+    fn check_message_is_flat(&mut self, message: &Ty, span: Span) {
+        let offender = match message {
+            // Strings are relocated by codegen, which knows their one layout.
+            Ty::Str | Ty::Int | Ty::Float | Ty::Bool | Ty::Error => None,
+            Ty::Sum(id) => {
+                let def = &self.hir.sums[id.0 as usize];
+                def.variants
+                    .iter()
+                    .flat_map(|variant| variant.fields.iter())
+                    .find(|(_, ty)| !matches!(ty, Ty::Int | Ty::Float | Ty::Bool))
+                    .map(|(name, ty)| format!("field `{name}` is {}", self.show(ty)))
+            }
+            other => Some(format!("{} cannot be sent", self.show(other))),
+        };
+
+        if let Some(offender) = offender {
+            self.error_labeled(
+                span,
+                format!("message types must be flat: {offender}"),
+                "not sendable",
+                "a message may only carry int, float, bool — anything holding a \
+                 pointer would arrive in an arena where that pointer means nothing",
+            );
+        }
+    }
+
     /// Validates the actor shape and records what codegen needs (§5.1).
     fn collect_actor(&mut self, program: &ast::Program) {
         let mut seen: Option<&ast::ActorDecl> = None;
@@ -221,6 +251,11 @@ impl Checker {
             seen = Some(decl);
 
             let state = self.resolve_ty(&decl.state);
+            let message = match &decl.message {
+                Some(ty) => self.resolve_ty(ty),
+                None => Ty::Str,
+            };
+            self.check_message_is_flat(&message, decl.span);
             let Some(init) = self.signatures.get("init").cloned() else { continue };
             let Some(receive) = self.signatures.get("receive").cloned() else { continue };
 
@@ -244,11 +279,11 @@ impl Checker {
                             format!("`receive` takes the state {want} first, found {found}"),
                         );
                     }
-                    if !second.unifies(&Ty::Str) {
-                        let found = self.show(second);
+                    if !second.unifies(&message) {
+                        let (found, want) = (self.show(second), self.show(&message));
                         self.error(
                             decl.receive.span,
-                            format!("`receive` takes the message as a string, found {found}"),
+                            format!("`receive` takes the message as {want}, found {found}"),
                         );
                     }
                 }
@@ -269,6 +304,7 @@ impl Checker {
             self.hir.actor = Some(ActorInfo {
                 name: decl.name.clone(),
                 state,
+                message,
                 init: init.id,
                 receive: receive.id,
             });

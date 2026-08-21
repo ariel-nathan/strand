@@ -210,7 +210,7 @@ impl<'hir> Emitter<'hir> {
         code.function(&str_eq_body());
         if let Some(actor) = &self.hir.actor {
             code.function(&actor_main_body(actor));
-            code.function(&actor_receive_body(actor, self.alloc_index));
+            code.function(&actor_receive_body(actor, self.alloc_index, self.hir));
         }
         module.section(&code);
 
@@ -893,36 +893,64 @@ fn actor_main_body(actor: &ActorInfo) -> Function {
     f
 }
 
-/// `strand_on_message`: wrap the delivered bytes as a Strand string, hand it to
-/// `receive` along with the current state, and keep whatever comes back.
+/// `strand_on_message`: turn the delivered bytes into the actor's message
+/// type, hand it to `receive` with the current state, and keep what comes back.
 ///
-/// The runtime writes raw bytes; `docs/abi.md` §5 says a string is a length
-/// header followed by its bytes, so the header is added here rather than
-/// teaching the runtime the language's layout.
-fn actor_receive_body(actor: &ActorInfo, alloc: u32) -> Function {
+/// For a flat message the bytes already *are* the value: the runtime copied
+/// them into this arena with `strand_alloc`, and the checker guaranteed the
+/// type holds no pointers needing relocation, so a boxed variant is used
+/// in place with no decoding at all. Strings are the one relocated case —
+/// codegen knows their layout (`docs/abi.md` §5), so it adds the header.
+fn actor_receive_body(actor: &ActorInfo, alloc: u32, hir: &Hir) -> Function {
     let mut f = Function::new([(1, ValType::I32)]);
     let (ptr, len, text) = (0, 1, 2);
 
-    f.instruction(&Instruction::LocalGet(len));
-    f.instruction(&Instruction::I32Const(4));
-    f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::Call(alloc));
-    f.instruction(&Instruction::LocalTee(text));
-
-    // header: the length
-    f.instruction(&Instruction::LocalGet(len));
-    f.instruction(&Instruction::I32Store(mem_arg(0, 2)));
-
-    // body: copy the delivered bytes in after it
-    f.instruction(&Instruction::LocalGet(text));
-    f.instruction(&Instruction::I32Const(4));
-    f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::LocalGet(ptr));
-    f.instruction(&Instruction::LocalGet(len));
-    f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
-
     f.instruction(&Instruction::GlobalGet(1));
-    f.instruction(&Instruction::LocalGet(text));
+
+    match &actor.message {
+        Ty::Str => {
+            f.instruction(&Instruction::LocalGet(len));
+            f.instruction(&Instruction::I32Const(4));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::Call(alloc));
+            f.instruction(&Instruction::LocalTee(text));
+
+            // header: the length
+            f.instruction(&Instruction::LocalGet(len));
+            f.instruction(&Instruction::I32Store(mem_arg(0, 2)));
+
+            // body: the delivered bytes, after it
+            f.instruction(&Instruction::LocalGet(text));
+            f.instruction(&Instruction::I32Const(4));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(ptr));
+            f.instruction(&Instruction::LocalGet(len));
+            f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+            f.instruction(&Instruction::LocalGet(text));
+        }
+        Ty::Sum(id) if hir.sums[id.0 as usize].variants.iter().any(|v| !v.fields.is_empty()) => {
+            // Boxed variant: the delivered block is already a valid value here.
+            f.instruction(&Instruction::LocalGet(ptr));
+        }
+        // All-niladic sums, and scalars, arrive as their bare value.
+        Ty::Sum(_) | Ty::Bool => {
+            f.instruction(&Instruction::LocalGet(ptr));
+            f.instruction(&Instruction::I32Load(mem_arg(0, 2)));
+        }
+        Ty::Int => {
+            f.instruction(&Instruction::LocalGet(ptr));
+            f.instruction(&Instruction::I64Load(mem_arg(0, 3)));
+        }
+        Ty::Float => {
+            f.instruction(&Instruction::LocalGet(ptr));
+            f.instruction(&Instruction::F64Load(mem_arg(0, 3)));
+        }
+        // The checker rejects anything else before codegen sees it.
+        _ => {
+            f.instruction(&Instruction::LocalGet(ptr));
+        }
+    }
+
     f.instruction(&Instruction::Call(actor.receive.0));
     f.instruction(&Instruction::GlobalSet(1));
     f.instruction(&Instruction::End);
