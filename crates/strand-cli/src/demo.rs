@@ -141,3 +141,70 @@ async fn run_crash(traced: bool) -> Result<()> {
     }
     Ok(())
 }
+
+/// §6.1's most visible claim: a busy app actor delays its own updates, never
+/// the compositor.
+///
+/// The "app actor" here is a plain thread — it submits UI trees over the scene
+/// channel exactly as an actor would, and `--burn` makes it hog its own thread
+/// between submissions. The bar stops moving; the window does not stop
+/// drawing.
+pub fn ui(burn: bool) -> Result<()> {
+    use strand_render::scene::{Color, Node, Sizing, Style};
+
+    let (sender, receiver) = strand_render::compositor::scene_channel();
+
+    std::thread::spawn(move || {
+        let accent = Color::rgb(0.35, 0.55, 0.95);
+        let panel = Color::rgb(0.13, 0.14, 0.18);
+        let mut step: f32 = 0.0;
+
+        loop {
+            step = (step + 0.02) % 1.0;
+            // A bar whose width tracks `step`, so movement is app progress.
+            let tree = Node::column(
+                Style { width: Sizing::Grow, height: Sizing::Grow, padding: 24.0, gap: 16.0, ..Default::default() },
+                vec![
+                    Node::Box {
+                        style: Style {
+                            width: Sizing::Percent(0.1 + step * 0.85),
+                            height: Sizing::Fixed(56.0),
+                            background: Some(accent),
+                            ..Default::default()
+                        },
+                    },
+                    Node::Box {
+                        style: Style {
+                            width: Sizing::Grow,
+                            height: Sizing::Grow,
+                            background: Some(panel),
+                            ..Default::default()
+                        },
+                    },
+                ],
+            );
+
+            if !sender.submit(tree) {
+                return; // compositor gone
+            }
+
+            if burn {
+                // Deliberately hostile: hold this thread for a third of a
+                // second. Under the old model this is where the UI freezes.
+                let until = std::time::Instant::now() + Duration::from_millis(300);
+                while std::time::Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(16));
+            }
+        }
+    });
+
+    if burn {
+        println!("--- strand M3: app actor burning CPU; the compositor should not care ---");
+    } else {
+        println!("--- strand M3: app actor submitting frames ---");
+    }
+    strand_render::run_with(Some(receiver))
+}

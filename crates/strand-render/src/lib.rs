@@ -8,9 +8,11 @@
 
 use std::sync::Arc;
 
+pub mod compositor;
 pub mod paint;
 pub mod scene;
 
+use compositor::SceneReceiver;
 use paint::Painter;
 use scene::{Color, Frame, Layouter, Node, Sizing, Style, TextStyle};
 
@@ -139,6 +141,14 @@ struct App {
     layouter: Layouter,
     /// The tree to paint. Replaced wholesale each time the app submits one.
     scene: Option<Node>,
+    /// Submissions from app actors (§6.1). Polled, never waited on.
+    scenes: Option<SceneReceiver>,
+    /// Frame counter, so the compositor's own rate is measurable rather than
+    /// merely claimed.
+    frames: u32,
+    /// Scenes drawn, to show how far the app fell behind.
+    updates: u32,
+    last_report: Option<std::time::Instant>,
 }
 
 impl ApplicationHandler for App {
@@ -179,6 +189,29 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 if let Some(gpu) = &mut self.gpu {
                     let viewport = (gpu.config.width as f32, gpu.config.height as f32);
+                    // Take whatever the app has most recently submitted. This
+                    // never blocks, so a slow actor cannot hold up the frame.
+                    if let Some(scenes) = &mut self.scenes {
+                        if scenes.poll() {
+                            self.scene = scenes.current().cloned();
+                            self.updates += 1;
+                        }
+                    }
+
+                    self.frames += 1;
+                    let now = std::time::Instant::now();
+                    let since = *self.last_report.get_or_insert(now);
+                    if now.duration_since(since).as_secs_f32() >= 1.0 {
+                        // The §6.1 claim, measured: compositor frames should
+                        // stay high even when app updates collapse.
+                        eprintln!(
+                            "compositor {:>4} fps | app submitted {:>3} frames",
+                            self.frames, self.updates
+                        );
+                        self.frames = 0;
+                        self.updates = 0;
+                        self.last_report = Some(now);
+                    }
                     let tree = self.scene.get_or_insert_with(demo_scene);
                     let frame = self.layouter.layout(tree, viewport);
                     if let Err(e) = gpu.render(frame) {
@@ -256,9 +289,20 @@ fn demo_scene() -> Node {
 /// Takes over the calling thread (which must be the main thread) with the
 /// window + compositor loop.
 pub fn run() -> Result<()> {
+    run_with(None)
+}
+
+/// Runs the compositor, drawing scenes submitted by app actors.
+///
+/// This takes over the calling thread, which must be the main thread — winit
+/// requires it on Windows and macOS. The actor runtime therefore runs as a
+/// guest of the compositor rather than the other way round, which is a
+/// stronger guarantee than §6.1 states: app code has no handle to this thread
+/// at all.
+pub fn run_with(scenes: Option<SceneReceiver>) -> Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::default();
+    let mut app = App { scenes, ..Default::default() };
     event_loop.run_app(&mut app)?;
     Ok(())
 }
