@@ -100,12 +100,33 @@ pub fn panel(theme: &Theme, children: Vec<Node>) -> Node {
     )
 }
 
+/// The size a field types at, and the line box that follows from it.
+///
+/// `text::FontMeasure` gives a run a line height of `size * 1.25`, and the
+/// caret is exactly one line tall so that a field holding nothing but a caret
+/// is the same height as one holding text. If that factor ever changes, the
+/// field height stops being constant across states — which is what
+/// `a_field_is_the_same_size_in_every_state` is there to catch.
+const FIELD_SIZE: f32 = 16.0;
+const FIELD_LINE: f32 = FIELD_SIZE * 1.25;
+const CARET_WIDTH: f32 = 2.0;
+
 /// A single-line text field (§6.4).
 ///
 /// The caret is a sibling box, not a measured position. Layout places it
 /// immediately after the glyphs because that is where the next sibling goes —
 /// so it lands exactly right, measured by the same font that drew the text,
 /// with no measuring code in the widget at all.
+///
+/// **The prompt and the caret never share the field.** A caret has to occupy
+/// layout space — §6.3 has no out-of-flow positioning, and floating elements
+/// with attach points, which are the mechanism it does specify, are for
+/// tooltips and modals rather than for something inline. So wherever the caret
+/// sits, everything after it moves to make room: showing both meant the prompt
+/// jumped 4px right when the field took focus and 4px back on the first
+/// keystroke. Hiding the prompt on focus removes the state instead of
+/// compensating for it, and the value's left edge is then the same in all four
+/// combinations. The prompt says what the field is for; focus has answered that.
 ///
 /// `focused` comes from the app's state. The platform decides *where* focus is
 /// and says so in an event; what a focused field looks like is the view's
@@ -117,27 +138,21 @@ pub fn text_input(
     placeholder: &str,
     focused: bool,
 ) -> Node {
-    let caret = Node::Box {
+    let caret = || Node::Box {
         style: Style {
-            width: Sizing::Fixed(2.0),
-            height: Sizing::Fixed(18.0),
+            width: Sizing::Fixed(CARET_WIDTH),
+            height: Sizing::Fixed(FIELD_LINE),
             background: Some(theme.accent),
             ..Default::default()
         },
     };
+    let run = |text: &str, color| Node::text(text, TextStyle { size: FIELD_SIZE, color });
 
-    let empty = value.is_empty();
-    let text = Node::text(
-        if empty { placeholder } else { value },
-        TextStyle { size: 16.0, color: if empty { theme.muted } else { theme.text } },
-    );
-
-    // With nothing typed, the caret belongs before the prompt rather than
-    // trailing it — the prompt is not text the caret is sitting after.
-    let children = match (empty, focused) {
-        (true, true) => vec![caret, text],
-        (false, true) => vec![text, caret],
-        (_, false) => vec![text],
+    let children = match (value.is_empty(), focused) {
+        (true, true) => vec![caret()],
+        (true, false) => vec![run(placeholder, theme.muted)],
+        (false, true) => vec![run(value, theme.text), caret()],
+        (false, false) => vec![run(value, theme.text)],
     };
 
     Node::row(
@@ -145,8 +160,12 @@ pub fn text_input(
             id: Some(id),
             focusable: true,
             width: Sizing::Grow,
+            // Fixed, not fitted: a row that sizes to its contents is a row that
+            // changes height when the contents change, and the contents here
+            // change on every keystroke.
+            height: Sizing::Fixed(FIELD_LINE + theme.padding * 2.0),
             padding: theme.padding,
-            gap: 2.0,
+            gap: CARET_WIDTH,
             background: Some(theme.raised),
             cross_axis: Align::Center,
             ..Default::default()
@@ -273,70 +292,85 @@ mod tests {
         assert_eq!(ids, vec![10, 11, 20, 21], "hit regions follow paint order");
     }
 
-    #[test]
-    fn a_focused_field_shows_a_caret_after_what_was_typed() {
+    /// Where the field puts its text and its caret, for a given state.
+    fn field(value: &str, focused: bool) -> (Option<f32>, Option<f32>, (f32, f32)) {
         let mut layouter = Layouter::new();
-        let tree = text_input(&theme(), HitId(1), "milk", "what needs doing?", true);
-        let frame = layouter.layout(&tree, (400.0, 60.0)).clone();
+        let tree = text_input(&theme(), HitId(1), value, "what needs doing?", focused);
+        let frame = layouter.layout(&tree, (400.0, 80.0)).clone();
 
-        // Text, then the caret: the caret's left edge is past the text's.
-        let text_x = frame
-            .commands
-            .iter()
-            .find_map(|c| match c {
-                Command::Text { x, .. } => Some(*x),
-                _ => None,
-            })
-            .expect("the value should be drawn");
-        let caret = frame
-            .commands
-            .iter()
-            .rev()
-            .find_map(|c| match c {
-                Command::Rect { x, width, color, .. } if *width == 2.0 => Some((*x, *color)),
-                _ => None,
-            })
-            .expect("a focused field should show a caret");
-        assert!(caret.0 > text_x, "the caret sits after the text, at {}", caret.0);
-        assert_eq!(caret.1, theme().accent);
+        let text = frame.commands.iter().find_map(|c| match c {
+            Command::Text { x, .. } => Some(*x),
+            _ => None,
+        });
+        let caret = frame.commands.iter().rev().find_map(|c| match c {
+            Command::Rect { x, width, .. } if *width == CARET_WIDTH => Some(*x),
+            _ => None,
+        });
+        let region = frame.hits[0];
+        (text, caret, (region.width, region.height))
     }
 
     #[test]
-    fn an_unfocused_field_shows_no_caret() {
-        let mut layouter = Layouter::new();
-        let tree = text_input(&theme(), HitId(1), "milk", "what needs doing?", false);
-        let frame = layouter.layout(&tree, (400.0, 60.0));
+    fn the_value_does_not_move_when_the_field_takes_focus() {
+        // The bug this exists for, reported from the running app: with the
+        // prompt and the caret both on screen, the prompt jumped 4px right on
+        // focus and 4px back on the first keystroke. The caret has to occupy
+        // layout space, so the fix was to stop the two from coexisting.
+        let (empty_blur, _, _) = field("", false);
+        let (empty_focus, caret_focus, _) = field("", true);
+        let (typed_focus, _, _) = field("milk", true);
+        let (typed_blur, _, _) = field("milk", false);
+
+        let left = empty_blur.expect("the prompt is drawn when unfocused");
+        assert_eq!(empty_focus, None, "focus replaces the prompt rather than sharing with it");
+        assert_eq!(caret_focus, Some(left), "and the caret starts exactly where text would");
+        assert_eq!(typed_focus, Some(left), "typing does not move it either");
+        assert_eq!(typed_blur, Some(left), "nor does losing focus");
+    }
+
+    #[test]
+    fn a_field_is_the_same_size_in_every_state() {
+        // A field holding only a caret must be as tall as one holding text, or
+        // the row jitters vertically on focus instead of horizontally.
+        let sizes: Vec<(f32, f32)> = [("", false), ("", true), ("milk", true), ("milk", false)]
+            .into_iter()
+            .map(|(value, focused)| field(value, focused).2)
+            .collect();
         assert!(
-            !frame.commands.iter().any(|c| matches!(c, Command::Rect { width: 2.0, .. })),
-            "the caret is what focus looks like, so it must not appear without it"
+            sizes.windows(2).all(|pair| pair[0] == pair[1]),
+            "the field changes size between states: {sizes:?}"
         );
     }
 
     #[test]
-    fn an_empty_field_prompts_in_muted_text_with_the_caret_ahead_of_it() {
-        let mut layouter = Layouter::new();
-        let tree = text_input(&theme(), HitId(1), "", "what needs doing?", true);
-        let frame = layouter.layout(&tree, (400.0, 60.0)).clone();
+    fn a_focused_field_shows_a_caret_after_what_was_typed() {
+        let (text_x, caret_x, _) = field("milk", true);
+        let text_x = text_x.expect("the value should be drawn");
+        let caret_x = caret_x.expect("a focused field should show a caret");
+        assert!(caret_x > text_x, "the caret sits after the text, at {caret_x}");
+    }
 
-        let (text_x, color) = frame
+    #[test]
+    fn an_unfocused_field_shows_no_caret() {
+        assert_eq!(field("milk", false).1, None, "the caret is what focus looks like");
+        assert_eq!(field("", false).1, None);
+    }
+
+    #[test]
+    fn an_empty_unfocused_field_prompts_in_muted_text() {
+        let mut layouter = Layouter::new();
+        let tree = text_input(&theme(), HitId(1), "", "what needs doing?", false);
+        let frame = layouter.layout(&tree, (400.0, 80.0));
+        let (text, color) = frame
             .commands
             .iter()
             .find_map(|c| match c {
-                Command::Text { x, color, .. } => Some((*x, *color)),
+                Command::Text { text, color, .. } => Some((text.clone(), *color)),
                 _ => None,
             })
             .expect("the placeholder should be drawn");
+        assert_eq!(text, "what needs doing?");
         assert_eq!(color, theme().muted, "a prompt is not the value");
-
-        let caret_x = frame
-            .commands
-            .iter()
-            .find_map(|c| match c {
-                Command::Rect { x, width: 2.0, .. } => Some(*x),
-                _ => None,
-            })
-            .expect("a focused field should show a caret");
-        assert!(caret_x < text_x, "with nothing typed the caret leads the prompt");
     }
 
     #[test]

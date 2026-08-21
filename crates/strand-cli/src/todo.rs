@@ -464,14 +464,25 @@ mod tests {
         let state = state.update(InputEvent::FocusChanged { id: Some(INPUT) });
         assert_eq!(state.focus, Some(INPUT));
 
+        // Focusing an empty field swaps the prompt for a caret rather than
+        // adding one beside it — see `widgets::text_input` for why.
         let mut layouter = strand_render::scene::Layouter::new();
         let focused = layouter.layout(&view(&Theme::default(), &state), (600.0, 400.0)).clone();
         let blurred = state.update(InputEvent::FocusChanged { id: None });
-        let blurred = layouter.layout(&view(&Theme::default(), &blurred), (600.0, 400.0));
-        assert!(
-            focused.commands.len() > blurred.commands.len(),
-            "the caret is one more command, and only while focused"
-        );
+        let blurred = layouter.layout(&view(&Theme::default(), &blurred), (600.0, 400.0)).clone();
+
+        let prompts = |frame: &strand_render::scene::Frame| {
+            frame
+                .commands
+                .iter()
+                .filter(|c| {
+                    matches!(c, strand_render::scene::Command::Text { text, .. }
+                        if text == "what needs doing?")
+                })
+                .count()
+        };
+        assert_eq!(prompts(&blurred), 1, "the prompt shows when the field is not in use");
+        assert_eq!(prompts(&focused), 0, "and steps aside once it is");
     }
 
     #[test]
