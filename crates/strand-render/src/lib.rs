@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub mod compositor;
 pub mod paint;
 pub mod scene;
+pub mod widgets;
 
 use compositor::{InputEvent, InputSender, SceneReceiver};
 use paint::Painter;
