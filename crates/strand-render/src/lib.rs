@@ -12,9 +12,9 @@ pub mod compositor;
 pub mod paint;
 pub mod scene;
 
-use compositor::SceneReceiver;
+use compositor::{InputEvent, InputSender, SceneReceiver};
 use paint::Painter;
-use scene::{Color, Frame, Layouter, Node, Sizing, Style, TextStyle};
+use scene::{Color, Frame, HitId, Layouter, Node, Sizing, Style, TextStyle};
 
 use anyhow::{anyhow, Result};
 use winit::application::ApplicationHandler;
@@ -149,6 +149,10 @@ struct App {
     /// Scenes drawn, to show how far the app fell behind.
     updates: u32,
     last_report: Option<std::time::Instant>,
+    /// Events routed back to the app (§6.1). The app never hit-tests.
+    input: Option<InputSender>,
+    cursor: (f32, f32),
+    hovered: Option<HitId>,
 }
 
 impl ApplicationHandler for App {
@@ -181,6 +185,32 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x as f32, position.y as f32);
+                // Hit-test against the frame actually on screen.
+                let hit = self.layouter.frame().hit_test(self.cursor.0, self.cursor.1);
+                if hit != self.hovered {
+                    if let Some(input) = &self.input {
+                        if let Some(left) = self.hovered {
+                            input.send(InputEvent::PointerLeave { id: left });
+                        }
+                        if let Some(entered) = hit {
+                            input.send(InputEvent::PointerEnter { id: entered });
+                        }
+                    }
+                    self.hovered = hit;
+                }
+            }
+
+            WindowEvent::MouseInput { state, .. } => {
+                let (Some(input), Some(id)) = (&self.input, self.hovered) else { return };
+                let (x, y) = self.cursor;
+                input.send(match state {
+                    winit::event::ElementState::Pressed => InputEvent::PointerDown { id, x, y },
+                    winit::event::ElementState::Released => InputEvent::PointerUp { id, x, y },
+                });
+            }
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
@@ -289,7 +319,7 @@ fn demo_scene() -> Node {
 /// Takes over the calling thread (which must be the main thread) with the
 /// window + compositor loop.
 pub fn run() -> Result<()> {
-    run_with(None)
+    run_with(None, None)
 }
 
 /// Runs the compositor, drawing scenes submitted by app actors.
@@ -299,10 +329,10 @@ pub fn run() -> Result<()> {
 /// guest of the compositor rather than the other way round, which is a
 /// stronger guarantee than §6.1 states: app code has no handle to this thread
 /// at all.
-pub fn run_with(scenes: Option<SceneReceiver>) -> Result<()> {
+pub fn run_with(scenes: Option<SceneReceiver>, input: Option<InputSender>) -> Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App { scenes, ..Default::default() };
+    let mut app = App { scenes, input, ..Default::default() };
     event_loop.run_app(&mut app)?;
     Ok(())
 }

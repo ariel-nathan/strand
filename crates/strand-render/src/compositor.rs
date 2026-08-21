@@ -15,7 +15,7 @@
 
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
-use crate::scene::Node;
+use crate::scene::{HitId, Node};
 
 /// The app end of the channel. Cloneable, so several actors could submit,
 /// though the POC has one UI actor.
@@ -70,6 +70,53 @@ impl SceneReceiver {
     pub fn superseded(&self) -> usize {
         self.superseded
     }
+}
+
+/// What the compositor sends back when input lands on a node (§6.1).
+///
+/// Typed, and carrying the id of the node that was hit — routing is the
+/// platform's job, so the app never hit-tests.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputEvent {
+    PointerDown { id: HitId, x: f32, y: f32 },
+    PointerUp { id: HitId, x: f32, y: f32 },
+    /// The pointer entered a different node than it was over last frame.
+    PointerEnter { id: HitId },
+    PointerLeave { id: HitId },
+}
+
+/// The compositor end: sends events towards the app.
+#[derive(Clone)]
+pub struct InputSender {
+    tx: Sender<InputEvent>,
+}
+
+impl InputSender {
+    pub fn send(&self, event: InputEvent) -> bool {
+        self.tx.send(event).is_ok()
+    }
+}
+
+/// The app end: drains events without blocking.
+pub struct InputReceiver {
+    rx: Receiver<InputEvent>,
+}
+
+impl InputReceiver {
+    /// Takes everything queued since the last call. Input is not coalesced the
+    /// way scenes are: dropping a click would lose the user's intent.
+    pub fn drain(&mut self) -> Vec<InputEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+}
+
+pub fn input_channel() -> (InputSender, InputReceiver) {
+    let (tx, rx) = mpsc::channel();
+    (InputSender { tx }, InputReceiver { rx })
 }
 
 pub fn scene_channel() -> (SceneSender, SceneReceiver) {
@@ -176,6 +223,22 @@ mod tests {
 
         assert_eq!(width_of(receiver.current().unwrap()), 4.0);
         assert_eq!(receiver.superseded(), 2, "skipped rather than queued");
+    }
+
+    #[test]
+    fn input_events_are_delivered_in_order_and_never_coalesced() {
+        // Scenes coalesce because only the newest matters. Input does not:
+        // dropping a click would lose what the user meant.
+        let (sender, mut receiver) = input_channel();
+        sender.send(InputEvent::PointerDown { id: HitId(1), x: 1.0, y: 2.0 });
+        sender.send(InputEvent::PointerUp { id: HitId(1), x: 1.0, y: 2.0 });
+        sender.send(InputEvent::PointerDown { id: HitId(2), x: 3.0, y: 4.0 });
+
+        let events = receiver.drain();
+        assert_eq!(events.len(), 3, "every event survives");
+        assert!(matches!(events[0], InputEvent::PointerDown { id: HitId(1), .. }));
+        assert!(matches!(events[2], InputEvent::PointerDown { id: HitId(2), .. }));
+        assert!(receiver.drain().is_empty(), "draining twice yields nothing");
     }
 
     #[test]

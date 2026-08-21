@@ -150,16 +150,34 @@ async fn run_crash(traced: bool) -> Result<()> {
 /// between submissions. The bar stops moving; the window does not stop
 /// drawing.
 pub fn ui(burn: bool) -> Result<()> {
-    use strand_render::scene::{Color, Node, Sizing, Style};
+    use strand_render::compositor::InputEvent;
+    use strand_render::scene::{Color, HitId, Node, Sizing, Style};
 
     let (sender, receiver) = strand_render::compositor::scene_channel();
+    let (input_sender, mut input_receiver) = strand_render::compositor::input_channel();
 
     std::thread::spawn(move || {
         let accent = Color::rgb(0.35, 0.55, 0.95);
+        let hot = Color::rgb(0.95, 0.45, 0.35);
         let panel = Color::rgb(0.13, 0.14, 0.18);
         let mut step: f32 = 0.0;
+        let mut armed = false;
 
         loop {
+            // Input arrives as typed messages naming the node that was hit —
+            // the app never hit-tests (§6.1).
+            for event in input_receiver.drain() {
+                match event {
+                    InputEvent::PointerDown { id, .. } => {
+                        println!("app: pointer down on node {}", id.0);
+                        armed = !armed;
+                    }
+                    InputEvent::PointerEnter { id } => println!("app: enter {}", id.0),
+                    InputEvent::PointerLeave { id } => println!("app: leave {}", id.0),
+                    InputEvent::PointerUp { .. } => {}
+                }
+            }
+
             step = (step + 0.02) % 1.0;
             // A bar whose width tracks `step`, so movement is app progress.
             let tree = Node::column(
@@ -173,11 +191,13 @@ pub fn ui(burn: bool) -> Result<()> {
                             ..Default::default()
                         },
                     },
+                    // A clickable panel: it carries a HitId, so input routes here.
                     Node::Box {
                         style: Style {
+                            id: Some(HitId(1)),
                             width: Sizing::Grow,
                             height: Sizing::Grow,
-                            background: Some(panel),
+                            background: Some(if armed { hot } else { panel }),
                             ..Default::default()
                         },
                     },
@@ -206,5 +226,5 @@ pub fn ui(burn: bool) -> Result<()> {
     } else {
         println!("--- strand M3: app actor submitting frames ---");
     }
-    strand_render::run_with(Some(receiver))
+    strand_render::run_with(Some(receiver), Some(input_sender))
 }

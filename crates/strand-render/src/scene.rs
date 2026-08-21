@@ -71,8 +71,16 @@ pub enum Align {
     SpaceBetween,
 }
 
+/// Identifies a node that can be hit by input. Assigned by whoever builds the
+/// tree — §6.2 calls these stable IDs, and stability is what lets input keep
+/// targeting the same thing across rebuilt frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HitId(pub u32);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Style {
+    /// `Some` makes this node a target for input routing (§6.1).
+    pub id: Option<HitId>,
     pub width: Sizing,
     pub height: Sizing,
     pub padding: f32,
@@ -86,6 +94,7 @@ pub struct Style {
 impl Default for Style {
     fn default() -> Self {
         Self {
+            id: None,
             width: Sizing::Fit,
             height: Sizing::Fit,
             padding: 0.0,
@@ -142,10 +151,28 @@ pub enum Command {
     Text { x: f32, y: f32, size: f32, color: Color, text: String },
 }
 
+/// Where an identified node ended up, so input can be routed to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HitRegion {
+    pub id: HitId,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl HitRegion {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+}
+
 /// A finished frame: draw these in order.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Frame {
     pub commands: Vec<Command>,
+    /// Identified regions, in paint order.
+    pub hits: Vec<HitRegion>,
 }
 
 impl Frame {
@@ -153,6 +180,14 @@ impl Frame {
     /// makes natural: keep the capacity, drop the contents.
     pub fn clear(&mut self) {
         self.commands.clear();
+        self.hits.clear();
+    }
+
+    /// Finds the node under a point. Paint order is tree order (§6.3 — no
+    /// z-index), so the last region painted is the one on top, and the search
+    /// runs backwards.
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<HitId> {
+        self.hits.iter().rev().find(|region| region.contains(x, y)).map(|region| region.id)
     }
 
     pub fn len(&self) -> usize {
@@ -187,6 +222,12 @@ impl Default for Layouter {
 impl Layouter {
     pub fn new() -> Self {
         Self { frame: Frame::default() }
+    }
+
+    /// The most recently laid-out frame, for hit-testing input against what
+    /// is actually on screen rather than what the app last built.
+    pub fn frame(&self) -> &Frame {
+        &self.frame
     }
 
     /// Lays `root` out in a `viewport` and returns the commands to paint it.
@@ -269,6 +310,9 @@ fn emit(tree: &TaffyTree<()>, id: NodeId, node: &Node, x: f32, y: f32, frame: &m
             if let Some(color) = style.background {
                 frame.commands.push(Command::Rect { x, y, width, height, color });
             }
+            if let Some(id) = style.id {
+                frame.hits.push(HitRegion { id, x, y, width, height });
+            }
             let ids = tree.children(id).unwrap_or_default();
             for (child_id, child) in ids.into_iter().zip(children) {
                 emit(tree, child_id, child, x, y, frame);
@@ -277,6 +321,9 @@ fn emit(tree: &TaffyTree<()>, id: NodeId, node: &Node, x: f32, y: f32, frame: &m
         Node::Box { style } => {
             if let Some(color) = style.background {
                 frame.commands.push(Command::Rect { x, y, width, height, color });
+            }
+            if let Some(id) = style.id {
+                frame.hits.push(HitRegion { id, x, y, width, height });
             }
         }
         Node::Text { text, style } => {
@@ -448,6 +495,73 @@ mod tests {
         );
         let mut layouter = Layouter::new();
         assert_eq!(layouter.layout(&deep, (50.0, 50.0)).len(), 1);
+    }
+
+    fn hittable(width: f32, height: f32, id: u32) -> Node {
+        Node::Box {
+            style: Style {
+                id: Some(HitId(id)),
+                width: Sizing::Fixed(width),
+                height: Sizing::Fixed(height),
+                background: Some(RED),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn only_identified_nodes_are_hit_targets() {
+        let tree = Node::column(
+            Style::default(),
+            vec![boxed(50.0, 20.0, RED), hittable(50.0, 20.0, 7)],
+        );
+        let mut layouter = Layouter::new();
+        let frame = layouter.layout(&tree, (100.0, 100.0));
+
+        assert_eq!(frame.hits.len(), 1, "the anonymous box is not a target");
+        assert_eq!(frame.hit_test(10.0, 30.0), Some(HitId(7)));
+        assert_eq!(frame.hit_test(10.0, 5.0), None, "the anonymous box swallows nothing");
+    }
+
+    #[test]
+    fn a_point_outside_everything_hits_nothing() {
+        let tree = Node::column(Style::default(), vec![hittable(10.0, 10.0, 1)]);
+        let mut layouter = Layouter::new();
+        let frame = layouter.layout(&tree, (100.0, 100.0));
+        assert_eq!(frame.hit_test(50.0, 50.0), None);
+    }
+
+    #[test]
+    fn the_topmost_node_wins() {
+        // Paint order is tree order (§6.3, no z-index), so a later sibling
+        // drawn over an earlier one also receives the input.
+        let tree = Node::row(
+            Style {
+                id: Some(HitId(1)),
+                width: Sizing::Fixed(100.0),
+                height: Sizing::Fixed(100.0),
+                background: Some(BLUE),
+                ..Default::default()
+            },
+            vec![hittable(40.0, 40.0, 2)],
+        );
+        let mut layouter = Layouter::new();
+        let frame = layouter.layout(&tree, (200.0, 200.0));
+
+        assert_eq!(frame.hit_test(10.0, 10.0), Some(HitId(2)), "the child is on top");
+        assert_eq!(frame.hit_test(80.0, 80.0), Some(HitId(1)), "outside it, the parent");
+    }
+
+    #[test]
+    fn hit_regions_follow_layout() {
+        let tree = Node::column(
+            Style { padding: 20.0, ..Default::default() },
+            vec![hittable(30.0, 30.0, 3)],
+        );
+        let mut layouter = Layouter::new();
+        let frame = layouter.layout(&tree, (100.0, 100.0));
+        assert_eq!(frame.hit_test(25.0, 25.0), Some(HitId(3)));
+        assert_eq!(frame.hit_test(15.0, 15.0), None, "the padding is not the child");
     }
 
     #[test]
