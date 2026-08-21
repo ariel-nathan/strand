@@ -399,3 +399,71 @@ fn the_state_in_a_crash_report_is_the_last_good_one() {
         labels(&tree)
     );
 }
+
+// ---- F5: the other half of a reload ---------------------------------------
+
+#[test]
+fn a_restart_puts_the_actor_back_to_its_init() {
+    // A reload keeps the state, which is the point of it — and is also why a
+    // string a handler put in the state keeps its old text until that handler
+    // runs again. This is the way out: same code, state let go, `init` again.
+    let hir = match strandc::compile("fragile.str", FRAGILE) {
+        Ok(hir) => hir,
+        Err(report) => panic!("{:?}", miette::Report::new(report)),
+    };
+    let plan = plan::plan(&hir).expect("a plan");
+    let wasm = plan.spawns[0].wasm.clone();
+    let port = plan.input_port.expect("it hears input");
+    let message_ty = hir.actors[plan.spawns[0].actor].inbox[port as usize].ty.clone();
+    let captured = Arc::new(Captured::default());
+    let sink = captured.clone();
+
+    let trace = sim::run(SimOptions::new(1), move |registry: Registry| {
+        let hir = hir.clone();
+        let wasm = wasm.clone();
+        let sink = sink.clone();
+        async move {
+            registry.route_frames(0, sink);
+            registry.route_state(0, Arc::new(Codec::new(&hir, &hir.actors[0].state)));
+            registry.reserve(0);
+            let engine = engine()?;
+            let handle =
+                spawn_supervised(&engine, &registry, 0, "fragile", &wasm, Policy::Restart, None);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            for event in typing("abc") {
+                let spec = spec_for(event).expect("deliverable");
+                let bytes = strand_cli::encode::encode(&hir, &message_ty, &spec)
+                    .unwrap_or_else(|e| panic!("encoding {spec}: {e:#}"));
+                registry.send_from(HOST, 0, Message::Blob { from: HOST, port, bytes })?;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            registry.send(0, Message::Restart)?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            registry.send(0, Message::Stop)?;
+            let _ = handle.await;
+            Ok::<(), anyhow::Error>(())
+        }
+    })
+    .expect("simulation failed");
+
+    let frames = captured.frames.lock().unwrap().clone();
+    let before = labels(&frames[frames.len() - 2]);
+    let after = labels(frames.last().expect("it drew after coming back"));
+    assert_eq!(before, vec!["typed 3".to_string()], "what it had");
+    assert_eq!(after, vec!["start 0".to_string()], "what `init` builds");
+
+    assert!(
+        trace.events().iter().any(|event| matches!(event, Event::Restarted { id: 0, .. })),
+        "a restart is a new life of the same actor:
+{}",
+        trace.render()
+    );
+    assert!(
+        !trace.events().iter().any(|event| matches!(event, Event::Crashed { .. })),
+        "and not a crash:
+{}",
+        trace.render()
+    );
+}

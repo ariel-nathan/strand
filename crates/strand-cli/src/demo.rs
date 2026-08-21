@@ -230,12 +230,14 @@ pub fn ui(burn: bool) -> Result<()> {
                     }
                     InputEvent::PointerEnter { id } => println!("app: enter {}", id.0),
                     InputEvent::PointerLeave { id } => println!("app: leave {}", id.0),
-                    // This demo has no field to type into and nothing to
-                    // scroll; the todo app is where those are exercised.
+                    // This demo has no field to type into, nothing to
+                    // scroll, and no actor state to throw away; the todo app
+                    // is where those are exercised.
                     InputEvent::PointerUp { .. }
                     | InputEvent::Key { .. }
                     | InputEvent::FocusChanged { .. }
-                    | InputEvent::Scroll { .. } => {}
+                    | InputEvent::Scroll { .. }
+                    | InputEvent::Restart => {}
                 }
             }
 

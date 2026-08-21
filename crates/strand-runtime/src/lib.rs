@@ -70,6 +70,14 @@ pub enum Message {
     /// read the new arena as the old one. Arriving together, it cannot be
     /// either.
     Reload { bytes: Vec<u8>, state: Arc<dyn Snapshots> },
+    /// Start over on the code already running (§5.4's first strategy, asked
+    /// for rather than provoked by a crash).
+    ///
+    /// The other half of `Reload`. A reload replaces the code and keeps the
+    /// data, which leaves a string a handler once put in the state showing its
+    /// old text until that handler runs again. This throws the state away, and
+    /// is how a person sees an edit to such a string.
+    Restart,
     /// §5.4: delivered to the parent when a child dies. Host-side supervisors
     /// act on it today; a Strand actor will receive it once M2's `actor`
     /// declarations land.
@@ -849,6 +857,8 @@ enum Exit {
     Stopped,
     /// Newer code arrived (§9.3), with whatever the actor's state was at that
     /// moment and whatever was still queued behind the reload.
+    /// Asked to start over on the same code, with the state let go.
+    Restart { pending: Vec<Message> },
     Reload {
         bytes: Vec<u8>,
         /// How to read the *replacement's* state, once it is running.
@@ -886,6 +896,17 @@ async fn run_actor_once(
         run_life(engine, registry, id, name, module_bytes, generation, &stats, restore).await;
     stats.end();
     outcome
+}
+
+/// Everything still queued, so a life that ends on purpose can hand its
+/// mailbox to the next one. A message already sent is not the caller's
+/// mistake, and dropping it would make a reload cost whatever was in flight.
+fn drain(mailbox: &mut mpsc::UnboundedReceiver<Message>) -> Vec<Message> {
+    let mut pending = Vec::new();
+    while let Ok(queued) = mailbox.try_recv() {
+        pending.push(queued);
+    }
+    pending
 }
 
 /// Reads the actor's state, if anyone told the runtime how (§9.3).
@@ -1016,14 +1037,16 @@ async fn run_life(
             // Newer code. Read the state before the arena holding it goes, and
             // take everything still queued along, so a reload costs no message
             // that was already on its way.
+            Message::Restart => return Ok(Exit::Restart { pending: drain(&mut mailbox) }),
             Message::Reload { bytes, state: reader } => {
                 let state =
                     capture_state(codec.as_ref(), name, &mut store, &instance, memory.as_ref());
-                let mut pending = Vec::new();
-                while let Ok(queued) = mailbox.try_recv() {
-                    pending.push(queued);
-                }
-                return Ok(Exit::Reload { bytes, reader, state, pending });
+                return Ok(Exit::Reload {
+                    bytes,
+                    reader,
+                    state,
+                    pending: drain(&mut mailbox),
+                });
             }
             Message::Blob { from, port, bytes } => {
                 if config.chaos {
@@ -1135,6 +1158,15 @@ pub fn spawn_supervised(
                 Ok(Exit::Stopped) => return Ok(()),
                 // Hot reload is a supervisor restart with newer code, which is
                 // why it lands here rather than in a machine of its own.
+                // Same code, no state: §5.4's fresh restart, on request.
+                Ok(Exit::Restart { pending }) => {
+                    generation += 1;
+                    registry.trace.record(Event::Restarted { id, generation });
+                    registry.reserve(id);
+                    for message in pending {
+                        registry.requeue(id, message);
+                    }
+                }
                 Ok(Exit::Reload { bytes: next, reader, state, pending }) => {
                     // The one check §9.3 turns on: the image is a value of the
                     // state type the *old* module had, and it may only be read

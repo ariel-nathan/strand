@@ -247,6 +247,13 @@ impl ApplicationHandler for App {
                 if !event.state.is_pressed() {
                     return;
                 }
+                if event.logical_key == WinitKey::Named(NamedKey::F5) {
+                    // The browser's key for the browser's meaning: start over.
+                    if let Some(input) = &self.input {
+                        input.send(InputEvent::Restart);
+                    }
+                    return;
+                }
                 if event.logical_key == WinitKey::Named(NamedKey::F12) {
                     self.inspector.toggle();
                     eprintln!(

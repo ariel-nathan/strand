@@ -110,6 +110,14 @@ pub enum InputEvent {
     /// the value — and sending the clamped result means an app can never hold a
     /// scroll position that shows nothing.
     Scroll { id: HitId, offset: f32 },
+    /// The user asked for the app to start over (§9.3).
+    ///
+    /// Not input, and no actor can ask for it: it is a command to the platform,
+    /// travelling on this channel because this is the path from the window to
+    /// the host. Saving the file reloads the code and keeps the state; this
+    /// throws the state away, which is the other half a person needs when a
+    /// string they just edited is one their code put in the state.
+    Restart,
 }
 
 /// The compositor end: sends events towards the app.

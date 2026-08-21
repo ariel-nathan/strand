@@ -63,6 +63,12 @@ pub async fn watch(path: PathBuf, hir: Hir, registry: Registry) {
 
     let mut seen = stamp(&path);
     println!("watching {} — save the file to reload it (§9.3)", path.display());
+    // Worth saying once, because the first time it surprises someone they
+    // report it as a bug: a reload replaces the code and keeps the data, so a
+    // string a handler put in the state keeps its old text until that handler
+    // runs again. F5 is the way to see such an edit at once.
+    println!("        a reload keeps the state, so a string already in it changes");
+    println!("        when the code that sets it next runs — F5 to start fresh");
 
     loop {
         tokio::time::sleep(POLL).await;

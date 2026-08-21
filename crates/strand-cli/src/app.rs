@@ -81,10 +81,12 @@ pub fn spec_for(event: InputEvent) -> Option<String> {
         }
         InputEvent::Scroll { id, offset } => format!("Scrolled {} {offset}", id.0),
         // Pointer release and hover are not in `input::VARIANTS`: an actor
-        // cannot ask for them, so there is nothing to deliver them to.
+        // cannot ask for them, so there is nothing to deliver them to. Nor is
+        // `Restart`, which is addressed to the platform rather than to the app.
         InputEvent::PointerUp { .. }
         | InputEvent::PointerEnter { .. }
-        | InputEvent::PointerLeave { .. } => return None,
+        | InputEvent::PointerLeave { .. }
+        | InputEvent::Restart => return None,
     })
 }
 
@@ -193,6 +195,17 @@ pub fn run_watching(hir: &Hir, watch: Option<&Path>) -> Result<()> {
 
         loop {
             for event in input_receiver.drain() {
+                // A command to the platform rather than input for the app, so
+                // it is handled here and never encoded (§9.3). Every actor,
+                // not just the one that draws: F5 means "this application,
+                // from the top".
+                if event == InputEvent::Restart {
+                    println!("restart — every actor from its own `init`");
+                    for spawn in &plan.spawns {
+                        let _ = feeding.send(spawn.id, Message::Restart);
+                    }
+                    continue;
+                }
                 let Some(spec) = spec_for(event) else { continue };
                 match crate::encode::encode(&hir_for_encoding, &message_ty, &spec) {
                     Ok(bytes) => {
@@ -218,6 +231,7 @@ pub fn run_watching(hir: &Hir, watch: Option<&Path>) -> Result<()> {
 
     println!("--- strand: a UI actor written in Strand (§6.2, §6.5) ---");
     println!("press F12 for the debug overlay (§8.4) — every actor here has a row");
+    println!("press F5 to restart the app from `init`, throwing its state away");
     strand_render::run_with_stats(Some(scene_receiver), Some(input_sender), Some(stats))
 }
 
@@ -264,6 +278,13 @@ mod tests {
         assert!(spec_for(InputEvent::PointerUp { id: HitId(1), x: 0.0, y: 0.0 }).is_none());
         assert!(spec_for(InputEvent::PointerEnter { id: HitId(1) }).is_none());
         assert!(spec_for(InputEvent::PointerLeave { id: HitId(1) }).is_none());
+    }
+
+    #[test]
+    fn a_restart_is_addressed_to_the_platform_and_not_to_the_app() {
+        // If this ever encoded, F5 would arrive at the actor as an ordinary
+        // message — most likely as a click on whatever id happened to match.
+        assert!(spec_for(InputEvent::Restart).is_none());
     }
 
     #[test]
