@@ -15,7 +15,8 @@ strand — the Strand toolchain
 compiling and running Strand:
   strand run <file.str>            compile and run `main`
   strand build <file.str> [-o out] compile to a .wasm module
-  strand view <file.str>           draw a `view fn` in a window (§6.2)
+  strand view <file.str>           draw a Strand view in a window (§6.2);
+                                   an actor with a `view fn` is interactive
   strand view <file.str> <w> <h>   print its laid-out tree instead
 
 windows to look at:

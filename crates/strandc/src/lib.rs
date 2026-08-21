@@ -6,6 +6,7 @@ pub mod check;
 pub mod codegen;
 pub mod diag;
 pub mod hir;
+pub mod input;
 pub mod lexer;
 pub mod line_index;
 pub mod parser;

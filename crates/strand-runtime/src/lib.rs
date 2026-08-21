@@ -109,6 +109,20 @@ impl Trace {
     }
 }
 
+/// Where a UI actor's frames go.
+///
+/// An actor that exports `strand_view` draws itself after every message it
+/// handles (`docs/abi.md` §8). The runtime calls it and hands the bytes
+/// straight over: it knows *where* the actor left a frame and nothing about
+/// what a frame means. Layout, widgets and the compositor stay on the other
+/// side of this trait, which is what keeps the actor runtime free of the
+/// renderer.
+pub trait Frames: Send + Sync {
+    /// `memory` is the actor's whole arena; the frame is `count` records
+    /// starting at `base`.
+    fn submit(&self, memory: &[u8], base: u32, count: u32);
+}
+
 /// A live measurement of one actor, for §8.4's debug overlay.
 ///
 /// Sampled, not logged. The overlay asks "what is true now", and a number one
@@ -201,6 +215,49 @@ impl StatCell {
     }
 }
 
+/// Everything needed to ask an actor to draw itself, resolved once per life.
+struct Painter {
+    sink: Arc<dyn Frames>,
+    draw: wasmtime::TypedFunc<(), ()>,
+    /// Where the frame's array starts. Immutable, so it is read once.
+    base: u32,
+    count: wasmtime::Global,
+}
+
+impl Painter {
+    /// Calls the guest's view and hands the frame it built to the sink.
+    ///
+    /// The bytes are read out of the actor's own memory and copied nowhere: the
+    /// sink borrows them for the length of the call.
+    async fn paint(
+        &self,
+        store: &mut Store<ActorCtx>,
+        memory: Option<&wasmtime::Memory>,
+    ) -> wasmtime::Result<()> {
+        self.draw.call_async(&mut *store, ()).await?;
+
+        let wasmtime::Val::I32(count) = self.count.get(&mut *store) else {
+            wasmtime::bail!("`strand_node_count` is not an i32");
+        };
+        if let Some(memory) = memory {
+            self.sink.submit(memory.data(&*store), self.base, count as u32);
+        }
+        Ok(())
+    }
+}
+
+/// Reads an i32 global, for the two the frame ABI exports.
+fn read_u32_global(
+    store: &mut Store<ActorCtx>,
+    instance: &Instance,
+    name: &str,
+) -> Option<u32> {
+    match instance.get_global(&mut *store, name)?.get(&mut *store) {
+        wasmtime::Val::I32(value) => Some(value as u32),
+        _ => None,
+    }
+}
+
 /// Reads an actor's arena size. Guest memory only grows while guest code runs,
 /// so sampling after each call is exact rather than approximate.
 fn sample_arena(stats: &StatCell, memory: Option<&wasmtime::Memory>, store: &Store<ActorCtx>) {
@@ -251,6 +308,10 @@ pub struct Registry {
     /// Keyed by id and ordered, so the overlay's rows keep their places
     /// between frames instead of dancing.
     stats: Arc<Mutex<BTreeMap<ActorId, Arc<StatCell>>>>,
+    /// Where each UI actor's frames go. On the registry rather than in
+    /// `spawn_supervised`'s arguments because "where does this actor's output
+    /// go" is the address book's question, and it is already the address book.
+    frames: Arc<Mutex<HashMap<ActorId, Arc<dyn Frames>>>>,
     config: Arc<SimConfig>,
 }
 
@@ -265,6 +326,7 @@ impl Registry {
             start: Instant::now(),
             trace: Trace::new(),
             stats: Arc::new(Mutex::new(BTreeMap::new())),
+            frames: Arc::new(Mutex::new(HashMap::new())),
             config,
         }
     }
@@ -279,6 +341,18 @@ impl Registry {
     fn stat_cell(&self, id: ActorId, name: &str) -> Arc<StatCell> {
         let mut cells = self.stats.lock().unwrap();
         cells.entry(id).or_insert_with(|| Arc::new(StatCell::new(name))).clone()
+    }
+
+    /// Says where actor `id`'s frames should go.
+    ///
+    /// Set before spawning: the actor draws itself once at startup, and a sink
+    /// registered afterwards would miss that first frame.
+    pub fn route_frames(&self, id: ActorId, sink: Arc<dyn Frames>) {
+        self.frames.lock().unwrap().insert(id, sink);
+    }
+
+    fn frames_for(&self, id: ActorId) -> Option<Arc<dyn Frames>> {
+        self.frames.lock().unwrap().get(&id).cloned()
     }
 
     /// A snapshot of every actor this registry has ever spawned, live or dead
@@ -617,6 +691,16 @@ async fn run_life(
     // the arena's size without reaching into another actor's memory.
     let memory = instance.get_memory(&mut store, "memory");
 
+    // A UI actor draws itself after every message (§6.5: the runtime re-invokes
+    // the view). An actor that exports none of this is unaffected — the whole
+    // path is `None` and never runs.
+    let painter = registry.frames_for(id).and_then(|sink| {
+        let draw = instance.get_typed_func::<(), ()>(&mut store, "strand_view").ok()?;
+        let base = read_u32_global(&mut store, &instance, "strand_nodes")?;
+        let count = instance.get_global(&mut store, "strand_node_count")?;
+        Some(Painter { sink, draw, base, count })
+    });
+
     if let Ok(main) = instance.get_typed_func::<(), ()>(&mut store, "strand_main") {
         stats.fibers.store(1, Ordering::Relaxed);
         let started = main.call_async(&mut store, ()).await;
@@ -625,6 +709,15 @@ async fn run_life(
         started.map_err(|e| died(reason(&e), Some("startup".to_string())))?;
     }
     sample_arena(stats, memory.as_ref(), &store);
+
+    // The first frame, so a window has something to show before anyone touches
+    // it.
+    if let Some(painter) = &painter {
+        painter
+            .paint(&mut store, memory.as_ref())
+            .await
+            .map_err(|e| died(reason(&e), Some("first frame".to_string())))?;
+    }
 
     let on_message = instance.get_typed_func::<(i32, i32), ()>(&mut store, "strand_on_message");
     while let Some(msg) = mailbox.recv().await {
@@ -656,7 +749,16 @@ async fn run_life(
                 // is more useful next to the arena size that produced it.
                 sample_arena(stats, memory.as_ref(), &store);
                 stats.handled.fetch_add(1, Ordering::Relaxed);
-                handled.map_err(|e| died(reason(&e), Some(summary)))?;
+                handled.map_err(|e| died(reason(&e), Some(summary.clone())))?;
+
+                // State has moved on, so the view has too.
+                if let Some(painter) = &painter {
+                    painter
+                        .paint(&mut store, memory.as_ref())
+                        .await
+                        .map_err(|e| died(reason(&e), Some(summary)))?;
+                    sample_arena(stats, memory.as_ref(), &store);
+                }
             }
         }
     }

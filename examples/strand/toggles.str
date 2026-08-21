@@ -1,0 +1,129 @@
+// A UI actor written entirely in Strand (§6.2, §6.5).
+//
+//   strand view examples/strand/toggles.str          click it
+//   strand view examples/strand/toggles.str 800 600  print the tree instead
+//
+// Everything here is one actor: it owns a record, it receives events as
+// messages, its handler returns the next state, and its view is a pure function
+// of that state. The platform re-invokes the view after every message — there is
+// no subscription, no effect system, and nothing in this file that knows a
+// window exists.
+//
+// Press F12 while it runs. The actor drawing the window has a row in the debug
+// overlay like any other, because it *is* an actor like any other: its own
+// arena, its own mailbox, its own supervisor.
+
+type Model = {
+  compiler: bool,
+  runtime: bool,
+  renderer: bool,
+  // Which panel the buttons have chosen. 0 = the list, 1 = the note.
+  tab: int,
+}
+
+// `message: Input` opts into the platform's event type (§6.1). Its variants —
+// Click, Typed, Enter, Focus, Scrolled and the rest — are then in scope, and
+// `match` is exhaustive over them like any other sum.
+
+// Node ids. Stable across frames, which is what lets a click keep landing on
+// the same thing after the tree is rebuilt.
+type Id = int
+
+fn LIST_TAB(): Id { 1 }
+fn NOTE_TAB(): Id { 2 }
+fn COMPILER(): Id { 10 }
+fn RUNTIME(): Id { 11 }
+fn RENDERER(): Id { 12 }
+
+fn done(state: Model): int {
+  // No stdlib yet, so counting is arithmetic on bools turned into ints by
+  // `match`. Ordinary code either way.
+  bit(state.compiler) + bit(state.runtime) + bit(state.renderer)
+}
+
+fn bit(flag: bool): int {
+  match flag {
+    true => 1,
+    false => 0,
+  }
+}
+
+// A count rendered without an int-to-string conversion, which the stdlib does
+// not have yet. `match` over the small range is honest about that.
+fn summary(state: Model): string {
+  match done(state) {
+    0 => "nothing done yet",
+    1 => "one of three done",
+    2 => "two of three done",
+    _ => "all three done",
+  }
+}
+
+view fn task(id: Id, checked: bool, label: string): Node {
+  row(gap: 8) {
+    checkbox(id: id, checked: checked, label: label)
+  }
+}
+
+actor Toggles {
+  state: Model
+  message: Input
+
+  fn init(): Model {
+    Model { compiler: true, runtime: true, renderer: false, tab: 0 }
+  }
+
+  // The §6.5 handler: an event in, the next state out. Nothing mutates.
+  fn receive(state: Model, msg: Input): Model {
+    match msg {
+      Click(id) => clicked(state, id),
+      // Everything else is input this app has no use for. Matching on it is
+      // still required, which is the point of the type being a real sum.
+      _ => state,
+    }
+  }
+
+  view fn draw(state: Model): Node {
+    screen(gap: 12, padding: 16) {
+      text("strand — a UI actor written in Strand")
+      muted(summary(state))
+
+      row(gap: 8) {
+        button(id: LIST_TAB(), label: "Tasks")
+        button(id: NOTE_TAB(), label: "About")
+      }
+
+      // Ordinary `if`, not a ternary: a branch that does not run contributes
+      // no child, so there is no `0` to leak onto the screen.
+      if state.tab == 0 {
+        panel(gap: 8) {
+          task(COMPILER(), state.compiler, "write the compiler")
+          task(RUNTIME(), state.runtime, "write the runtime")
+          task(RENDERER(), state.renderer, "write the renderer")
+        }
+      }
+
+      if state.tab == 1 {
+        panel(gap: 8) {
+          text("This window is drawn by compiled Strand.")
+          muted("The view is a pure function of the record above it.")
+          muted("Clicks arrive as messages; the platform redraws.")
+        }
+      }
+
+      spacer()
+      muted("F12 shows the actor drawing this")
+    }
+  }
+}
+
+fn clicked(state: Model, id: Id): Model {
+  match id {
+    1 => Model { compiler: state.compiler, runtime: state.runtime, renderer: state.renderer, tab: 0 },
+    2 => Model { compiler: state.compiler, runtime: state.runtime, renderer: state.renderer, tab: 1 },
+    10 => Model { compiler: !state.compiler, runtime: state.runtime, renderer: state.renderer, tab: state.tab },
+    11 => Model { compiler: state.compiler, runtime: !state.runtime, renderer: state.renderer, tab: state.tab },
+    12 => Model { compiler: state.compiler, runtime: state.runtime, renderer: !state.renderer, tab: state.tab },
+    _ => state,
+  }
+}

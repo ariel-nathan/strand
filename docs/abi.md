@@ -164,6 +164,52 @@ Exports:
     strand_nodes           // i32 global: where the array starts
     strand_node_count      // i32 global: how many records are in it
     strand_frame_reset()   // empty the array before building the next frame
+    strand_view()          // reset, then draw the actor as it currently is
+
+`strand_view` exists only on an actor that declares a `view fn`. It takes no
+arguments because §6.5 makes a view a pure function of state, and the state
+global is the only state there is — so it resets the arena, reads global 1, and
+calls the view.
+
+The runtime calls it after `strand_main` and after every message, then hands
+the region to whoever asked for frames. It knows *where* a frame is and nothing
+about what one means: layout, widgets and the compositor live on the far side
+of a one-method trait, which is what keeps the actor runtime free of the
+renderer.
+
+## 9. Input: the platform's own message type
+
+A UI actor receives input as ordinary messages (§6.1, §6.5), so its mailbox
+carries a type the platform declares:
+
+    Click(id: int)
+    Typed(ch: int)          // the Unicode scalar value
+    Backspace
+    Enter
+    Escape
+    Focus(id: int)          // 0 when nothing holds focus
+    Scrolled(id: int, offset: float)
+
+Every field is `int` or `float`, so §7's flatness rule is satisfied without an
+exception: input crosses into the actor's arena carrying no pointers, and the
+encoder that puts it on the wire is the same one the CLI uses for any message.
+
+**Why the platform declares it rather than matching names.** The alternative
+was to let an actor declare its own event type and have the host fill in
+variants whose names it recognised. That is a protocol held together by
+spelling — rename `Click` to `Pressed` and the actor silently stops receiving
+clicks. Declaring it here means the checker knows the type, `match` is
+exhaustive over it, and a typo is a compile error.
+
+**Why it is opt-in.** Registering the type also registers `Click`, `Enter` and
+the rest as constructors, and those are ordinary names a UI program might want.
+So it appears only in a module that writes `message: Input`, and a module that
+declares its own `type Input` keeps its own. A file that never mentions it
+reserves nothing.
+
+`crates/strandc/src/input.rs` is the single table, read by the checker and by
+the host's translation from `InputEvent` — the same discipline `ui.rs` imposes
+on the frame.
 
 The arena is fixed at 2048 nodes (`ui::NODE_CAPACITY`) and sits between the
 static data and the bump heap. A view that exceeds it traps rather than

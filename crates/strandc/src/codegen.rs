@@ -183,6 +183,7 @@ impl<'hir> Emitter<'hir> {
             Vec::new(),
         );
         let frame_reset_ty = self.intern_type(Vec::new(), Vec::new());
+        let actor_view_ty = self.intern_type(Vec::new(), Vec::new());
 
         // Bodies are emitted before the type section is finalised, because a
         // multi-value block inside a body can intern a new type.
@@ -218,9 +219,12 @@ impl<'hir> Emitter<'hir> {
             functions.function(node_push_ty);
             functions.function(frame_reset_ty);
         }
-        if self.hir.actor.is_some() {
+        if let Some(actor) = &self.hir.actor {
             functions.function(actor_main_ty);
             functions.function(actor_recv_ty);
+            if actor.view.is_some() {
+                functions.function(actor_view_ty);
+            }
         }
         module.section(&functions);
 
@@ -284,11 +288,17 @@ impl<'hir> Emitter<'hir> {
             exports.export("strand_node_count", ExportKind::Global, self.node_count_global);
             exports.export("strand_frame_reset", ExportKind::Func, self.node_push_index + 1);
         }
-        if self.hir.actor.is_some() {
+        if let Some(actor) = &self.hir.actor {
             let actor_base =
                 if self.builds_nodes { self.node_push_index + 1 } else { self.str_eq_index };
             exports.export("strand_main", ExportKind::Func, actor_base + 1);
             exports.export("strand_on_message", ExportKind::Func, actor_base + 2);
+            if actor.view.is_some() {
+                // Draws the actor as it currently is. The runtime calls this
+                // after each message; what it produces is read out of
+                // `strand_nodes` (`docs/abi.md` §8).
+                exports.export("strand_view", ExportKind::Func, actor_base + 3);
+            }
             // Lets a host read the actor's state without the actor logging it.
             exports.export("strand_state", ExportKind::Global, 1);
         }
@@ -311,6 +321,9 @@ impl<'hir> Emitter<'hir> {
         if let Some(actor) = &self.hir.actor {
             code.function(&actor_main_body(actor, offset));
             code.function(&actor_receive_body(actor, self.alloc_index, self.hir, offset));
+            if let Some(view) = actor.view {
+                code.function(&actor_view_body(view, self.node_push_index + 1, offset));
+            }
         }
         module.section(&code);
 
@@ -1166,6 +1179,21 @@ fn actor_receive_body(actor: &ActorInfo, alloc: u32, hir: &Hir, offset: u32) -> 
 
     f.instruction(&Instruction::Call(offset + actor.receive.0));
     f.instruction(&Instruction::GlobalSet(1));
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// `strand_view`: empty last frame's array, then draw the actor as it is.
+///
+/// The state global is the only argument, because §6.5 makes a view a pure
+/// function of state — there is nothing else it could need, and nothing else it
+/// is allowed to see.
+fn actor_view_body(view: FuncId, frame_reset: u32, offset: u32) -> Function {
+    let mut f = Function::new([]);
+    f.instruction(&Instruction::Call(frame_reset));
+    f.instruction(&Instruction::GlobalGet(1));
+    f.instruction(&Instruction::Call(offset + view.0));
+    // A view returns nothing: building the nodes was the result.
     f.instruction(&Instruction::End);
     f
 }

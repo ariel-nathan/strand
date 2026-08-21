@@ -442,3 +442,113 @@ fn view_is_a_keyword_and_says_so_when_used_as_a_name() {
     let error = strandc::parser::parse(src).expect_err("`view` cannot be a name");
     assert!(error.message.contains("keyword, not a name"), "message was: {}", error.message);
 }
+
+// ---- the platform's Input type -------------------------------------------
+
+#[test]
+fn an_actor_that_asks_for_input_gets_the_platform_type() {
+    let hir = expect_ok(
+        r#"
+        type Model = { tab: int }
+        actor App {
+          state: Model
+          message: Input
+          fn init(): Model { Model { tab: 0 } }
+          fn receive(state: Model, msg: Input): Model {
+            match msg {
+              Click(id) => Model { tab: id },
+              Scrolled(id, offset) => state,
+              _ => state,
+            }
+          }
+          view fn draw(state: Model): Node { text("app") }
+        }
+        "#,
+    );
+    let sum = hir.sums.iter().find(|sum| sum.name == "Input").expect("Input is declared");
+    assert!(sum.variants.iter().any(|v| v.name == "Click"));
+    // §5.3's flatness rule applies to it like any other message type.
+    assert!(sum
+        .variants
+        .iter()
+        .flat_map(|v| v.fields.iter())
+        .all(|(_, ty)| matches!(ty, Ty::Int | Ty::Float)));
+}
+
+#[test]
+fn a_module_that_never_asks_reserves_nothing() {
+    // `Click` is an ordinary name a UI program might want, so it stays one
+    // until the module opts in.
+    let hir = expect_ok(
+        r#"
+        type Gesture = | Click | Drag
+        fn f(): Gesture { Click }
+        "#,
+    );
+    assert!(!hir.sums.iter().any(|sum| sum.name == "Input"), "nothing was injected");
+}
+
+#[test]
+fn a_module_can_declare_its_own_input_type() {
+    // Its own wins, and it is not told it clashes with something it never
+    // asked for.
+    let hir = expect_ok(
+        r#"
+        type Input = | Tap(id: int)
+        type Model = { tab: int }
+        actor App {
+          state: Model
+          message: Input
+          fn init(): Model { Model { tab: 0 } }
+          fn receive(state: Model, msg: Input): Model {
+            match msg {
+              Tap(id) => Model { tab: id },
+            }
+          }
+        }
+        "#,
+    );
+    let sum = hir.sums.iter().find(|sum| sum.name == "Input").expect("Input is declared");
+    assert_eq!(sum.variants.len(), 1, "the file's own, not the platform's");
+    assert_eq!(sum.variants[0].name, "Tap");
+}
+
+#[test]
+fn a_match_on_input_must_still_be_exhaustive() {
+    let msg = expect_error(
+        r#"
+        type Model = { tab: int }
+        actor App {
+          state: Model
+          message: Input
+          fn init(): Model { Model { tab: 0 } }
+          fn receive(state: Model, msg: Input): Model {
+            match msg {
+              Click(id) => Model { tab: id },
+            }
+          }
+        }
+        "#,
+    );
+    // The platform's type is a real sum, so the platform's variants are named
+    // in the diagnostic like anyone else's.
+    assert!(msg.contains("does not cover"), "message was: {msg}");
+    assert!(msg.contains("Scrolled"), "message was: {msg}");
+}
+
+#[test]
+fn an_actor_with_a_view_records_it() {
+    let hir = expect_ok(
+        r#"
+        type Model = { tab: int }
+        actor App {
+          state: Model
+          message: Input
+          fn init(): Model { Model { tab: 0 } }
+          fn receive(state: Model, msg: Input): Model { state }
+          view fn draw(state: Model): Node { text("app") }
+        }
+        "#,
+    );
+    assert!(hir.actor.expect("an actor").view.is_some());
+}

@@ -12,6 +12,7 @@ use crate::ast;
 use crate::diag::Diagnostic;
 use crate::hir::*;
 use crate::lexer::Span;
+use crate::input;
 use crate::ui::{self, PropTy, Slot};
 
 pub fn check(program: &ast::Program) -> Result<Hir, Vec<Diagnostic>> {
@@ -165,6 +166,8 @@ impl Checker {
     // ---- declarations ----------------------------------------------------
 
     fn collect_types(&mut self, program: &ast::Program) {
+        self.collect_platform_input(program);
+
         // Pass 1: reserve ids so types may refer to each other in any order.
         for item in &program.items {
             let ast::Item::Type(decl) = item else { continue };
@@ -249,6 +252,60 @@ impl Checker {
                 }
             }
         }
+    }
+
+    /// Declares the platform's `Input` type, if this module asked for it.
+    ///
+    /// Asking means writing `message: Input` on an actor. That is the whole
+    /// opt-in, and it matters because registering the type also registers
+    /// `Click`, `Enter` and the rest as constructors — ordinary names a UI
+    /// program might want for itself. A file that never mentions `Input`
+    /// reserves nothing; a file that declares its own `type Input` keeps it,
+    /// and is left alone here rather than being told it clashes with something
+    /// it never asked for.
+    fn collect_platform_input(&mut self, program: &ast::Program) {
+        let asked = program.items.iter().any(|item| match item {
+            ast::Item::Actor(decl) => matches!(
+                &decl.message,
+                Some(ast::TypeExpr::Named { name, args, .. })
+                    if name == input::TYPE_NAME && args.is_empty()
+            ),
+            _ => false,
+        });
+        let declared_here = program.items.iter().any(|item| {
+            matches!(item, ast::Item::Type(decl) if decl.name == input::TYPE_NAME)
+        });
+        if !asked || declared_here {
+            return;
+        }
+
+        let id = SumId(self.hir.sums.len() as u32);
+        self.hir.sums.push(SumDef {
+            name: input::TYPE_NAME.to_string(),
+            variants: input::VARIANTS
+                .iter()
+                .map(|variant| Variant {
+                    name: variant.name.to_string(),
+                    fields: variant
+                        .fields
+                        .iter()
+                        .map(|(name, field)| {
+                            let ty = match field {
+                                input::Field::Int => Ty::Int,
+                                input::Field::Float => Ty::Float,
+                            };
+                            (name.to_string(), ty)
+                        })
+                        .collect(),
+                })
+                .collect(),
+        });
+        self.sum_ids.insert(input::TYPE_NAME.to_string(), id);
+        for (index, variant) in input::VARIANTS.iter().enumerate() {
+            self.ctors.insert(variant.name.to_string(), (id, index as u32));
+        }
+        // No `type_defs` or `ctor_defs` entry: there is no declaration in this
+        // file for go-to-definition to land on.
     }
 
     fn collect_signatures(&mut self, program: &ast::Program) {
