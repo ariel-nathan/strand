@@ -1,17 +1,16 @@
 //! The M0 walking-skeleton demo, kept as a subcommand so the actor runtime
 //! stays exercised while the language comes up.
 
-use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use strand_render::inspect::StatsHandle;
 use strand_runtime::{engine, spawn_actor, spawn_supervised, Message, Policy, Registry, HOST};
 
 const ACTORS: [(u32, &str, &str); 3] = [
-    (0, "ping", "examples/wasm/ping.wat"),
-    (1, "pong", "examples/wasm/pong.wat"),
-    (2, "ticker", "examples/wasm/ticker.wat"),
+    (0, "ping", "wasm/ping.wat"),
+    (1, "pong", "wasm/pong.wat"),
+    (2, "ticker", "wasm/ticker.wat"),
 ];
 
 pub fn run(windowed: bool) -> Result<()> {
@@ -57,8 +56,7 @@ async fn run_actors(traced: bool, stats: Option<StatsHandle>) -> Result<()> {
     println!("--- strand M0: 3 actors, 1 worker thread ---");
     let mut handles = Vec::new();
     for (id, name, path) in ACTORS {
-        let wat =
-            std::fs::read_to_string(Path::new(path)).with_context(|| format!("reading {path}"))?;
+        let wat = crate::examples::read(path)?;
         handles.push(spawn_actor(&engine, &registry, id, name, wat.as_bytes()).await?);
     }
 
@@ -134,7 +132,7 @@ async fn run_crash(traced: bool, forever: bool, stats: Option<StatsHandle>) -> R
         &registry,
         CRASHER,
         "crasher",
-        std::fs::read_to_string("examples/wasm/crasher.wat")?.as_bytes(),
+        crate::examples::read("wasm/crasher.wat")?.as_bytes(),
         Policy::Restart,
         None,
     );
@@ -143,7 +141,7 @@ async fn run_crash(traced: bool, forever: bool, stats: Option<StatsHandle>) -> R
         &registry,
         TICKER,
         "ticker",
-        std::fs::read_to_string("examples/wasm/ticker.wat")?.as_bytes(),
+        crate::examples::read("wasm/ticker.wat")?.as_bytes(),
         Policy::Restart,
         None,
     );

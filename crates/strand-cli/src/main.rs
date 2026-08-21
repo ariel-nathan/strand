@@ -12,16 +12,25 @@ use anyhow::{Context, Result};
 const USAGE: &str = "\
 strand — the Strand toolchain
 
-usage:
+compiling and running Strand:
   strand run <file.str>            compile and run `main`
   strand build <file.str> [-o out] compile to a .wasm module
-  strand todo                      the todo UI (§7)
-  strand view <file.str> [w h]     draw a Strand view; with w h, print its tree
+  strand view <file.str>           draw a `view fn` in a window (§6.2)
+  strand view <file.str> <w> <h>   print its laid-out tree instead
+
+windows to look at:
+  strand todo                      the todo app (§7) — type, scroll, delete
+  strand crash --window            watch an actor die and restart (§5.4)
+  strand demo --window             the M0 actor skeleton
+  strand ui [--burn]               a busy actor cannot jank the compositor
+
+in the terminal:
   strand inspect [w h]             print the todo UI tree (§8.4)
-  strand ui [--burn]               compositor demo (§6.1)
-  strand demo [--window|--trace]   run the M0 actor skeleton
-  strand crash [--trace|--window]  supervised crash and restart (§5.4)
+  strand demo [--trace]            actors; --trace prints the causal log
+  strand crash [--trace]           supervision, as a transcript
   strand help                      show this message
+
+Press F12 in any window for the inspector overlay (§8.4).
 ";
 
 fn main() -> ExitCode {

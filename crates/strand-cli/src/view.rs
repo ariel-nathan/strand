@@ -25,6 +25,42 @@ pub struct View {
     name: String,
 }
 
+/// Says what is missing and what to do about it.
+///
+/// The mistake this exists for: reaching for `strand view` on a program that
+/// is not a view. Naming the functions the module *does* have turns "no" into
+/// "not this one", which is the difference between a dead end and a next step.
+fn no_view(hir: &Hir) -> String {
+    let views: Vec<&str> = hir
+        .funcs
+        .iter()
+        .filter(|func| func.is_view)
+        .map(|func| func.name.as_str())
+        .collect();
+
+    if !views.is_empty() {
+        return format!(
+            "every view here takes arguments ({}), so none of them can be the \
+             one to draw. `strand view` calls a view that needs nothing — add a \
+             `view fn main() -> Node` that supplies the arguments.",
+            views.join(", ")
+        );
+    }
+
+    let functions: Vec<&str> =
+        hir.funcs.iter().map(|func| func.name.as_str()).take(4).collect();
+    let has = if functions.is_empty() {
+        String::new()
+    } else {
+        format!(" This module defines {}.", functions.join(", "))
+    };
+    format!(
+        "this file has no view to draw.{has} A view is written \
+         `view fn main() -> Node {{ ... }}` — see examples/strand/view.str. \
+         (The todo app is its own command: `strand todo`.)"
+    )
+}
+
 impl View {
     /// Instantiates `wasm` and finds the view to call.
     ///
@@ -35,11 +71,7 @@ impl View {
             .funcs
             .iter()
             .find(|func| func.is_view && func.param_count == 0)
-            .ok_or_else(|| {
-                anyhow!(
-                    "this module has no view to draw — write `view fn main() -> Node {{ ... }}`"
-                )
-            })?;
+            .ok_or_else(|| anyhow!("{}", no_view(hir)))?;
 
         let engine = Engine::default();
         let module =
