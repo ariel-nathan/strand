@@ -1,5 +1,7 @@
 # Strand
 
+[![test](https://github.com/ariel-nathan/strand/actions/workflows/test.yml/badge.svg)](https://github.com/ariel-nathan/strand/actions/workflows/test.yml)
+
 *A new browser runtime: a typed language, a multithreaded actor VM, a declarative scene graph.*
 
 The core architecture of the web platform is from the 1990s. A script language
@@ -97,8 +99,7 @@ actor Meter {
         next
       },
       // `Input` is a platform type, so `match` has to account for every
-      // event it can deliver.
-      // Everything else leaves the meter as it was.
+      // event it can deliver. Everything else leaves the meter as it was.
       Typed(ch) => state,
       Backspace => state,
       Enter => state,
@@ -164,7 +165,7 @@ Real: the compiler and its diagnostics; actors, typed channels, supervision and
 crash reports; the scene graph, layout, text and input; the todo application
 written in Strand; hot reload with a typed state snapshot; a debug overlay on
 live data; a language server with hover, go-to-definition, references and
-symbols. 489 tests, `cargo test --workspace` green.
+symbols. 490 tests, green on Windows and Linux.
 
 Not real yet, and known: `scope` and `spawn` parse and do nothing, so the fiber
 count is 0 or 1. There is no `xs[0]`, no method-call syntax, and no `strand

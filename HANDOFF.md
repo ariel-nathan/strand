@@ -9,8 +9,10 @@ messages carry the reasoning; `git log -S` the line before changing it.
 
 ## State
 
-489 tests, `cargo test --workspace` green. M0–M4 done including §8's demo
-sequence. M5 is done bar one item — read §13 rather than trusting this file.
+490 tests, green on Windows and Linux — CI runs both on every push, and it
+earned that on its first run by finding two tests that were only true on
+this machine. M0–M4 done including §8's demo sequence. M5 is done bar one
+item — read §13 rather than trusting this file.
 
 Hot reload landed this session: `strand view <file> --watch` recompiles on
 save, swaps every actor onto the new module, and carries its state across.
@@ -76,7 +78,12 @@ smallest thing that shows ports, and `--watch` is best seen on the first.
   advances when every task is idle, so a self-scheduled loop (the CPU burn)
   stops the clock. `tests/tree.rs::drive_realtime` is the real-clock driver.
 - **Mixed CRLF/LF.** A patch matching `\n` silently matches nothing in a
-  CRLF file. Normalise, patch, restore.
+  CRLF file. Normalise, patch, restore. `.gitattributes` now pins `eol=lf`
+  on checkout, which is what stops the same hazard reaching a test fixture —
+  it already had, and the test passed while proving nothing.
+- **No `jq` on this machine.** Two watchers on a CI run sat silent until
+  they timed out because a script assumed it. `gh run view <id>` reads fine
+  on its own.
 - **The user works in this repo while you do.** Stage explicit paths; check
   `git status --short` first. `docs/strand-design.md` in particular has been
   carrying an uncommitted rewrite.
