@@ -12,3 +12,6 @@ taffy = "0.13.0"
 tracing.workspace = true
 wgpu = "30.0.0"
 winit = "0.30.13"
+
+[dev-dependencies]
+pollster = "1.0.1"
